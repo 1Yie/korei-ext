@@ -8,35 +8,28 @@ on:
 permissions:
   contents: read
 
+env:
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
 jobs:
   law:
     name: Dependency law
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          path: korei-ext
-      # TODO: set the kernel repository once its URL is decided.
-      - uses: actions/checkout@v4
-        with:
-          repository: OWNER/korei
-          path: korei
       - uses: dtolnay/rust-toolchain@stable
-      - run: sudo apt-get update && sudo apt-get install -y jq
+      - name: Allow cargo to fetch the private korei repository
+        run: |
+          git config --global url."https://x-access-token:${{ secrets.KOREI_TOKEN }}@github.com/".insteadOf "ssh://git@github.com/"
       - run: ./scripts/check-deps.sh
-        working-directory: korei-ext
+
   test:
     name: Build and test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          path: korei-ext
-      # TODO: set the kernel repository once its URL is decided.
-      - uses: actions/checkout@v4
-        with:
-          repository: OWNER/korei
-          path: korei
       - uses: dtolnay/rust-toolchain@stable
+      - name: Allow cargo to fetch the private korei repository
+        run: |
+          git config --global url."https://x-access-token:${{ secrets.KOREI_TOKEN }}@github.com/".insteadOf "ssh://git@github.com/"
       - run: cargo test --workspace
-        working-directory: korei-ext

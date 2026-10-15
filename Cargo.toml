@@ -26,11 +26,11 @@ grep-searcher = "0.1"
 grep-regex = "0.1"
 grep-matcher = "0.1"
 
-# Kernel closure — sibling checkout of the `korei` repository.
-agent-ipc = { path = "../korei/crates/agent-ipc", version = "0.1.0" }
-agent-llm-core = { path = "../korei/crates/agent-llm-core", version = "0.1.0" }
-agent-tool = { path = "../korei/crates/agent-tool", version = "0.1.0" }
-agent-kernel = { path = "../korei/crates/agent-kernel", version = "0.1.0" }
+# The kernel's contracts, from the korei repository.
+agent-llm-core = { git = "ssh://git@github.com/1Yie/korei.git", branch = "main" }
+agent-tool = { git = "ssh://git@github.com/1Yie/korei.git", branch = "main" }
+agent-ipc = { git = "ssh://git@github.com/1Yie/korei.git", branch = "main" }
+agent-kernel = { git = "ssh://git@github.com/1Yie/korei.git", branch = "main" }
 
 [profile.dev]
 panic = "unwind"       # tests need unwinding; debug UX needs backtraces
