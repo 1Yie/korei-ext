@@ -6,8 +6,8 @@
 
 pub mod audit;
 pub mod env_sanitize;
-#[cfg(target_os = "linux")]
 pub mod limits;
+#[cfg(target_os = "linux")]
 pub mod linux_bwrap;
 #[cfg(target_os = "linux")]
 pub mod linux_landlock;
