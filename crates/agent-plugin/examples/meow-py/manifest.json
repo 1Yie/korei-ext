@@ -1,0 +1,12 @@
+{
+  "id": "meow-py",
+  "name": "喵～ (Python)",
+  "capabilities": {
+    "hooks": [
+      {
+        "event": "on_response",
+        "run": { "command": "python3", "args": ["main.py"] }
+      }
+    ]
+  }
+}

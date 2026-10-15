@@ -1,0 +1,17 @@
+[package]
+name = "agent-sandbox"
+version = "0.1.0"
+edition = "2021"
+description = "L2 process sandbox: bwrap/landlock backends, env sanitization, resource limits, audit"
+license = "MIT"
+
+[dependencies]
+tokio.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+libc = "0.2.189"
+
+[dev-dependencies]
+tempfile = "3"

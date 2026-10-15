@@ -1,0 +1,42 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  law:
+    name: Dependency law
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: korei-ext
+      # TODO: set the kernel repository once its URL is decided.
+      - uses: actions/checkout@v4
+        with:
+          repository: OWNER/korei
+          path: korei
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y jq
+      - run: ./scripts/check-deps.sh
+        working-directory: korei-ext
+  test:
+    name: Build and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: korei-ext
+      # TODO: set the kernel repository once its URL is decided.
+      - uses: actions/checkout@v4
+        with:
+          repository: OWNER/korei
+          path: korei
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --workspace
+        working-directory: korei-ext

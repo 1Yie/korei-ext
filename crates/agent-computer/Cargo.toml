@@ -1,0 +1,54 @@
+[package]
+name = "agent-computer"
+version = "0.1.0"
+edition = "2021"
+description = "Desktop-control backends for computer-use tools: screenshot capture + synthetic input"
+license = "MIT"
+
+[dependencies]
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+# Pure-Rust codecs only (png → flate2/miniz_oxide): the workspace never links C.
+image.workspace = true
+
+# Capture + synthetic input are per-OS — gated so each backend only links
+# its own API (and so Linux/Windows never pull macOS frameworks).
+#
+# Windows: `windows` crate covers BOTH `SendInput` (input) and the GDI
+#   `BitBlt` grab (capture) — no extra capture crate needed, and the raw
+#   RGBA it hands back feeds straight into the shared `image` PNG pipeline.
+# macOS:  `screencapture` is a system binary for capture (like `scrot`),
+#   `core-graphics` covers `CGEventPost` for input — nothing else required.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_Foundation",
+  "Win32_Graphics_Gdi",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_System_Threading",
+  "Win32_Graphics_Dwm",
+] }
+
+# Wayland input: libei through the RemoteDesktop portal (KDE/GNOME). Linux
+# only. `ashpd` runs the portal handshake (granted once, remembered by the
+# compositor); `reis` speaks the EI protocol on the socket it hands back.
+[target.'cfg(target_os = "linux")'.dependencies]
+ashpd = { version = "0.13", default-features = false, features = ["tokio", "remote_desktop", "screencast"] }
+reis = { version = "0.7", features = ["tokio"] }
+futures-util = "0.3"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = { version = "0.25", features = ["highsierra"] }
+core-foundation = "0.10"
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+# Compile the macOS backend off-target against a pure-Rust `core-graphics`
+# stub — `cargo check -p agent-computer --features check-macos` typechecks
+# `macos.rs` on Linux/CI without the CoreGraphics framework. Never enable
+# in a real build.
+check-macos = []

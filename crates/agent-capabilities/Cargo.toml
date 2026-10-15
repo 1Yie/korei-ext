@@ -1,0 +1,17 @@
+[package]
+name = "agent-capabilities"
+version = "0.1.0"
+edition = "2021"
+description = "Optional host capability adapters for the generic tool context"
+license = "MIT"
+
+[dependencies]
+agent-tool.workspace = true
+agent-paths = { path = "../agent-paths" }
+agent-sandbox = { path = "../agent-sandbox", optional = true }
+agent-computer = { path = "../agent-computer", optional = true }
+
+[features]
+default = []
+sandbox = ["dep:agent-sandbox"]
+desktop = ["dep:agent-computer"]

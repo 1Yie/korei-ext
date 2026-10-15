@@ -1,0 +1,16 @@
+{
+  "id": "meow-ts",
+  "name": "喵～ (TypeScript)",
+  "capabilities": {
+    "hooks": [
+      {
+        "event": "on_response",
+        "run": {
+          "command": "bun",
+          "args": ["main.ts"],
+          "env": { "PATH": "env:PATH" }
+        }
+      }
+    ]
+  }
+}

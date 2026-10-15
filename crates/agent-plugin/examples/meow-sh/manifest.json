@@ -1,0 +1,12 @@
+{
+  "id": "meow-sh",
+  "name": "喵～ (Shell)",
+  "capabilities": {
+    "hooks": [
+      {
+        "event": "on_response",
+        "run": { "command": "./meow.sh" }
+      }
+    ]
+  }
+}

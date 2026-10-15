@@ -1,0 +1,20 @@
+[package]
+name = "agent-tools-serena"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# The contract only — the meta-tool is generic over the context, so nothing
+# here depends on the kernel that instantiates it. Serena runs as an MCP child
+# over stdio, so there is no HTTP client and no plugin dependency either.
+agent-tool.workspace = true
+agent-capabilities = { path = "../agent-capabilities" }
+async-trait.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+schemars.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

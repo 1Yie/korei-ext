@@ -1,0 +1,38 @@
+[package]
+name = "agent-plugin"
+version = "0.1.0"
+edition = "2021"
+description = "Plugin system: manifest, Plugin trait, PluginManager, MCP stdio bridge, WASM runtime"
+license = "MIT"
+
+[dependencies]
+agent-paths = { path = "../agent-paths" }
+agent-llm-core.workspace = true   # ToolCall shape only
+agent-sandbox = { path = "../agent-sandbox" } # sandboxed spawn (permissions enforcement)
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10.9"
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+futures.workspace = true
+reqwest.workspace = true
+schemars.workspace = true
+toml.workspace = true
+libc = "0.2.189"
+dirs.workspace = true
+wasmtime = { version = "49", optional = true }
+wasmtime-wasi = { version = "49", optional = true, features = ["p1"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+# WASM is a first-class plugin kind — on by default so `cargo tauri dev`
+# (and every downstream crate's default feature resolution) gets wasmtime.
+# `--no-default-features` still builds a wasm-free binary for size-sensitive
+# consumers.
+default = ["wasm"]
+wasm = ["dep:wasmtime", "dep:wasmtime-wasi"]
