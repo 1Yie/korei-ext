@@ -150,13 +150,16 @@ impl SandboxBackend for NoneBackend {
     }
 }
 
-/// `kill(-pgid, SIGKILL)` via `/proc` — no libc dep. Fails silently on
-/// non-Linux (the backend is best-effort there).
+/// `kill(-pgid, SIGKILL)`. `process_group(0)` made the child a group leader,
+/// so the negative pid reaps the whole tree. A direct syscall rather than the
+/// external `kill` binary, whose handling of a negative pid differs between
+/// procps versions and shells.
 #[cfg(target_family = "unix")]
 fn libc_kill_group(pgid: u32) {
-    let _ = std::process::Command::new("kill")
-        .args(["-9", &format!("-{pgid}")])
-        .status();
+    // SAFETY: `kill` takes plain integers and has no memory-safety contract.
+    unsafe {
+        libc::kill(-(pgid as libc::pid_t), libc::SIGKILL);
+    }
 }
 
 #[cfg(not(target_family = "unix"))]
