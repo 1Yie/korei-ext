@@ -1,3 +1,4 @@
+#![cfg(target_os = "linux")]
 //! End-to-end bwrap + egress-proxy test. Skipped unless
 //! `AGENT_SANDBOX_E2E=1` (needs bwrap, socat and live DNS/HTTPS).
 
