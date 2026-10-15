@@ -8,9 +8,6 @@ on:
 permissions:
   contents: read
 
-env:
-  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
-
 jobs:
   law:
     name: Dependency law
@@ -18,9 +15,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Allow cargo to fetch the private korei repository
-        run: |
-          git config --global url."https://x-access-token:${{ secrets.KOREI_TOKEN }}@github.com/".insteadOf "ssh://git@github.com/"
       - run: ./scripts/check-deps.sh
 
   test:
@@ -29,7 +23,4 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Allow cargo to fetch the private korei repository
-        run: |
-          git config --global url."https://x-access-token:${{ secrets.KOREI_TOKEN }}@github.com/".insteadOf "ssh://git@github.com/"
       - run: cargo test --workspace
