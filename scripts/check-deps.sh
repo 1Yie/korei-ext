@@ -9,6 +9,7 @@ declare -A ALLOW=(
   [agent-sandbox]=""
   [agent-computer]=""
   [agent-paths]=""
+  [agent-skills]=""
   [agent-plugin]="agent-llm-core agent-paths agent-sandbox"
   [agent-capabilities]="agent-computer agent-paths agent-sandbox agent-tool"
   [agent-tools-fs]="agent-capabilities agent-tool"

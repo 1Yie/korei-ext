@@ -12,6 +12,7 @@ kernel.
 | `agent-tools-computer` | drive a desktop through screenshots and input |
 | `agent-tools-serena` | bridge to a Serena MCP server |
 | `agent-sandbox` | run commands under bubblewrap, Landlock, seatbelt or a Windows job |
+| `agent-skills` | discover and load skills: reusable instructions the agent pulls in on demand |
 | `agent-plugin` | load hook and WASM plugins |
 | `agent-computer` | desktop capture and input backends |
 | `agent-capabilities` | the traits tool packages are written against |

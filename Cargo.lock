@@ -108,6 +108,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-skills"
+version = "0.1.0"
+dependencies = [
+ "dirs",
+ "serde_json",
+ "strsim",
+ "tempfile",
+]
+
+[[package]]
 name = "agent-tool"
 version = "0.1.0"
 source = "git+ssh://git@github.com/1Yie/korei.git?branch=main#b23a7fa708023a93dd393180002121b86a19c427"
