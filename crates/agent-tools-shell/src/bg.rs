@@ -1134,14 +1134,18 @@ pub fn spec<C: WorkspaceCtx + SandboxCtx>() -> ToolSpec<C> {
             "Run a finite long-running shell command in the background, or \
              manage a job. action=run (default when `command` is set) starts \
              `command` and returns a bg-N id; list shows every job; status \
-             shows one job; logs tails its output; wait blocks until it \
-             finishes or timeout_secs (default 30) — use this instead of \
-             sleep; kill stops it; pause/resume freeze and continue it; \
-             remove drops a finished job. Unlike bash(persistent) for \
-             servers, bg_run records the exit status and pushes a completion \
-             notice to the model when notify=true (default). All jobs run \
-             under the same sandbox as bash (same fs/network/env limits, no \
-             stdin) and are killed when the session that started them ends.",
+             shows one job; logs tails its output; kill stops it; pause/\
+             resume freeze and continue it; remove drops a finished job. \
+             Start the job and keep working: with notify=true (default) the \
+             completion is pushed to you on its own, between tool calls or as \
+             a new turn once the session is idle. wait blocks until the job \
+             ends or timeout_secs (default 30) — prefer it over sleep, and use \
+             it ONLY when the next step cannot proceed without this result; \
+             otherwise it just stalls the turn, and status/logs already answer \
+             instantly. Unlike bash(persistent) for servers, bg_run records \
+             the exit status. All jobs run under the same sandbox as bash \
+             (same fs/network/env limits, no stdin) and are killed when the \
+             session that started them ends.",
         ),
         readonly: false,
         class: agent_tool::ToolClass::Process,
