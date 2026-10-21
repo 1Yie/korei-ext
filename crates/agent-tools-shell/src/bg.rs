@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures::FutureExt;
 use tokio::sync::{mpsc, watch};
@@ -55,11 +55,51 @@ type Notifier = Arc<dyn Fn(String) + Send + Sync>;
 /// one per session ([`BgRegistrySlot`]) so sessions never see each other's
 /// jobs; a context without a slot uses the process default. Dropping the
 /// registry kills whatever it still holds.
-#[derive(Default)]
 pub struct BgRegistry {
     map: Mutex<BTreeMap<String, Job>>,
     /// Fallback for a context that installed no [`BgNotifierSlot`].
     default_notifier: Mutex<Option<Notifier>>,
+    /// Bumped on every visible change (start, pause, resume, finish,
+    /// remove) — the host's feed for a live job list. Elapsed time is not a
+    /// change: a viewer ticks it from [`BgJobInfo::elapsed_ms`].
+    revision: watch::Sender<u64>,
+}
+
+impl Default for BgRegistry {
+    fn default() -> Self {
+        Self {
+            map: Mutex::default(),
+            default_notifier: Mutex::default(),
+            revision: watch::channel(0).0,
+        }
+    }
+}
+
+/// One job as a host shows it — a snapshot, not a handle.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct BgJobInfo {
+    pub id: String,
+    pub command: String,
+    pub state: BgJobState,
+    /// Wall-clock start, epoch milliseconds.
+    pub started_at_ms: u64,
+    /// Time actually run at the moment of the snapshot (paused time excluded).
+    pub elapsed_ms: u64,
+    /// Whether completion is pushed to the model.
+    pub notify: bool,
+    /// Started by a context with no completion sink of its own — in a host
+    /// that installs one per session, a delegated child's job.
+    pub from_child: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BgJobState {
+    Running,
+    Paused,
+    /// `label` is the tool's own wording (`exited(0)`, `killed(timeout)`);
+    /// `code` is set only for a normal exit.
+    Done { label: String, code: Option<i32> },
 }
 
 /// Host-installed registry for this context (and its delegated children).
@@ -80,6 +120,74 @@ impl BgRegistry {
     pub fn set_notifier(&self, f: impl Fn(String) + Send + Sync + 'static) {
         *lock(&self.default_notifier) = Some(Arc::new(f));
     }
+
+    fn bump(&self) {
+        self.revision.send_modify(|r| *r = r.wrapping_add(1));
+    }
+
+    /// A receiver that changes whenever [`jobs`](Self::jobs) would.
+    pub fn subscribe(&self) -> watch::Receiver<u64> {
+        self.revision.subscribe()
+    }
+
+    /// Every job this registry holds, oldest id first.
+    pub fn jobs(&self) -> Vec<BgJobInfo> {
+        let mut jobs: Vec<BgJobInfo> = lock(&self.map)
+            .iter()
+            .map(|(id, job)| BgJobInfo {
+                id: id.clone(),
+                command: job.command.clone(),
+                state: match &job.state {
+                    JobState::Running => BgJobState::Running,
+                    JobState::Paused => BgJobState::Paused,
+                    JobState::Done(label) => BgJobState::Done {
+                        label: label.clone(),
+                        code: exit_code(label),
+                    },
+                },
+                started_at_ms: job
+                    .started_wall
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0),
+                elapsed_ms: elapsed_of(job).as_millis() as u64,
+                notify: job.notify,
+                from_child: job.notifier.is_none(),
+            })
+            .collect();
+        // `bg-10` after `bg-9`: the map's string order would not say so.
+        jobs.sort_by_key(|j| j.id.trim_start_matches("bg-").parse::<u64>().unwrap_or(u64::MAX));
+        jobs
+    }
+
+    /// The last `lines` of a job's log, capped like the tool's `logs`.
+    pub fn tail(&self, id: &str, lines: usize) -> Result<String, String> {
+        let path = with_job(self, id, |job| job.log_path.clone()).map_err(|e| e.to_string())?;
+        read_tail(&path, lines.min(2000))
+            .map(|t| cap_tail(&t))
+            .map_err(|e| e.to_string())
+    }
+
+    /// Stop a job — the tool's `kill`, without its completion notice.
+    pub async fn kill(&self, id: &str) -> Result<(), String> {
+        kill(self, &BgArgs::for_id(id)).await.map(drop).map_err(|e| e.to_string())
+    }
+
+    /// Freeze (`true`) or continue (`false`) a job — the tool's `pause` /
+    /// `resume`.
+    pub fn set_paused(&self, id: &str, paused: bool) -> Result<(), String> {
+        pause(self, &BgArgs::for_id(id), paused).map(drop).map_err(|e| e.to_string())
+    }
+
+    /// Drop a finished job and its log — the tool's `remove`.
+    pub fn remove(&self, id: &str) -> Result<(), String> {
+        remove(self, &BgArgs::for_id(id)).map(drop).map_err(|e| e.to_string())
+    }
+}
+
+/// The exit code inside a `status_label` — `None` for a signal or an error.
+fn exit_code(label: &str) -> Option<i32> {
+    label.strip_prefix("exited(")?.strip_suffix(')')?.parse().ok()
 }
 
 impl Drop for BgRegistry {
@@ -147,6 +255,7 @@ struct Job {
     log_path: PathBuf,
     state: JobState,
     started: Instant,
+    started_wall: SystemTime,
     /// Set while paused, so the reported time is work, not waiting.
     paused_at: Option<Instant>,
     paused_total: Duration,
@@ -424,7 +533,7 @@ fn log_size(path: &Path) -> u64 {
 
 /// Mark a job finished, hand the exit to whoever waits, and push the notice.
 fn settle(reg: &BgRegistry, id: &str, label: String) {
-    let (snap, notifier) = {
+    let pending = {
         let mut map = lock(&reg.map);
         let Some(job) = map.get_mut(id) else {
             return;
@@ -440,10 +549,11 @@ fn settle(reg: &BgRegistry, id: &str, label: String) {
         // SIGKILL whatever inherited the number.)
         job.pid = None;
         let _ = job.done.send(true);
-        if !job.notify || job.waiters > 0 {
-            return;
-        }
-        (snapshot(id, job), job.notifier.clone())
+        (job.notify && job.waiters == 0).then(|| (snapshot(id, job), job.notifier.clone()))
+    };
+    reg.bump();
+    let Some((snap, notifier)) = pending else {
+        return;
     };
     let text = notice(&snap);
     match notifier {
@@ -533,6 +643,7 @@ where
         log_path: log_path.clone(),
         state: JobState::Running,
         started: Instant::now(),
+        started_wall: SystemTime::now(),
         paused_at: None,
         paused_total: Duration::ZERO,
         finished: None,
@@ -543,6 +654,7 @@ where
         notifier: notifier_of(&**ctx),
     };
     lock(&reg.map).insert(id.clone(), job);
+    reg.bump();
     spawn_monitor(
         Arc::downgrade(reg),
         id.clone(),
@@ -794,6 +906,7 @@ fn pause(reg: &BgRegistry, parsed: &BgArgs, freeze: bool) -> Result<ToolResult, 
                 }
             }
         }
+        reg.bump();
         Ok(ToolResult::text(format!(
             "{id} {} (pid {pid})",
             if freeze { "paused" } else { "resumed" }
@@ -815,6 +928,8 @@ fn remove(reg: &BgRegistry, parsed: &BgArgs) -> Result<ToolResult, ToolError> {
     if let Some(job) = map.remove(&id) {
         let _ = job.done.send(true);
     }
+    drop(map);
+    reg.bump();
     let _ = std::fs::remove_file(&log_path);
     Ok(ToolResult::text(format!("{id} removed")))
 }
@@ -945,7 +1060,7 @@ enum Action {
     Remove,
 }
 
-#[derive(Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 struct BgArgs {
     /// Action: `run` (default when `command` is set), `list`, `status`,
     /// `logs`, `wait`, `kill`, `pause`, `resume`, `remove`.
@@ -965,6 +1080,15 @@ struct BgArgs {
     max_secs: Option<u64>,
     /// `status`/`logs`: lines of log tail (default 10 / 80).
     tail_lines: Option<usize>,
+}
+
+impl BgArgs {
+    fn for_id(id: &str) -> Self {
+        Self {
+            id: Some(id.to_string()),
+            ..Self::default()
+        }
+    }
 }
 
 /// The permission gate's view of one call. A read action is not a process
@@ -1613,6 +1737,99 @@ mod tests {
     }
 
     /// The reported duration is work, not time spent paused.
+    #[tokio::test]
+    async fn the_host_view_follows_the_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, reg) = test_ctx(dir.path());
+        let mut feed = reg.subscribe();
+        assert!(reg.jobs().is_empty());
+
+        let out = call(
+            serde_json::json!({"action": "run", "command": "echo hello; sleep 30"}),
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+        let id = job_id(&out.content);
+        assert!(feed.has_changed().unwrap(), "start bumps the feed");
+        feed.mark_unchanged();
+        let jobs = reg.jobs();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, id);
+        assert_eq!(jobs[0].state, BgJobState::Running);
+        assert!(jobs[0].started_at_ms > 0);
+        // The registry belongs to the context that started the job, but the
+        // test context installed no sink of its own.
+        assert!(jobs[0].from_child);
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(reg.tail(&id, 10).unwrap().contains("hello"));
+
+        reg.set_paused(&id, true).unwrap();
+        assert!(feed.has_changed().unwrap(), "pause bumps the feed");
+        feed.mark_unchanged();
+        assert_eq!(reg.jobs()[0].state, BgJobState::Paused);
+        reg.set_paused(&id, false).unwrap();
+        assert_eq!(reg.jobs()[0].state, BgJobState::Running);
+        assert!(reg.remove(&id).is_err(), "a live job cannot be removed");
+
+        reg.kill(&id).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !matches!(reg.jobs()[0].state, BgJobState::Done { .. }) {
+                feed.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("the kill settles the job");
+        match &reg.jobs()[0].state {
+            BgJobState::Done { label, code } => {
+                assert!(label.starts_with("killed"), "{label}");
+                assert_eq!(*code, None);
+            }
+            other => panic!("{other:?}"),
+        }
+        feed.mark_unchanged();
+
+        reg.remove(&id).unwrap();
+        assert!(feed.has_changed().unwrap(), "remove bumps the feed");
+        assert!(reg.jobs().is_empty());
+        assert!(reg.tail(&id, 10).is_err());
+    }
+
+    #[tokio::test]
+    async fn the_host_view_reports_the_exit_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, reg) = test_ctx(dir.path());
+        let out = call(
+            serde_json::json!({"action": "run", "command": "exit 3", "notify": false}),
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+        let id = job_id(&out.content);
+        call(serde_json::json!({"action": "wait", "id": id}), ctx)
+            .await
+            .unwrap();
+        let job = &reg.jobs()[0];
+        assert!(!job.notify);
+        assert_eq!(
+            job.state,
+            BgJobState::Done {
+                label: "exited(3)".into(),
+                code: Some(3)
+            }
+        );
+    }
+
+    #[test]
+    fn exit_codes_come_from_normal_exits_only() {
+        assert_eq!(exit_code("exited(0)"), Some(0));
+        assert_eq!(exit_code("exited(127)"), Some(127));
+        assert_eq!(exit_code("exited(unknown)"), None);
+        assert_eq!(exit_code("killed(sig 9)"), None);
+        assert_eq!(exit_code("killed(timeout)"), None);
+    }
+
     #[test]
     fn elapsed_excludes_paused_time() {
         let (ctl, _rx) = mpsc::unbounded_channel();
@@ -1624,6 +1841,7 @@ mod tests {
             log_path: PathBuf::from("/tmp/x.log"),
             state: JobState::Done("exited(0)".into()),
             started: now - Duration::from_secs(10),
+            started_wall: SystemTime::now(),
             paused_at: None,
             paused_total: Duration::from_secs(4),
             finished: Some(now),
