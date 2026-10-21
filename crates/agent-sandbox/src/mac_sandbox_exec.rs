@@ -218,7 +218,11 @@ impl SandboxBackend for MacSandboxExec {
             .process_group(0);
         let child = command.spawn().context("spawn sandbox-exec")?;
         let child_id = child.id();
+        // Held across the wait: if this future is dropped (a cancelled turn),
+        // the guard kills the whole group, not just `sh`.
+        let mut group = crate::group_kill::GroupGuard::new(child_id);
         let status = tokio::time::timeout(timeout, child.wait_with_output()).await;
+        group.disarm();
         let elapsed = started.elapsed().as_millis() as u64;
         let (out, err, code, is_timeout) = match status {
             Ok(Ok(o)) => (

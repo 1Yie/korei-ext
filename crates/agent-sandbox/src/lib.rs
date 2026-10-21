@@ -6,6 +6,7 @@
 
 pub mod audit;
 pub mod env_sanitize;
+mod group_kill;
 pub mod limits;
 #[cfg(target_os = "linux")]
 pub mod linux_bwrap;

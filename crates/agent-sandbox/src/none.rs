@@ -79,8 +79,12 @@ impl SandboxBackend for NoneBackend {
 
         let child = command.spawn().context("spawn sh")?;
         let child_id = child.id();
+        // Held across the wait: if this future is dropped (a cancelled turn),
+        // the guard kills the whole group, not just `sh`.
+        let mut group = crate::group_kill::GroupGuard::new(child_id);
         // `wait_with_output` collects piped stdout/stderr atomically.
         let status = tokio::time::timeout(timeout, child.wait_with_output()).await;
+        group.disarm();
         let elapsed = started.elapsed().as_millis() as u64;
 
         let (out, err, code, is_timeout) = match status {
@@ -207,6 +211,28 @@ mod tests {
         assert!(
             !marker.exists(),
             "grandchild survived the timeout — the group was not killed"
+        );
+    }
+
+    /// A cancelled turn drops the `run_command` future mid-wait. The whole
+    /// group must die with it — `kill_on_drop` alone reaches only `sh`, and
+    /// the grandchild would go on to write its marker.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_the_run_kills_the_process_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("grandchild-alive");
+        let cmd = format!("sh -c 'sleep 2; touch {}' & sleep 300", marker.display());
+        let cfg = cfg(dir.path(), 600);
+        let run = NoneBackend.run_command(&cmd, &[], &cfg);
+        // Long enough for the shell to fork the grandchild.
+        let dropped = tokio::time::timeout(std::time::Duration::from_millis(500), run).await;
+        assert!(dropped.is_err(), "the command must still be running");
+
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        assert!(
+            !marker.exists(),
+            "grandchild survived the dropped run — the group was not killed"
         );
     }
 
