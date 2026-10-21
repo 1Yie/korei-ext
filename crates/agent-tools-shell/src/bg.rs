@@ -96,6 +96,9 @@ impl Drop for BgRegistry {
             if let Some(pid) = job.pid {
                 signal_tree(pid, SIGKILL);
             }
+            // The job is gone with the session; its output should not linger
+            // in /tmp until the system prunes it.
+            let _ = std::fs::remove_file(&job.log_path);
         }
     }
 }
@@ -294,6 +297,18 @@ fn cap_head(text: &str) -> String {
         crate::util::head(text, MAX_TOOL_BYTES),
         text.len() - MAX_TOOL_BYTES
     )
+}
+
+/// Append a capped `── tail ──` block, when the log has anything in it.
+fn push_tail(out: &mut String, path: &Path, lines: usize) {
+    if let Ok(tail) = read_tail(path, lines) {
+        let tail = crate::util::tail(tail.trim_end(), MAX_TOOL_BYTES);
+        if !tail.is_empty() {
+            out.push_str("── tail ──\n");
+            out.push_str(tail);
+            out.push('\n');
+        }
+    }
 }
 
 fn need_id(parsed: &BgArgs) -> Result<String, ToolError> {
@@ -582,15 +597,7 @@ fn status(reg: &BgRegistry, parsed: &BgArgs) -> Result<ToolResult, ToolError> {
     let id = need_id(parsed)?;
     let snap = with_job(reg, &id, |job| snapshot(&id, job))?;
     let mut out = summary(&snap);
-    let lines = parsed.tail_lines.unwrap_or(10).min(500);
-    if let Ok(tail) = read_tail(&snap.log_path, lines) {
-        let tail = crate::util::tail(tail.trim_end(), MAX_TOOL_BYTES);
-        if !tail.is_empty() {
-            out.push_str("── tail ──\n");
-            out.push_str(tail);
-            out.push('\n');
-        }
-    }
+    push_tail(&mut out, &snap.log_path, parsed.tail_lines.unwrap_or(10).min(500));
     Ok(ToolResult::text(out))
 }
 
@@ -686,15 +693,7 @@ async fn wait(
     let mut out = summary(&snap);
     if done {
         out.push_str(&format!("done after {}\n", human(snap.elapsed)));
-        let lines = parsed.tail_lines.unwrap_or(20).min(500);
-        if let Ok(tail) = read_tail(&snap.log_path, lines) {
-            let tail = crate::util::tail(tail.trim_end(), MAX_TOOL_BYTES);
-            if !tail.is_empty() {
-                out.push_str("── tail ──\n");
-                out.push_str(tail);
-                out.push('\n');
-            }
-        }
+        push_tail(&mut out, &snap.log_path, parsed.tail_lines.unwrap_or(20).min(500));
     } else {
         out.push_str(&format!(
             "still running after {}s — call wait again or status/logs\n",
@@ -1511,6 +1510,106 @@ mod tests {
         call(serde_json::json!({"action": "kill", "id": id}), ctx)
             .await
             .unwrap();
+    }
+
+    /// `notify=false` leaves the caller to poll: nothing is pushed.
+    #[tokio::test]
+    async fn notify_false_pushes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, reg) = test_ctx(dir.path());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        reg.set_notifier(move |text| {
+            let _ = tx.send(text);
+        });
+
+        let out = call(
+            serde_json::json!({"action": "run", "command": "true", "notify": false}),
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+        let id = job_id(&out.content);
+
+        let out = call(
+            serde_json::json!({"action": "wait", "id": id, "timeout_secs": 10}),
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(out.content.contains("exited(0)"), "{}", out.content);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(600), rx.recv())
+                .await
+                .is_err(),
+            "notify=false must not push a notice"
+        );
+    }
+
+    /// A user cancel must not sit behind a long `wait`.
+    #[tokio::test]
+    async fn a_user_cancel_breaks_a_wait() {
+        struct CancelCtx {
+            ext: agent_tool::Extensions,
+            cancel: Arc<AtomicBool>,
+        }
+
+        impl ToolContext for CancelCtx {
+            fn extensions(&self) -> &agent_tool::Extensions {
+                &self.ext
+            }
+            fn extensions_mut(&mut self) -> &mut agent_tool::Extensions {
+                &mut self.ext
+            }
+            fn cancel_flag(&self) -> Option<Arc<AtomicBool>> {
+                Some(self.cancel.clone())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut ext = agent_tool::Extensions::default();
+        ext.insert_shared(Arc::new(agent_capabilities::SandboxSlot(
+            Arc::new(NoneBackend) as Arc<dyn agent_sandbox::SandboxBackend>,
+        )));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut ctx = CancelCtx { ext, cancel: cancel.clone() };
+        ctx = ctx.with_workspace(dir.path());
+        install_registry(&mut ctx);
+        let ctx = Arc::new(ctx);
+
+        let out = exec::<CancelCtx>(
+            serde_json::json!({"action": "run", "command": "sleep 30"}),
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+        let id = job_id(&out.content);
+
+        let wait_id = id.clone();
+        let waiter = tokio::spawn({
+            let ctx = ctx.clone();
+            async move {
+                exec::<CancelCtx>(
+                    serde_json::json!({"action": "wait", "id": wait_id, "timeout_secs": 30}),
+                    ctx,
+                )
+                .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        cancel.store(true, Ordering::Relaxed);
+
+        let result = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("the cancel must break the wait")
+            .expect("the task");
+        let err = result.expect_err("a cancelled wait is an error");
+        assert!(format!("{err}").contains("cancelled"), "{err}");
+
+        exec::<CancelCtx>(
+            serde_json::json!({"action": "kill", "id": id}),
+            ctx,
+        )
+        .await
+        .unwrap();
     }
 
     /// The reported duration is work, not time spent paused.
