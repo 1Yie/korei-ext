@@ -97,9 +97,32 @@ pub struct BgJobInfo {
 pub enum BgJobState {
     Running,
     Paused,
-    /// `label` is the tool's own wording (`exited(0)`, `killed(timeout)`);
-    /// `code` is set only for a normal exit.
-    Done { label: String, code: Option<i32> },
+    /// `label` is the tool's own wording (`exited(0)`, `killed(timeout)`),
+    /// for display; `code` is set only for a normal exit. `reason` is what a
+    /// host branches on — never the label's text.
+    Done {
+        label: String,
+        code: Option<i32>,
+        reason: BgEndReason,
+    },
+}
+
+/// Why a job ended — decided by the monitor from what actually happened.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BgEndReason {
+    /// The command exited on its own; `code` says how.
+    Exited,
+    /// A signal nobody here sent — a crash, the OOM killer.
+    Signaled,
+    /// Stopped on request: `kill` (tool or host) or the session ending.
+    Killed,
+    /// Outlived its `max_secs` budget.
+    Timeout,
+    /// Its log outgrew the on-disk cap.
+    LogCap,
+    /// The exit status could not be read.
+    Error,
 }
 
 /// Host-installed registry for this context (and its delegated children).
@@ -140,9 +163,10 @@ impl BgRegistry {
                 state: match &job.state {
                     JobState::Running => BgJobState::Running,
                     JobState::Paused => BgJobState::Paused,
-                    JobState::Done(label) => BgJobState::Done {
+                    JobState::Done(label, reason) => BgJobState::Done {
                         label: label.clone(),
                         code: exit_code(label),
+                        reason: *reason,
                     },
                 },
                 started_at_ms: job
@@ -168,9 +192,14 @@ impl BgRegistry {
             .map_err(|e| e.to_string())
     }
 
-    /// Stop a job — the tool's `kill`, without its completion notice.
+    /// Stop a job on the user's behalf. Unlike the tool's `kill` the model
+    /// did not ask for this, so a job that notifies still reports — as
+    /// stopped by the user — and the model never goes on believing it runs.
     pub async fn kill(&self, id: &str) -> Result<(), String> {
-        kill(self, &BgArgs::for_id(id)).await.map(drop).map_err(|e| e.to_string())
+        kill(self, &BgArgs::for_id(id), Requester::Host)
+            .await
+            .map(drop)
+            .map_err(|e| e.to_string())
     }
 
     /// Freeze (`true`) or continue (`false`) a job — the tool's `pause` /
@@ -262,6 +291,9 @@ struct Job {
     finished: Option<Instant>,
     /// Whether completion should be pushed to the model.
     notify: bool,
+    /// Stopped from the host's controls, not by the model — its notice says
+    /// so.
+    killed_by_user: bool,
     /// A `wait` in flight suppresses the push: the caller gets the result
     /// directly and must not also receive it as a notice.
     waiters: usize,
@@ -276,19 +308,19 @@ struct Job {
 enum JobState {
     Running,
     Paused,
-    Done(String),
+    Done(String, BgEndReason),
 }
 
 impl JobState {
     fn is_done(&self) -> bool {
-        matches!(self, Self::Done(_))
+        matches!(self, Self::Done(..))
     }
 
     fn label(&self) -> String {
         match self {
             Self::Running => "running".into(),
             Self::Paused => "paused".into(),
-            Self::Done(label) => label.clone(),
+            Self::Done(label, _) => label.clone(),
         }
     }
 }
@@ -300,6 +332,7 @@ struct JobSnapshot {
     command: String,
     log_path: PathBuf,
     state: String,
+    killed_by_user: bool,
     pid: Option<u32>,
     elapsed: Duration,
 }
@@ -310,6 +343,7 @@ fn snapshot(id: &str, job: &Job) -> JobSnapshot {
         command: job.command.clone(),
         log_path: job.log_path.clone(),
         state: job.state.label(),
+        killed_by_user: job.killed_by_user,
         pid: job.pid,
         elapsed: elapsed_of(job),
     }
@@ -367,8 +401,13 @@ fn summary(snap: &JobSnapshot) -> String {
 
 fn notice(snap: &JobSnapshot) -> String {
     let mut out = format!(
-        "[background task {} finished: {} after {}] {}",
+        "[background task {} {}: {} after {}] {}",
         snap.id,
+        if snap.killed_by_user {
+            "stopped by the user"
+        } else {
+            "finished"
+        },
         snap.state,
         human(snap.elapsed),
         crate::util::head(&snap.command, 300),
@@ -461,7 +500,8 @@ fn spawn_monitor(
         let mut ctl_closed = false;
         let mut timed_out = false;
         let mut log_capped = false;
-        let label = loop {
+        let mut kill_asked = false;
+        let (label, signaled) = loop {
             let step = tokio::select! {
                 status = child.wait() => Step::Exited(status),
                 cmd = ctl.recv(), if !ctl_closed => Step::Ctl(cmd),
@@ -469,12 +509,18 @@ fn spawn_monitor(
                 _ = tokio::time::sleep(LOG_CHECK) => Step::LogTick,
             };
             match step {
-                Step::Exited(Ok(status)) => break status_label(status),
-                Step::Exited(Err(e)) => break format!("status error: {e}"),
-                Step::Ctl(Some(Ctl::Kill)) => kill_now(pid, &mut child),
+                Step::Exited(Ok(status)) => {
+                    break (status_label(status), Some(status.code().is_none()))
+                }
+                Step::Exited(Err(e)) => break (format!("status error: {e}"), None),
+                Step::Ctl(Some(Ctl::Kill)) => {
+                    kill_asked = true;
+                    kill_now(pid, &mut child);
+                }
                 // The registry is going away; make sure the child follows it.
                 Step::Ctl(None) => {
                     ctl_closed = true;
+                    kill_asked = true;
                     kill_now(pid, &mut child);
                 }
                 Step::Deadline => {
@@ -490,17 +536,30 @@ fn spawn_monitor(
                 }
             }
         };
-        let label = if log_capped {
-            format!("killed(log over {} MiB)", MAX_LOG_ON_DISK / (1024 * 1024))
+        // Our own kills first: the child of a killed job usually reports a
+        // signal, and that signal is ours, not a crash.
+        let (label, reason) = if log_capped {
+            (
+                format!("killed(log over {} MiB)", MAX_LOG_ON_DISK / (1024 * 1024)),
+                BgEndReason::LogCap,
+            )
         } else if timed_out {
-            "killed(timeout)".to_string()
+            ("killed(timeout)".to_string(), BgEndReason::Timeout)
         } else {
-            label
+            let reason = match signaled {
+                None => BgEndReason::Error,
+                // A command that traps the kill and exits still ended because
+                // it was asked to.
+                Some(_) if kill_asked => BgEndReason::Killed,
+                Some(true) => BgEndReason::Signaled,
+                Some(false) => BgEndReason::Exited,
+            };
+            (label, reason)
         };
         // A dropped registry has nothing left to settle; the exit is still
         // reaped because the child belonged to this task.
         if let Some(reg) = reg.upgrade() {
-            settle(&reg, &id, label);
+            settle(&reg, &id, label, reason);
         }
     });
 }
@@ -532,7 +591,7 @@ fn log_size(path: &Path) -> u64 {
 }
 
 /// Mark a job finished, hand the exit to whoever waits, and push the notice.
-fn settle(reg: &BgRegistry, id: &str, label: String) {
+fn settle(reg: &BgRegistry, id: &str, label: String, reason: BgEndReason) {
     let pending = {
         let mut map = lock(&reg.map);
         let Some(job) = map.get_mut(id) else {
@@ -542,7 +601,7 @@ fn settle(reg: &BgRegistry, id: &str, label: String) {
         if let Some(paused_at) = job.paused_at.take() {
             job.paused_total += now.saturating_duration_since(paused_at);
         }
-        job.state = JobState::Done(label);
+        job.state = JobState::Done(label, reason);
         job.finished = Some(now);
         // The child was reaped by the monitor: this pid is free to be reused,
         // so the registry must forget it. (A later `Drop` would otherwise
@@ -648,6 +707,7 @@ where
         paused_total: Duration::ZERO,
         finished: None,
         notify,
+        killed_by_user: false,
         waiters: 0,
         done,
         ctl,
@@ -815,7 +875,16 @@ async fn wait(
     Ok(ToolResult::text(out))
 }
 
-async fn kill(reg: &BgRegistry, parsed: &BgArgs) -> Result<ToolResult, ToolError> {
+/// Who asked for a kill — it decides whether the model hears about it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Requester {
+    /// The model's own `bg_run kill`: it knows, a notice would be noise.
+    Model,
+    /// The host's control surface (a user's click): the model must be told.
+    Host,
+}
+
+async fn kill(reg: &BgRegistry, parsed: &BgArgs, by: Requester) -> Result<ToolResult, ToolError> {
     let id = need_id(parsed)?;
     let mut rx = {
         let mut map = lock(&reg.map);
@@ -826,9 +895,12 @@ async fn kill(reg: &BgRegistry, parsed: &BgArgs) -> Result<ToolResult, ToolError
                 job.state.label()
             )));
         }
-        // The caller asked for this kill — a "finished: killed" notice would
-        // be pure noise.
-        job.notify = false;
+        match by {
+            // The caller asked for this kill — a "finished: killed" notice
+            // would be pure noise.
+            Requester::Model => job.notify = false,
+            Requester::Host => job.killed_by_user = true,
+        }
         let _ = job.ctl.send(Ctl::Kill);
         job.done.subscribe()
     };
@@ -1186,7 +1258,7 @@ where
         Action::Status => status(&reg, &parsed),
         Action::Logs => logs(&reg, &parsed),
         Action::Wait => wait(&reg, &parsed, ctx.cancel_flag()).await,
-        Action::Kill => kill(&reg, &parsed).await,
+        Action::Kill => kill(&reg, &parsed, Requester::Model).await,
         Action::Pause => pause(&reg, &parsed, true),
         Action::Resume => pause(&reg, &parsed, false),
         Action::Remove => remove(&reg, &parsed),
@@ -1506,6 +1578,71 @@ mod tests {
         );
     }
 
+    /// A stop from the host's controls is news to the model: it gets a
+    /// notice saying the user stopped the job, and the job reads as killed.
+    #[tokio::test]
+    async fn a_host_kill_tells_the_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, reg) = test_ctx(dir.path());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        reg.set_notifier(move |text| {
+            let _ = tx.send(text);
+        });
+
+        let out = call(
+            serde_json::json!({"action": "run", "command": "sleep 30"}),
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+        let id = job_id(&out.content);
+        reg.kill(&id).await.unwrap();
+
+        let text = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a host kill must reach the model")
+            .unwrap();
+        assert!(
+            text.starts_with(&format!("[background task {id} stopped by the user:")),
+            "{text}"
+        );
+        assert!(matches!(
+            reg.jobs()[0].state,
+            BgJobState::Done {
+                reason: BgEndReason::Killed,
+                ..
+            }
+        ));
+    }
+
+    /// Our own caps are reported as such, not as the signal they used.
+    #[tokio::test]
+    async fn a_capped_job_reports_why_it_ended() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, reg) = test_ctx(dir.path());
+        let out = call(
+            serde_json::json!({"action": "run", "command": "sleep 30", "max_secs": 1, "notify": false}),
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+        let id = job_id(&out.content);
+        call(
+            serde_json::json!({"action": "wait", "id": id, "timeout_secs": 10}),
+            ctx,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            reg.jobs()[0].state,
+            BgJobState::Done {
+                reason: BgEndReason::Timeout,
+                code: None,
+                ..
+            }
+        ));
+    }
+
     /// #3: a reaped child's pid is free to be reused, so the registry must
     /// forget it — otherwise `Drop` would SIGKILL an unrelated process.
     #[tokio::test]
@@ -1786,9 +1923,14 @@ mod tests {
         .await
         .expect("the kill settles the job");
         match &reg.jobs()[0].state {
-            BgJobState::Done { label, code } => {
+            BgJobState::Done {
+                label,
+                code,
+                reason,
+            } => {
                 assert!(label.starts_with("killed"), "{label}");
                 assert_eq!(*code, None);
+                assert_eq!(*reason, BgEndReason::Killed);
             }
             other => panic!("{other:?}"),
         }
@@ -1820,7 +1962,8 @@ mod tests {
             job.state,
             BgJobState::Done {
                 label: "exited(3)".into(),
-                code: Some(3)
+                code: Some(3),
+                reason: BgEndReason::Exited,
             }
         );
     }
@@ -1843,13 +1986,14 @@ mod tests {
             command: "cargo test".into(),
             pid: None,
             log_path: PathBuf::from("/tmp/x.log"),
-            state: JobState::Done("exited(0)".into()),
+            state: JobState::Done("exited(0)".into(), BgEndReason::Exited),
             started: now - Duration::from_secs(10),
             started_wall: SystemTime::now(),
             paused_at: None,
             paused_total: Duration::from_secs(4),
             finished: Some(now),
             notify: false,
+            killed_by_user: false,
             waiters: 0,
             done,
             ctl,
