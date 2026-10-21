@@ -26,7 +26,9 @@ use tokio::sync::{mpsc, watch};
 
 use crate::log::{create_log, log_dir, read_tail, DEFAULT_TAIL_LINES};
 use agent_capabilities::{SandboxCtx, WorkspaceCtx};
-use agent_tool::{schema_for, Args, CallRisk, Review, ToolContext, ToolError, ToolResult, ToolSpec};
+use agent_tool::{
+    schema_for, Args, CallRisk, Review, ToolContext, ToolError, ToolResult, ToolSpec,
+};
 
 /// How long `wait` blocks when the call names no timeout.
 const DEFAULT_WAIT_SECS: u64 = 30;
@@ -87,9 +89,10 @@ pub struct BgJobInfo {
     pub elapsed_ms: u64,
     /// Whether completion is pushed to the model.
     pub notify: bool,
-    /// Started by a context with no completion sink of its own — in a host
-    /// that installs one per session, a delegated child's job.
-    pub from_child: bool,
+    /// Whether the context that started this job installed its own completion
+    /// sink. In a host that installs one per session, `false` means a
+    /// delegated child's job: it reports to no one but this list.
+    pub has_own_sink: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
@@ -176,11 +179,15 @@ impl BgRegistry {
                     .unwrap_or(0),
                 elapsed_ms: elapsed_of(job).as_millis() as u64,
                 notify: job.notify,
-                from_child: job.notifier.is_none(),
+                has_own_sink: job.notifier.is_some(),
             })
             .collect();
         // `bg-10` after `bg-9`: the map's string order would not say so.
-        jobs.sort_by_key(|j| j.id.trim_start_matches("bg-").parse::<u64>().unwrap_or(u64::MAX));
+        jobs.sort_by_key(|j| {
+            j.id.trim_start_matches("bg-")
+                .parse::<u64>()
+                .unwrap_or(u64::MAX)
+        });
         jobs
     }
 
@@ -205,18 +212,26 @@ impl BgRegistry {
     /// Freeze (`true`) or continue (`false`) a job — the tool's `pause` /
     /// `resume`.
     pub fn set_paused(&self, id: &str, paused: bool) -> Result<(), String> {
-        pause(self, &BgArgs::for_id(id), paused).map(drop).map_err(|e| e.to_string())
+        pause(self, &BgArgs::for_id(id), paused)
+            .map(drop)
+            .map_err(|e| e.to_string())
     }
 
     /// Drop a finished job and its log — the tool's `remove`.
     pub fn remove(&self, id: &str) -> Result<(), String> {
-        remove(self, &BgArgs::for_id(id)).map(drop).map_err(|e| e.to_string())
+        remove(self, &BgArgs::for_id(id))
+            .map(drop)
+            .map_err(|e| e.to_string())
     }
 }
 
 /// The exit code inside a `status_label` — `None` for a signal or an error.
 fn exit_code(label: &str) -> Option<i32> {
-    label.strip_prefix("exited(")?.strip_suffix(')')?.parse().ok()
+    label
+        .strip_prefix("exited(")?
+        .strip_suffix(')')?
+        .parse()
+        .ok()
 }
 
 impl Drop for BgRegistry {
@@ -251,10 +266,7 @@ pub fn install_registry<C: ToolContext>(ctx: &mut C) -> Arc<BgRegistry> {
 
 /// Install this context's completion sink. Deliberately not `insert_shared`:
 /// a delegated child must not push notices into the parent's turn.
-pub fn install_notifier<C: ToolContext>(
-    ctx: &mut C,
-    f: impl Fn(String) + Send + Sync + 'static,
-) {
+pub fn install_notifier<C: ToolContext>(ctx: &mut C, f: impl Fn(String) + Send + Sync + 'static) {
     ctx.extensions_mut()
         .insert(Arc::new(BgNotifierSlot(Arc::new(f))));
 }
@@ -472,11 +484,7 @@ fn no_job(id: &str) -> ToolError {
 }
 
 /// Run one action against one job with the registry lock held.
-fn with_job<T>(
-    reg: &BgRegistry,
-    id: &str,
-    f: impl FnOnce(&Job) -> T,
-) -> Result<T, ToolError> {
+fn with_job<T>(reg: &BgRegistry, id: &str, f: impl FnOnce(&Job) -> T) -> Result<T, ToolError> {
     let map = lock(&reg.map);
     map.get(id).map(f).ok_or_else(|| no_job(id))
 }
@@ -691,9 +699,8 @@ where
         .spawn()
         .map_err(|e| ToolError::Failed(format!("spawn background job: {e}")))?;
     let pid = child.id();
-    let deadline = max_secs.map(|secs| {
-        Instant::now() + Duration::from_secs(secs.clamp(1, MAX_JOB_SECS))
-    });
+    let deadline =
+        max_secs.map(|secs| Instant::now() + Duration::from_secs(secs.clamp(1, MAX_JOB_SECS)));
     let (done, _) = watch::channel(false);
     let (ctl, ctl_rx) = mpsc::unbounded_channel();
     let job = Job {
@@ -769,7 +776,11 @@ fn status(reg: &BgRegistry, parsed: &BgArgs) -> Result<ToolResult, ToolError> {
     let id = need_id(parsed)?;
     let snap = with_job(reg, &id, |job| snapshot(&id, job))?;
     let mut out = summary(&snap);
-    push_tail(&mut out, &snap.log_path, parsed.tail_lines.unwrap_or(10).min(500));
+    push_tail(
+        &mut out,
+        &snap.log_path,
+        parsed.tail_lines.unwrap_or(10).min(500),
+    );
     Ok(ToolResult::text(out))
 }
 
@@ -865,7 +876,11 @@ async fn wait(
     let mut out = summary(&snap);
     if done {
         out.push_str(&format!("done after {}\n", human(snap.elapsed)));
-        push_tail(&mut out, &snap.log_path, parsed.tail_lines.unwrap_or(20).min(500));
+        push_tail(
+            &mut out,
+            &snap.log_path,
+            parsed.tail_lines.unwrap_or(20).min(500),
+        );
     } else {
         out.push_str(&format!(
             "still running after {}s — call wait again or status/logs\n",
@@ -1208,16 +1223,16 @@ pub fn spec<C: WorkspaceCtx + SandboxCtx>() -> ToolSpec<C> {
              `command` and returns a bg-N id; list shows every job; status \
              shows one job; logs tails its output; kill stops it; pause/\
              resume freeze and continue it; remove drops a finished job. \
-             Start the job and keep working: with notify=true (default) the \
+             Start it and keep working: with notify=true (default) the \
              completion is pushed to you on its own, between tool calls or as \
              a new turn once the session is idle. wait blocks until the job \
-             ends or timeout_secs (default 30) — prefer it over sleep, and use \
-             it ONLY when the next step cannot proceed without this result; \
-             otherwise it just stalls the turn, and status/logs already answer \
-             instantly. Unlike bash(persistent) for servers, bg_run records \
-             the exit status. All jobs run under the same sandbox as bash \
-             (same fs/network/env limits, no stdin) and are killed when the \
-             session that started them ends.",
+             ends or timeout_secs (default 30); max_secs kills a job that \
+             outlives its budget. When waiting is worth it rather than keep \
+             working is in the system prompt's Background work section. \
+             Unlike bash(persistent) for servers, bg_run records the exit \
+             status. All jobs run under the same sandbox as bash (same \
+             fs/network/env limits, no stdin) and are killed when the session \
+             that started them ends.",
         ),
         readonly: false,
         class: agent_tool::ToolClass::Process,
@@ -1284,7 +1299,10 @@ mod tests {
             .to_string()
     }
 
-    async fn call(args: serde_json::Value, ctx: Arc<crate::TestCtx>) -> Result<ToolResult, ToolError> {
+    async fn call(
+        args: serde_json::Value,
+        ctx: Arc<crate::TestCtx>,
+    ) -> Result<ToolResult, ToolError> {
         exec(args, ctx).await
     }
 
@@ -1415,11 +1433,13 @@ mod tests {
     #[tokio::test]
     async fn only_the_starting_context_gets_the_notice() {
         let dir = tempfile::tempdir().unwrap();
-        let parent = Arc::new(crate::TestCtx::with_sandbox(
-            dir.path(),
-            Arc::new(NoneBackend) as Arc<dyn agent_sandbox::SandboxBackend>,
-        )
-        .with_workspace(dir.path()));
+        let parent = Arc::new(
+            crate::TestCtx::with_sandbox(
+                dir.path(),
+                Arc::new(NoneBackend) as Arc<dyn agent_sandbox::SandboxBackend>,
+            )
+            .with_workspace(dir.path()),
+        );
         let mut ctx = Arc::try_unwrap(parent).ok().unwrap();
         let reg = install_registry(&mut ctx);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1434,9 +1454,12 @@ mod tests {
             let _ = fallback_tx.send(text);
         });
 
-        let out = call(serde_json::json!({"action": "run", "command": "true"}), ctx.clone())
-            .await
-            .unwrap();
+        let out = call(
+            serde_json::json!({"action": "run", "command": "true"}),
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
         let id = job_id(&out.content);
         let first = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
@@ -1650,9 +1673,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (ctx, reg) = test_ctx(dir.path());
 
-        let out = call(serde_json::json!({"action": "run", "command": "true"}), ctx.clone())
-            .await
-            .unwrap();
+        let out = call(
+            serde_json::json!({"action": "run", "command": "true"}),
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
         let id = job_id(&out.content);
         call(
             serde_json::json!({"action": "wait", "id": id, "timeout_secs": 10}),
@@ -1754,9 +1780,12 @@ mod tests {
         .await
         .unwrap();
         let id = job_id(&out.content);
-        call(serde_json::json!({"action": "pause", "id": id}), ctx.clone())
-            .await
-            .unwrap();
+        call(
+            serde_json::json!({"action": "pause", "id": id}),
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
 
         let started = Instant::now();
         let out = call(
@@ -1835,7 +1864,10 @@ mod tests {
             Arc::new(NoneBackend) as Arc<dyn agent_sandbox::SandboxBackend>,
         )));
         let cancel = Arc::new(AtomicBool::new(false));
-        let mut ctx = CancelCtx { ext, cancel: cancel.clone() };
+        let mut ctx = CancelCtx {
+            ext,
+            cancel: cancel.clone(),
+        };
         ctx = ctx.with_workspace(dir.path());
         install_registry(&mut ctx);
         let ctx = Arc::new(ctx);
@@ -1869,12 +1901,9 @@ mod tests {
         let err = result.expect_err("a cancelled wait is an error");
         assert!(format!("{err}").contains("cancelled"), "{err}");
 
-        exec::<CancelCtx>(
-            serde_json::json!({"action": "kill", "id": id}),
-            ctx,
-        )
-        .await
-        .unwrap();
+        exec::<CancelCtx>(serde_json::json!({"action": "kill", "id": id}), ctx)
+            .await
+            .unwrap();
     }
 
     /// The reported duration is work, not time spent paused.
@@ -1901,7 +1930,7 @@ mod tests {
         assert!(jobs[0].started_at_ms > 0);
         // The registry belongs to the context that started the job, but the
         // test context installed no sink of its own.
-        assert!(jobs[0].from_child);
+        assert!(!jobs[0].has_own_sink);
 
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(reg.tail(&id, 10).unwrap().contains("hello"));
@@ -2029,10 +2058,7 @@ mod tests {
             CallRisk::RequiresApproval
         );
         let run = serde_json::json!({ "command": "cargo test" });
-        assert_eq!(
-            review::<crate::TestCtx>(&run, &ctx).risk,
-            CallRisk::Normal
-        );
+        assert_eq!(review::<crate::TestCtx>(&run, &ctx).risk, CallRisk::Normal);
         // No command at all is a broken call, not a harmless one.
         let empty = serde_json::json!({ "action": "run" });
         assert_eq!(
