@@ -6,6 +6,7 @@
 //! go through, so a test run is not a lesser command than a shell run.
 
 pub mod bash;
+mod log;
 pub mod risk;
 pub mod sandbox_cfg;
 pub mod services;

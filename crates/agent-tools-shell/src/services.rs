@@ -23,12 +23,9 @@ use std::sync::{Arc, LazyLock};
 use futures::FutureExt;
 use tokio::sync::Mutex;
 
+use crate::log::{create_log, log_dir, read_tail, DEFAULT_TAIL_LINES};
 use agent_capabilities::SandboxCtx;
 use agent_tool::{schema_for, Args, ToolError, ToolResult, ToolSpec};
-
-/// Cap on a `logs` read — services can write unbounded output.
-const MAX_LOG_BYTES: u64 = 256 * 1024;
-const DEFAULT_TAIL_LINES: usize = 80;
 
 /// The set of live background services one owner can see and stop. A host
 /// installs one per session ([`ServiceRegistrySlot`]) so sessions never see
@@ -77,10 +74,6 @@ impl Drop for Service {
     }
 }
 
-fn log_dir() -> PathBuf {
-    std::env::temp_dir().join(format!("agent-svc-{}", std::process::id()))
-}
-
 /// Spawn `command` as a registered background service via `wrap_spawn`.
 /// Called by `bash` when `persistent: true`. Returns the model-facing text.
 pub async fn spawn_persistent<C: SandboxCtx>(
@@ -99,15 +92,10 @@ pub async fn spawn_persistent<C: SandboxCtx>(
         })?;
 
     let id = format!("svc-{}", NEXT_ID.fetch_add(1, Ordering::Relaxed));
-    let dir = log_dir();
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| ToolError::Failed(format!("service log dir: {e}")))?;
-    let log_path = dir.join(format!("{id}.log"));
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .map_err(|e| ToolError::Failed(format!("service log file: {e}")))?;
+    // Private dir + 0600 file, never through a symlink: service output can
+    // carry tokens.
+    let dir = log_dir("agent-svc")?;
+    let (log, log_path) = create_log(&dir, &id)?;
     let log_err = log
         .try_clone()
         .map_err(|e| ToolError::Failed(e.to_string()))?;
@@ -140,28 +128,6 @@ pub async fn spawn_persistent<C: SandboxCtx>(
         pid,
         log_path.display()
     )))
-}
-
-/// Last `lines` of the log, reading at most MAX_LOG_BYTES from the tail.
-fn read_log_tail(path: &PathBuf, lines: usize) -> Result<String, ToolError> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut f = std::fs::File::open(path)
-        .map_err(|e| ToolError::Failed(format!("log {}: {e}", path.display())))?;
-    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
-    let off = len.saturating_sub(MAX_LOG_BYTES);
-    f.seek(SeekFrom::Start(off)).ok();
-    let mut buf = String::new();
-    f.read_to_string(&mut buf)
-        .map_err(|e| ToolError::Failed(e.to_string()))?;
-    // If we cut mid-line, drop the partial first line.
-    if off > 0 {
-        if let Some(nl) = buf.find('\n') {
-            buf.drain(..=nl);
-        }
-    }
-    let tail: Vec<&str> = buf.lines().collect();
-    let start = tail.len().saturating_sub(lines);
-    Ok(tail[start..].join("\n"))
 }
 
 fn status_of(svc: &mut Service) -> String {
@@ -236,7 +202,7 @@ async fn exec<C: SandboxCtx>(args: Args, ctx: Arc<C>) -> Result<ToolResult, Tool
                 .get_mut(&id)
                 .ok_or_else(|| ToolError::Failed(format!("no service {id}")))?;
             let status = status_of(svc);
-            let body = read_log_tail(
+            let body = read_tail(
                 &svc.log_path.clone(),
                 parsed.tail_lines.unwrap_or(DEFAULT_TAIL_LINES),
             )?;
