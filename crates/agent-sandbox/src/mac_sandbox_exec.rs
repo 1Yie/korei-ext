@@ -289,6 +289,10 @@ impl SandboxBackend for MacSandboxExec {
             envs.extend(proxied_env(run));
         }
         c.env_clear().envs(envs);
+        // Own process group: pause/resume and kill address the whole tree,
+        // and a negative-pid signal can never reach the agent's own group.
+        #[cfg(unix)]
+        c.process_group(0);
         Some(c)
     }
 }

@@ -218,6 +218,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "futures",
+ "libc",
  "schemars",
  "serde",
  "serde_json",
