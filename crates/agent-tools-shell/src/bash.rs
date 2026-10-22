@@ -38,12 +38,16 @@ pub fn spec<C: WorkspaceCtx + SandboxCtx>() -> ToolSpec<C> {
     ToolSpec {
         name: "bash",
         schema: schema_for::<BashArgs>(
-            "Run a shell command in the workspace. Output is truncated to \
-             20 KB (head 30% + tail 70%). Prefer dedicated tools \
-             (smart_read/smart_grep/fuzzy_patch/apply_patch) for file IO —
-             never `cat`/`echo`/`sed` to create or edit files; use apply_patch
-             to create new files/folders, fuzzy_patch for in-place edits.
-             bash is for builds, tests, and commands those don't cover.
+            "Run a shell command in the workspace sandbox: builds, tests, package \
+             managers, git, scripts, process and runtime diagnostics, and reading \
+             what the file tools cannot reach (dependency sources, ignored trees, \
+             paths outside the workspace). Not for looking at workspace files: \
+             reading, searching and listing them is smart_read / smart_grep / \
+             list_dir, which return line numbers and a `content_hash` the patch \
+             tools anchor on — several at once via `batch_execute`. Never create \
+             or edit files through the shell (`cat >`, `echo >`, `sed -i`, \
+             scripts): apply_patch creates, fuzzy_patch edits. Output is \
+             truncated to 20 KB (head 30% + tail 70%).
              Set persistent=true for long-lived services (dev servers, DBs,
              watchers): the process survives across calls under the same
              sandbox, output goes to a log file, manage via the `service`

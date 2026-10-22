@@ -33,9 +33,10 @@ pub fn spec<C: WorkspaceCtx>() -> ToolSpec<C> {
     ToolSpec {
         name: "list_dir",
         schema: schema_for::<ListDirArgs>(
-            "List directory entries (dirs carry a trailing `/`). Respects \
-             .gitignore. Bounded output — use smart_grep/smart_read for \
-             targeted lookups instead of deep listings.",
+            "List a workspace directory — the listing tool, in place of `ls` / \
+             `find` / `tree` through bash. Directories carry a trailing `/`, \
+             .gitignore is respected, `depth` goes up to 4. Bounded output; to \
+             locate code by content use smart_grep rather than deep listings.",
         ),
         readonly: true,
         class: agent_tool::ToolClass::Observation,

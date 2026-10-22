@@ -45,14 +45,17 @@ pub fn spec<C: WorkspaceCtx>() -> ToolSpec<C> {
     ToolSpec {
         name: "smart_read",
         schema: schema_for::<SmartReadArgs>(
-            "Read ONE file structurally: `outline` returns a signature skeleton \
-             (~100 tokens for large files), `range` returns numbered lines with \
-             a content_hash for patch anchoring, `search` returns matching \
-             lines with numbers. Prefer outline→range over dumping whole files. \
-             When you already know 2+ independent files/ranges to inspect, do \
-             NOT call smart_read repeatedly — send them as ONE batch_execute. \
-             Call smart_read directly only for a single read, or when the next \
-             read's target depends on this read's result.",
+            "Read ONE workspace file — the read tool for anything inside the \
+             workspace, in place of `cat` / `sed -n` / `head` / `tail` through \
+             bash. Modes: `outline` (signature skeleton, cheap for large files), \
+             `range` (numbered lines, `start`/`end`; whole file when omitted, up \
+             to 1000 lines), `search` (lines matching `pattern`). Every result \
+             carries a `content_hash` the patch tools anchor on. Several files, \
+             or several ranges of one file → ONE `batch_execute`: never read A → \
+             read B when both were known up front. Read again only for lines you \
+             have not seen (past a `[truncated …]` marker) or after the file \
+             changed. Paths outside the workspace (dependency sources, system \
+             files) are bash's job.",
         ),
         readonly: true,
         class: agent_tool::ToolClass::Observation,
