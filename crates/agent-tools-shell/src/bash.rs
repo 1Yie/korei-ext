@@ -10,7 +10,7 @@ use std::time::Duration;
 use futures::FutureExt;
 use serde::Deserialize;
 
-use crate::sandbox_cfg::sandbox_config;
+use crate::sandbox_cfg::prepare;
 use agent_capabilities::SandboxCtx;
 use agent_capabilities::WorkspaceCtx;
 use agent_tool::{schema_for, Args, ToolError, ToolResult, ToolSpec};
@@ -78,12 +78,14 @@ async fn exec<C: WorkspaceCtx + SandboxCtx>(
         .unwrap_or(DEFAULT_TIMEOUT)
         .min(MAX_TIMEOUT);
 
-    // Audit before spawn; its verdict becomes the result's risk tier.
-    // Scoped to the workspace so out-of-scope writes flag ScopeViolation.
-    let verdict = agent_sandbox::audit_command_scoped(&parsed.command, Some(ctx.root()?));
+    // The boundary the file tools hold, held the same way here: a write
+    // outside every granted root is refused when nothing confines the process —
+    // otherwise `bash` is the way around each grant the host hands out.
+    crate::sandbox_cfg::refuse_unconfined_write(&*ctx, &parsed.command)?;
 
+    // Audit before spawn; its verdict becomes the result's risk tier.
+    let (verdict, cfg) = prepare(&*ctx, &parsed.command, timeout)?;
     let sandbox = ctx.sandbox()?;
-    let cfg = sandbox_config(&verdict, ctx.root()?, timeout, &ctx.sandbox_limits());
 
     if parsed.persistent.unwrap_or(false) {
         return crate::services::spawn_persistent(&ctx, &cfg, &parsed.command).await;

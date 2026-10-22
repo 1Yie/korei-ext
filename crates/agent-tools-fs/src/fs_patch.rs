@@ -23,7 +23,8 @@ const FUZZY_THRESHOLD: f64 = 0.9;
 
 #[derive(Debug, serde::Serialize, Deserialize, schemars::JsonSchema)]
 struct FuzzyPatchArgs {
-    /// Workspace-relative path.
+    /// Workspace-relative path, or an absolute path inside a read-write
+    /// linked workspace.
     path: String,
     /// Exact source text to find. Must match uniquely — add surrounding
     /// context lines if it matches more than once.

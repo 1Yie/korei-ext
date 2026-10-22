@@ -20,7 +20,7 @@ use grep_searcher::SinkError;
 use grep_searcher::{Searcher, SearcherBuilder, Sink, SinkContext, SinkMatch};
 use serde::Deserialize;
 
-use agent_capabilities::WorkspaceCtx;
+use agent_capabilities::{PathScope, WorkspaceCtx};
 use agent_tool::{schema_for, Args, ToolError, ToolResult, ToolSpec};
 
 /// Stdout cap per truncation table.
@@ -56,7 +56,8 @@ const BINARY_EXTS: &[&str] = &[
 struct GrepArgs {
     /// Regex or literal pattern (max 4 KiB).
     pattern: String,
-    /// Subtree to search — workspace-relative (default workspace root).
+    /// Subtree to search — workspace-relative (default workspace root), or an
+    /// absolute path inside a linked workspace.
     path: Option<String>,
     /// File-glob filter, e.g. `*.rs` or `src/**/*.rs` (default: all
     /// non-ignored files). `*` stays inside one path component.
@@ -87,8 +88,9 @@ pub fn spec<C: WorkspaceCtx>() -> ToolSpec<C> {
              `context: N` adds N lines before and after each hit (like `grep -C N`, max 10), so \
              a hit and its surroundings come back in ONE call. `path` narrows the subtree, \
              `glob` the file names. Several independent searches → ONE `batch_execute`. \
-             Ignored trees (node_modules, target) and paths outside the workspace are bash's \
-             job.",
+             Inside a linked workspace, hits are printed as absolute paths. Ignored trees \
+             (node_modules, target) and paths outside the workspace and its linked \
+             workspaces are bash's job.",
         ),
         readonly: true,
         class: agent_tool::ToolClass::Observation,
@@ -115,7 +117,7 @@ async fn exec<C: WorkspaceCtx>(args: Args, ctx: Arc<C>) -> Result<ToolResult, To
         )));
     }
 
-    let base = ctx.resolve(parsed.path.as_deref().unwrap_or("."))?;
+    let scope = ctx.scope_of(parsed.path.as_deref().unwrap_or("."))?;
 
     let mut builder = grep_regex::RegexMatcherBuilder::new();
     if parsed.ignore_case.unwrap_or(false) {
@@ -149,7 +151,18 @@ async fn exec<C: WorkspaceCtx>(args: Args, ctx: Arc<C>) -> Result<ToolResult, To
 
     let include_hidden = parsed.include_hidden.unwrap_or(false);
     let context = parsed.context.unwrap_or(0).min(MAX_CONTEXT);
-    let ws = ctx.root()?.to_path_buf();
+    // Globs match relative to the root the search sits in. Hits inside the
+    // workspace print workspace-relative paths; hits in a linked workspace
+    // print absolute ones, since a relative path always means the workspace.
+    let (base, glob_root, absolute) = match scope {
+        PathScope::Workspace(p) => (p, ctx.root()?.to_path_buf(), false),
+        PathScope::Linked { path, root, .. } => (path, root, true),
+        PathScope::Outside(_) => {
+            return Err(ToolError::PathEscape(
+                parsed.path.clone().unwrap_or_else(|| ".".into()),
+            ))
+        }
+    };
     let ctx_cancel = ctx.cancel_flag();
 
     // Shared stop flag: the timeout arms it so the blocking search actually
@@ -160,7 +173,8 @@ async fn exec<C: WorkspaceCtx>(args: Args, ctx: Arc<C>) -> Result<ToolResult, To
     let handle = tokio::task::spawn_blocking(move || {
         search_sync(
             &base,
-            &ws,
+            &glob_root,
+            absolute,
             &matcher,
             glob_matcher.as_ref(),
             include_hidden,
@@ -281,7 +295,8 @@ fn text_of(bytes: &[u8]) -> String {
 
 fn search_sync(
     base: &std::path::Path,
-    workspace: &std::path::Path,
+    glob_root: &std::path::Path,
+    absolute: bool,
     matcher: &RegexMatcher,
     glob_matcher: Option<&globset::GlobMatcher>,
     include_hidden: bool,
@@ -324,9 +339,9 @@ fn search_sync(
             continue;
         }
 
-        // Glob matches the workspace-RELATIVE path — an absolute match on
+        // Glob matches the root-RELATIVE path — an absolute match on
         // `src/**/*.rs` would hinge on where the workspace happens to sit.
-        let rel_path = entry.path().strip_prefix(workspace).unwrap_or(entry.path());
+        let rel_path = entry.path().strip_prefix(glob_root).unwrap_or(entry.path());
         if let Some(m) = glob_matcher {
             if !m.is_match(rel_path) {
                 continue;
@@ -351,7 +366,8 @@ fn search_sync(
         }
 
         scanned += 1;
-        let rel = rel_path.to_string_lossy().replace('\\', "/");
+        let shown = if absolute { entry.path() } else { rel_path };
+        let rel = shown.to_string_lossy().replace('\\', "/");
 
         // Counting and the output budget live INSIDE the sink, so `Ok(false)`
         // aborts this file the moment either runs out instead of buffering
@@ -443,7 +459,7 @@ mod tests {
             .expect("pattern");
         let stop = AtomicBool::new(false);
         search_sync(
-            root, root, &matcher, None, false, context, MAX_HITS, &stop, &None,
+            root, root, false, &matcher, None, false, context, MAX_HITS, &stop, &None,
         )
         .expect("search")
         .content
@@ -491,5 +507,24 @@ mod tests {
         );
         let out = search(dir.path(), "line(2|25)$", 1);
         assert_eq!(out.matches("--\n").count(), 1, "{out}");
+    }
+
+    /// A search in a linked workspace prints absolute paths (a relative one
+    /// would name the workspace) while the glob still matches relative to
+    /// that root.
+    #[test]
+    fn linked_root_hits_are_absolute_and_globbed_relative_to_it() {
+        let dir = tree(3);
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/b.rs"), "line2\n").unwrap();
+        let matcher = grep_regex::RegexMatcherBuilder::new().build("line2$").unwrap();
+        let glob = globset::Glob::new("src/*.rs").unwrap().compile_matcher();
+        let stop = AtomicBool::new(false);
+        let out = search_sync(&root, &root, true, &matcher, Some(&glob), false, 0, MAX_HITS, &stop, &None)
+            .unwrap()
+            .content;
+        assert!(out.starts_with(&format!("{}/src/b.rs:1 │ line2\n", root.display())), "{out}");
+        assert!(out.contains("── 1 matches"), "{out}");
     }
 }

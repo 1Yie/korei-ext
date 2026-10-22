@@ -26,7 +26,7 @@ use serde::Deserialize;
 use agent_capabilities::SandboxCtx;
 use agent_capabilities::WorkspaceCtx;
 use agent_tool::{schema_for, ToolError, ToolResult, ToolSpec};
-use agent_tools_shell::sandbox_cfg::sandbox_config;
+use agent_tools_shell::sandbox_cfg::prepare;
 
 const MAX_OUTPUT_CHARS: usize = 20 * 1024;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -51,9 +51,8 @@ async fn run<C: WorkspaceCtx + SandboxCtx>(
     // Without a resident, each call does a synchronous read-modify-write on
     // the file itself, so a reported success always means on-disk truth.
     let cmd = format!("OFFICECLI_NO_AUTO_RESIDENT=1 {}", shell_join(&argv));
-    let verdict = agent_sandbox::audit_command_scoped(&cmd, Some(ctx.root()?));
+    let (_verdict, cfg) = prepare(&*ctx, &cmd, timeout)?;
     let sandbox = ctx.sandbox()?;
-    let cfg = sandbox_config(&verdict, ctx.root()?, timeout, &ctx.sandbox_limits());
 
     let output = sandbox
         .run_command(&cmd, &[], &cfg)

@@ -19,7 +19,7 @@ const MAX_SCAN_ENTRIES: usize = 4_000;
 #[derive(Debug, serde::Serialize, Deserialize, schemars::JsonSchema)]
 struct ListDirArgs {
     /// Workspace-relative directory path (default "."). Absolute paths are
-    /// accepted only when they still resolve inside the workspace.
+    /// accepted when they resolve inside the workspace or a linked workspace.
     path: Option<String>,
     /// Recurse depth (default 1 = direct children only, max 4).
     #[schemars(range(min = 1, max = 4))]
@@ -51,7 +51,7 @@ async fn exec<C: WorkspaceCtx>(args: Args, ctx: Arc<C>) -> Result<ToolResult, To
     let parsed: ListDirArgs =
         serde_json::from_value(args).map_err(|e| ToolError::Args(format!("list_dir args: {e}")))?;
     let rel = parsed.path.as_deref().unwrap_or(".");
-    let root = ctx.resolve(rel)?;
+    let root = ctx.resolve_read(rel)?;
     if !root.is_dir() {
         return Err(ToolError::Failed(format!("not a directory: {rel}")));
     }

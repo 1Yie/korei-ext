@@ -657,17 +657,15 @@ where
         )));
     }
 
-    let root = ctx.root()?;
-    let verdict = agent_sandbox::audit_command_scoped(command, Some(root));
+    // A background job is a shell command with a longer life: the same
+    // boundary applies before it is spawned.
+    crate::sandbox_cfg::refuse_unconfined_write(&**ctx, command)?;
+
     let sandbox = ctx.sandbox()?;
     // `wrap_spawn` has no wall-clock timeout (only `run_command` honours the
     // plan's), so the lifetime is enforced here by the monitor.
-    let cfg = crate::sandbox_cfg::sandbox_config(
-        &verdict,
-        root,
-        Duration::from_secs(MAX_WAIT_SECS),
-        &ctx.sandbox_limits(),
-    );
+    let (verdict, cfg) =
+        crate::sandbox_cfg::prepare(&**ctx, command, Duration::from_secs(MAX_WAIT_SECS))?;
     let mut cmd = sandbox
         .wrap_spawn(&cfg, "/bin/sh", &["-c", command])
         .ok_or_else(|| {
@@ -1181,7 +1179,7 @@ impl BgArgs {
 /// The permission gate's view of one call. A read action is not a process
 /// action: `list`/`status`/`logs`/`wait` must not raise an approval card in
 /// the modes that ask for non-readonly tools.
-fn review<C>(args: &Args, _: &Arc<C>) -> Review {
+fn review<C: WorkspaceCtx + SandboxCtx>(args: &Args, ctx: &Arc<C>) -> Review {
     let named = args
         .get("action")
         .and_then(|v| v.as_str())
@@ -1195,7 +1193,7 @@ fn review<C>(args: &Args, _: &Arc<C>) -> Review {
     let risk = match action {
         "list" | "status" | "logs" | "wait" => CallRisk::Readonly,
         "run" => match args.get("command").and_then(|v| v.as_str()) {
-            Some(command) => crate::risk::classify(command),
+            Some(command) => crate::risk::classify_in(command, &**ctx),
             // No command: the call is invalid, and an invalid call must not
             // ride in as a harmless one.
             None => CallRisk::RequiresApproval,

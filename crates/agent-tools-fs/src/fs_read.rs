@@ -29,7 +29,8 @@ const MAX_SIG_SPAN: usize = 4;
 
 #[derive(Debug, serde::Serialize, Deserialize, schemars::JsonSchema)]
 struct SmartReadArgs {
-    /// Workspace-relative path to the file.
+    /// Workspace-relative path to the file, or an absolute path inside a
+    /// linked workspace.
     path: String,
     /// `outline` | `range` | `search` (default `range` when start/end given).
     mode: Option<String>,
@@ -54,8 +55,8 @@ pub fn spec<C: WorkspaceCtx>() -> ToolSpec<C> {
              or several ranges of one file → ONE `batch_execute`: never read A → \
              read B when both were known up front. Read again only for lines you \
              have not seen (past a `[truncated …]` marker) or after the file \
-             changed. Paths outside the workspace (dependency sources, system \
-             files) are bash's job.",
+             changed. Paths outside the workspace and its linked workspaces \
+             (dependency sources, system files) are bash's job.",
         ),
         readonly: true,
         class: agent_tool::ToolClass::Observation,
@@ -69,7 +70,7 @@ pub fn spec<C: WorkspaceCtx>() -> ToolSpec<C> {
 async fn exec<C: WorkspaceCtx>(args: Args, ctx: Arc<C>) -> Result<ToolResult, ToolError> {
     let parsed: SmartReadArgs = serde_json::from_value(args)
         .map_err(|e| ToolError::Args(format!("smart_read args: {e}")))?;
-    let path = ctx.resolve(&parsed.path)?;
+    let path = ctx.resolve_read(&parsed.path)?;
     let content = tokio::fs::read_to_string(&path).await?;
     let hash = format!("{:016x}", xxh3_64(content.as_bytes()));
 

@@ -16,7 +16,7 @@ use std::time::Duration;
 use futures::FutureExt;
 use serde::Deserialize;
 
-use crate::sandbox_cfg::sandbox_config;
+use crate::sandbox_cfg::prepare;
 use agent_capabilities::SandboxCtx;
 use agent_capabilities::WorkspaceCtx;
 use agent_tool::{schema_for, Args, ToolError, ToolResult, ToolSpec};
@@ -59,11 +59,13 @@ async fn exec<C: WorkspaceCtx + SandboxCtx>(
     let parsed: TestRunnerArgs = serde_json::from_value(args)
         .map_err(|e| ToolError::Args(format!("smart_test_runner args: {e}")))?;
 
+    // Same boundary as `bash` — a test run is not a lesser command.
+    crate::sandbox_cfg::refuse_unconfined_write(&*ctx, &parsed.command)?;
+
     // Same dispatch as `bash`: audit first, derive the config, run through the
     // backend (which owns env sanitization, limits and timeout tree-kill).
-    let verdict = agent_sandbox::audit_command_scoped(&parsed.command, Some(ctx.root()?));
+    let (verdict, cfg) = prepare(&*ctx, &parsed.command, TIMEOUT)?;
     let sandbox = ctx.sandbox()?;
-    let cfg = sandbox_config(&verdict, ctx.root()?, TIMEOUT, &ctx.sandbox_limits());
 
     let out = sandbox
         .run_command(&parsed.command, &[], &cfg)
