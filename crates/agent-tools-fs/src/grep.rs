@@ -5,6 +5,10 @@
 //! cancel flag the sink + walker poll — `spawn_blocking` work actually
 //! stops instead of just being detached. Scope-annotation ([inside impl X])
 //! is a Phase-2 upgrade once tree-sitter grammars land.
+//!
+//! `context` (the `grep -C` capability) is native here: the searcher reports
+//! before/after lines through the same sink, so a hit and its surroundings
+//! cost one call and one pass over the file.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -12,9 +16,8 @@ use std::time::Duration;
 
 use futures::FutureExt;
 use grep_regex::RegexMatcher;
-use grep_searcher::sinks::UTF8;
-use grep_searcher::SearcherBuilder;
 use grep_searcher::SinkError;
+use grep_searcher::{Searcher, SearcherBuilder, Sink, SinkContext, SinkMatch};
 use serde::Deserialize;
 
 use agent_capabilities::WorkspaceCtx;
@@ -26,6 +29,9 @@ const MAX_OUTPUT: usize = 5 * 1024 * 1024;
 const MAX_HITS: usize = 300;
 /// Hard ceiling on `max_hits` — resource control isn't the model's call.
 const MAX_HITS_LIMIT: usize = 2_000;
+/// Hard ceiling on `context` — the same reasoning as `max_hits`: one call
+/// must stay bounded however the model spells it.
+const MAX_CONTEXT: usize = 10;
 /// Reject absurd patterns before they reach the regex compiler.
 const MAX_PATTERN_LEN: usize = 4 * 1024;
 /// Per-line truncation (UTF-8 boundary-safe) — one pathological line can't
@@ -64,15 +70,25 @@ struct GrepArgs {
     /// Max hits to list (default 300, max 2000).
     #[schemars(range(min = 1, max = 2000))]
     max_hits: Option<usize>,
+    /// Lines shown before and after each hit, like `grep -C` (default 0,
+    /// max 10). Returns a hit with its surroundings in one call, which is
+    /// what `grep -A/-B/-C` through bash is usually reaching for.
+    context: Option<usize>,
 }
 
 pub fn spec<C: WorkspaceCtx>() -> ToolSpec<C> {
     ToolSpec {
         name: "smart_grep",
         schema: schema_for::<GrepArgs>(
-            "Regex/literal search across the workspace (ripgrep-engine, in-process). \
-             Returns `path:line │ match` lines plus a match summary; respects \
-             .gitignore. Prefer this over list_dir for locating code.",
+            "Search file contents across the workspace (in-process ripgrep engine, respects \
+             .gitignore) — this is the search tool for anything inside the workspace, instead \
+             of `grep` / `rg` / `find … | xargs grep` through bash. Returns `path:line │ text` \
+             per hit plus a summary that says when hits were capped or files skipped. \
+             `context: N` adds N lines before and after each hit (like `grep -C N`, max 10), so \
+             a hit and its surroundings come back in ONE call. `path` narrows the subtree, \
+             `glob` the file names. Several independent searches → ONE `batch_execute`. \
+             Ignored trees (node_modules, target) and paths outside the workspace are bash's \
+             job.",
         ),
         readonly: true,
         class: agent_tool::ToolClass::Observation,
@@ -132,6 +148,7 @@ async fn exec<C: WorkspaceCtx>(args: Args, ctx: Arc<C>) -> Result<ToolResult, To
         .map_err(|e| ToolError::Args(format!("bad glob: {e}")))?;
 
     let include_hidden = parsed.include_hidden.unwrap_or(false);
+    let context = parsed.context.unwrap_or(0).min(MAX_CONTEXT);
     let ws = ctx.root()?.to_path_buf();
     let ctx_cancel = ctx.cancel_flag();
 
@@ -147,6 +164,7 @@ async fn exec<C: WorkspaceCtx>(args: Args, ctx: Arc<C>) -> Result<ToolResult, To
             &matcher,
             glob_matcher.as_ref(),
             include_hidden,
+            context,
             max_hits,
             &stop_task,
             &ctx_cancel,
@@ -184,12 +202,90 @@ fn truncate_line(line: &str) -> String {
     format!("{}… [line truncated]", &t[..end])
 }
 
+/// One rendered line from the searcher: a hit, a context line, or the `--`
+/// break between two non-adjacent groups.
+enum Line {
+    Match(u64, String),
+    Context(u64, String),
+    Break,
+}
+
+/// Collects one file's hits — and, with `context`, the lines around them.
+///
+/// Returning `false` from a sink method stops the search: that is how the
+/// match cap and the output budget abort a file early instead of buffering
+/// everything and truncating afterwards. The budget is per file, so one huge
+/// file cannot spend the whole output before the next one is reached.
+struct Collector<'a> {
+    total: &'a mut usize,
+    max_hits: usize,
+    context: usize,
+    budget: usize,
+    lines: &'a mut Vec<Line>,
+    stop: &'a AtomicBool,
+    ctx_cancel: &'a Option<Arc<AtomicBool>>,
+}
+
+impl Collector<'_> {
+    /// Record a line unless the output budget is spent.
+    fn push(&mut self, line: Line, len: usize) -> bool {
+        if self.budget < len {
+            return false;
+        }
+        self.budget -= len;
+        self.lines.push(line);
+        true
+    }
+}
+
+impl Sink for Collector<'_> {
+    type Error = std::io::Error;
+
+    fn matched(&mut self, _searcher: &Searcher, mat: &SinkMatch<'_>) -> Result<bool, Self::Error> {
+        if cancelled(self.stop, self.ctx_cancel) {
+            return Err(SinkError::error_message("cancelled"));
+        }
+        *self.total += 1;
+        let text = text_of(mat.bytes());
+        let len = text.len();
+        let keep = self.push(Line::Match(mat.line_number().unwrap_or(0), text), len);
+        Ok(keep && *self.total < self.max_hits)
+    }
+
+    fn context(
+        &mut self,
+        _searcher: &Searcher,
+        ctx: &SinkContext<'_>,
+    ) -> Result<bool, Self::Error> {
+        if self.context == 0 || cancelled(self.stop, self.ctx_cancel) {
+            return Ok(true);
+        }
+        let text = text_of(ctx.bytes());
+        let len = text.len();
+        Ok(self.push(Line::Context(ctx.line_number().unwrap_or(0), text), len))
+    }
+
+    fn context_break(&mut self, _searcher: &Searcher) -> Result<bool, Self::Error> {
+        // A break before the first line would render a leading `--`.
+        if self.context > 0 && !self.lines.is_empty() {
+            self.lines.push(Line::Break);
+        }
+        Ok(true)
+    }
+}
+
+/// A sink line's text: lossy UTF-8, right-trimmed, per-line capped.
+fn text_of(bytes: &[u8]) -> String {
+    truncate_line(&String::from_utf8_lossy(bytes))
+}
+
 fn search_sync(
     base: &std::path::Path,
     workspace: &std::path::Path,
     matcher: &RegexMatcher,
     glob_matcher: Option<&globset::GlobMatcher>,
     include_hidden: bool,
+    context: usize,
     max_hits: usize,
     stop: &AtomicBool,
     ctx_cancel: &Option<Arc<AtomicBool>>,
@@ -257,39 +353,48 @@ fn search_sync(
         scanned += 1;
         let rel = rel_path.to_string_lossy().replace('\\', "/");
 
-        // Shared counting INSIDE the sink: `total` and the shown-budget are
-        // live during the scan, so `Ok(false)` aborts this file the moment
-        // the cap is hit instead of buffering every hit then truncating.
-        let mut hits: Vec<(u64, String)> = Vec::new();
-        let mut searcher = SearcherBuilder::new().line_number(true).build();
-        let sink = UTF8(|line_no, line| {
-            if cancelled(stop, ctx_cancel) {
-                return Err(SinkError::error_message("cancelled"));
-            }
-            total += 1;
-            if emitted + hits.len() < max_hits {
-                hits.push((line_no, truncate_line(line)));
-            }
-            Ok(total < max_hits)
-        });
-        match searcher.search_path(matcher, entry.path(), sink) {
-            Ok(_) => {}
-            Err(_) if cancelled(stop, ctx_cancel) => {
-                was_cancelled = true;
-            }
+        // Counting and the output budget live INSIDE the sink, so `Ok(false)`
+        // aborts this file the moment either runs out instead of buffering
+        // every hit and truncating afterwards.
+        let mut searcher = SearcherBuilder::new()
+            .line_number(true)
+            .before_context(context)
+            .after_context(context)
+            .build();
+        let mut file_total = 0usize;
+        let mut lines: Vec<Line> = Vec::new();
+        let collected = Collector {
+            total: &mut file_total,
+            max_hits,
+            context,
+            budget: MAX_OUTPUT,
+            lines: &mut lines,
+            stop,
+            ctx_cancel,
+        };
+        match searcher.search_path(matcher, entry.path(), collected) {
+            Ok(()) => {}
+            Err(_) if cancelled(stop, ctx_cancel) => was_cancelled = true,
             Err(_) => errors += 1,
         }
+        total += file_total;
 
-        for (line_no, text) in hits {
-            let line = format!("{rel}:{line_no} │ {text}\n");
-            if bytes + line.len() > MAX_OUTPUT {
+        for line in lines {
+            let (is_match, rendered) = match line {
+                Line::Match(n, text) => (true, format!("{rel}:{n} │ {text}\n")),
+                Line::Context(n, text) => (false, format!("{rel}-{n} │ {text}\n")),
+                Line::Break => (false, "--\n".to_string()),
+            };
+            if bytes + rendered.len() > MAX_OUTPUT {
                 out.push_str("… [5 MiB output cap reached] …\n");
                 stopped_early = true;
                 break 'walk;
             }
-            bytes += line.len();
-            emitted += 1;
-            out.push_str(&line);
+            bytes += rendered.len();
+            if is_match {
+                emitted += 1;
+            }
+            out.push_str(&rendered);
         }
         if was_cancelled || total >= max_hits {
             stopped_early = true;
@@ -324,4 +429,67 @@ fn search_sync(
         out.push_str(&format!("({skipped} binary/oversize files skipped)\n"));
     }
     Ok(ToolResult::text(out))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Run the real search over an on-disk tree. `context` is the only knob
+    /// under test; every other bound is the default.
+    fn search(root: &std::path::Path, pattern: &str, context: usize) -> String {
+        let matcher = grep_regex::RegexMatcherBuilder::new()
+            .build(pattern)
+            .expect("pattern");
+        let stop = AtomicBool::new(false);
+        search_sync(
+            root, root, &matcher, None, false, context, MAX_HITS, &stop, &None,
+        )
+        .expect("search")
+        .content
+    }
+
+    fn tree(lines: usize) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let body: String = (1..=lines).map(|i| format!("line{i}\n")).collect();
+        std::fs::write(dir.path().join("a.txt"), body).unwrap();
+        dir
+    }
+
+    /// Without `context` the output is exactly what it was before the option
+    /// existed: one `path:line │ text` row per hit.
+    #[test]
+    fn no_context_keeps_the_flat_hit_list() {
+        let dir = tree(20);
+        let out = search(dir.path(), "line5$", 0);
+        assert!(out.starts_with("a.txt:5 │ line5\n"), "{out}");
+        assert!(!out.contains("a.txt-"), "{out}");
+        assert!(out.contains("── 1 matches"), "{out}");
+    }
+
+    /// `context` surrounds the hit the way `grep -C` does: hits keep `:`,
+    /// neighbours get `-`.
+    #[test]
+    fn context_surrounds_the_hit_with_grep_marks() {
+        let dir = tree(20);
+        let out = search(dir.path(), "line10$", 2);
+        let want = "a.txt-8 │ line8\na.txt-9 │ line9\na.txt:10 │ line10\n\
+                    a.txt-11 │ line11\na.txt-12 │ line12\n";
+        assert!(out.starts_with(want), "{out}");
+        assert!(out.contains("── 1 matches"), "{out}");
+    }
+
+    /// Overlapping groups merge into one block instead of repeating lines
+    /// around a `--` break; distant groups keep the break.
+    #[test]
+    fn adjacent_hits_merge_and_distant_ones_break() {
+        let dir = tree(30);
+        let out = search(dir.path(), "line(10|12)$", 1);
+        assert!(
+            !out.contains("--\n"),
+            "overlapping groups must merge:\n{out}"
+        );
+        let out = search(dir.path(), "line(2|25)$", 1);
+        assert_eq!(out.matches("--\n").count(), 1, "{out}");
+    }
 }
