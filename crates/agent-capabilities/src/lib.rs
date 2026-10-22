@@ -1,7 +1,9 @@
 //! Host capability adapters. The kernel does not depend on this crate.
 
 pub mod workspace;
-pub use workspace::{WorkspaceCtx, WorkspaceSlot};
+pub use workspace::{
+    suggest_root, LinkedRoot, LinkedRoots, PathScope, RootAccess, WorkspaceCtx, WorkspaceSlot,
+};
 
 #[cfg(feature = "sandbox")]
 pub mod sandbox;

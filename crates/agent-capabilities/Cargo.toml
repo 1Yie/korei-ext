@@ -15,3 +15,6 @@ agent-computer = { path = "../agent-computer", optional = true }
 default = []
 sandbox = ["dep:agent-sandbox"]
 desktop = ["dep:agent-computer"]
+
+[dev-dependencies]
+tempfile = "3"
