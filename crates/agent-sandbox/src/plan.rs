@@ -295,12 +295,12 @@ const SCAN_SKIP_DIRS: &[&str] = &[
 /// that exists at the root or nested ≤ 3 deep, plus `.git` internals
 /// (`hooks`, `config`, `HEAD`, `modules`) for every `.git` *directory*
 /// found — worktrees (`$ws/.git` a file) have no `hooks/` to deny.
-fn mandatory_deny_write(workspace: &PathBuf) -> Vec<PathBuf> {
+pub fn mandatory_deny_write(workspace: &std::path::Path) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
     // Iterative walk so no recursion plumbing is needed.
-    let mut stack: Vec<(PathBuf, usize)> = vec![(workspace.clone(), 0)];
+    let mut stack: Vec<(PathBuf, usize)> = vec![(workspace.to_path_buf(), 0)];
     while let Some((dir, depth)) = stack.pop() {
         let Ok(rd) = std::fs::read_dir(&dir) else {
             continue;
@@ -332,7 +332,7 @@ fn mandatory_deny_write(workspace: &PathBuf) -> Vec<PathBuf> {
             // denies HEAD only for nested repos (top-level `git switch`
             // legitimately rewrites it) — match that.
             if name == ".git" {
-                let nested = dir != *workspace;
+                let nested = dir != workspace;
                 let mut subs = vec!["hooks", "config", "modules"];
                 if nested {
                     subs.push("HEAD");

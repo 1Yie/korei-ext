@@ -30,6 +30,11 @@ pub struct SandboxLimits {
     /// Host-chosen directories mounted read-only into every sandboxed run
     /// (e.g. the user's skill roots). Kernel never picks these itself.
     pub extra_ro_mounts: Vec<std::path::PathBuf>,
+    /// Host-granted directories mounted read-write into every sandboxed run
+    /// (linked workspaces). Each gets the same mandatory `deny_write` set as
+    /// the workspace: a writable root must not become a channel for planting
+    /// git hooks or shell rc files.
+    pub extra_rw_mounts: Vec<std::path::PathBuf>,
 }
 
 impl SandboxLimits {
@@ -91,6 +96,16 @@ pub fn apply_limits(cfg: &mut SandboxConfig, l: &SandboxLimits) {
             cfg.extra_ro_mounts.push(m.clone());
         }
     }
+    for m in &l.extra_rw_mounts {
+        if !cfg.extra_rw_mounts.contains(m) {
+            cfg.extra_rw_mounts.push(m.clone());
+        }
+        for p in crate::plan::mandatory_deny_write(m) {
+            if !cfg.deny_write.contains(&p) {
+                cfg.deny_write.push(p);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -138,5 +153,33 @@ mod tests {
         apply_limits(&mut cfg, &limits);
         assert_eq!(cfg.allowed_domains, ["registry.npmjs.org", "github.com"]);
         assert_eq!(cfg.denied_domains, ["evil.example"]);
+    }
+
+    /// A linked workspace is mounted writable, and its `.git` internals are
+    /// write-denied exactly like the workspace's.
+    #[test]
+    fn extra_rw_mounts_carry_the_mandatory_deny_write_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let linked = dir.path().join("kernel");
+        std::fs::create_dir_all(linked.join(".git/hooks")).unwrap();
+        std::fs::write(linked.join(".git/config"), "").unwrap();
+        std::fs::write(linked.join(".bashrc"), "").unwrap();
+        let mut cfg = SandboxConfig::default();
+        let limits = SandboxLimits {
+            extra_rw_mounts: vec![linked.clone()],
+            ..Default::default()
+        };
+        apply_limits(&mut cfg, &limits);
+        apply_limits(&mut cfg, &limits);
+        assert_eq!(cfg.extra_rw_mounts, [linked.clone()], "merged once");
+        for p in [
+            linked.join(".git/hooks"),
+            linked.join(".git/config"),
+            linked.join(".bashrc"),
+        ] {
+            assert!(cfg.deny_write.contains(&p), "missing {}", p.display());
+        }
+        let hooks = linked.join(".git/hooks");
+        assert_eq!(cfg.deny_write.iter().filter(|p| **p == hooks).count(), 1);
     }
 }

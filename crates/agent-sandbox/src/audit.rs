@@ -4,8 +4,10 @@
 //! audit missed. Replaces the old string-blacklist matcher — now driven by
 //! `shell_ast` → `capability` extraction → risk classification.
 
+use std::path::PathBuf;
+
 use crate::capability::{extract, risk_of, Capability, RiskLevel};
-use crate::shell_ast::parse;
+use crate::shell_ast::{parse, Node};
 use crate::traits::SnapshotMode;
 
 /// Risk tier surfaced to the approval card + sandbox config — kept for
@@ -59,24 +61,41 @@ pub fn audit_command(cmd: &str) -> AuditResult {
 /// `workspace` is the canonical sandbox root; absolute paths outside it +
 /// `$HOME`/etc/system dirs raise `ScopeViolation`/elevated risk.
 pub fn audit_command_scoped(cmd: &str, workspace: Option<&std::path::Path>) -> AuditResult {
+    audit_command_rooted(cmd, workspace, &[], &[])
+}
+
+/// [`audit_command_scoped`] with the roots a host granted beyond the
+/// workspace: a read inside `readable` or `writable` is in scope, a write only
+/// inside `writable`. The sensitive system set stays out of scope regardless.
+pub fn audit_command_rooted(
+    cmd: &str,
+    workspace: Option<&std::path::Path>,
+    readable: &[std::path::PathBuf],
+    writable: &[std::path::PathBuf],
+) -> AuditResult {
     let ast = parse(cmd);
     let mut caps = extract(&ast);
 
     // Mark out-of-scope file caps — a write/delete/read outside the
-    // workspace root is a scope violation, not a generic file op.
+    // granted roots is a scope violation, not a generic file op.
     if let Some(ws) = workspace {
         for c in &mut caps {
-            let path = match c {
+            let (path, write) = match c {
                 Capability::WriteFile { path }
                 | Capability::AppendFile { path }
                 | Capability::DeleteFile { path, .. }
                 | Capability::CreateFile { path }
-                | Capability::CreateDirectory { path }
-                | Capability::ReadFile { path } => Some(path.clone()),
-                _ => None,
+                | Capability::CreateDirectory { path } => (Some(path.clone()), true),
+                Capability::ReadFile { path } => (Some(path.clone()), false),
+                _ => (None, false),
             };
             if let Some(p) = path {
-                if is_out_of_scope(&p, ws) {
+                let out = if write {
+                    is_out_of_scope(&p, ws, writable.iter())
+                } else {
+                    is_out_of_scope(&p, ws, readable.iter().chain(writable))
+                };
+                if out {
                     *c = Capability::OutOfScope { path: p };
                 }
             }
@@ -116,6 +135,223 @@ pub fn audit_command_scoped(cmd: &str, workspace: Option<&std::path::Path>) -> A
         },
         needs_network_prompt: needs_network,
     }
+}
+
+/// The paths `cmd` writes, creates, moves or deletes outside the workspace and
+/// the `writable` roots — what an unsandboxed run could change that the host
+/// never granted. Reads are not listed: reading a dependency's source is
+/// ordinary shell work.
+pub fn writes_out_of_scope(
+    cmd: &str,
+    workspace: &std::path::Path,
+    writable: &[std::path::PathBuf],
+) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let node = parse(cmd);
+    for p in walk_writes(&node, workspace, writable) {
+        if is_out_of_scope(&p, workspace, writable.iter()) {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// The paths the command writes, in order, with `cd` tracked — `cd /w && rm f`
+/// writes `/w/f`, not the workspace's `f`. Capability extraction alone cannot
+/// say that: it sees one flat set of operations and no working directory.
+fn walk_writes(
+    node: &Node,
+    workspace: &std::path::Path,
+    writable: &[std::path::PathBuf],
+) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let _ = step(node, workspace, writable, &mut out);
+    out
+}
+
+/// One node, returning the working directory the following segment inherits.
+fn step(
+    node: &Node,
+    workspace: &std::path::Path,
+    writable: &[std::path::PathBuf],
+    out: &mut Vec<PathBuf>,
+) -> PathBuf {
+    match node {
+        Node::And(a, b) | Node::Or(a, b) | Node::Seq(a, b) => {
+            let cwd = step(a, workspace, writable, out);
+            step(b, &cwd, writable, out);
+            cwd
+        }
+        // A pipeline's segments see the same directory; only the last one's
+        // `cd` could matter and it does not escape the pipeline anyway.
+        Node::Pipe(cmds) => {
+            let mut cwd = workspace.to_path_buf();
+            for c in cmds {
+                cwd = step(c, &cwd, writable, out);
+            }
+            cwd
+        }
+        Node::Subshell(inner) => {
+            step(inner, workspace, writable, out);
+            workspace.to_path_buf()
+        }
+        Node::Simple(cmd) => simple_writes(cmd, workspace, writable, out),
+    }
+}
+
+/// Binaries whose non-flag arguments are files they overwrite, move or remove.
+const WRITE_VERBS: &[&str] = &[
+    "rm", "rmdir", "mv", "cp", "touch", "mkdir", "ln", "dd", "install", "truncate", "tee",
+];
+
+fn simple_writes(
+    cmd: &crate::shell_ast::Command,
+    workspace: &std::path::Path,
+    _writable: &[std::path::PathBuf],
+    out: &mut Vec<PathBuf>,
+) -> PathBuf {
+    let mut cwd = workspace.to_path_buf();
+    if cmd.program == "cd" {
+        if let Some(target) = cmd.args.first() {
+            cwd = resolve_against(target, &cwd);
+        }
+        return cwd;
+    }
+    // Redirects are writes wherever the verb points.
+    for r in &cmd.redirects {
+        if r.write {
+            out.push(resolve_against(&r.target, &cwd));
+        }
+    }
+    // Modelled verbs (and the two in-place editors, whose flag is the only
+    // difference between reading and rewriting a file).
+    let in_place_editor = matches!(cmd.program.as_str(), "sed" | "perl" | "ruby")
+        && cmd.args.iter().any(|a| a == "-i" || a.starts_with("-i") || a.starts_with("-pi"));
+    if WRITE_VERBS.contains(&cmd.program.as_str()) || in_place_editor {
+        for a in &cmd.args {
+            if a.starts_with('-') || a.contains("://") {
+                continue;
+            }
+            out.push(resolve_against(a, &cwd));
+        }
+    }
+    cwd
+}
+
+/// A shell word → the path it names, with `~` expanded and relatives placed
+/// under `cwd`. Good enough to compare scopes; it never touches the fs.
+fn resolve_against(word: &str, cwd: &std::path::Path) -> PathBuf {
+    let w = word.trim_matches(['\'', '"']);
+    if w == "~" || w.starts_with("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(w.trim_start_matches("~/"));
+        }
+    }
+    let p = PathBuf::from(w);
+    if p.is_absolute() {
+        return p;
+    }
+    let joined = cwd.join(p);
+    // Normalize `..` lexically — the target may not exist.
+    let mut norm = PathBuf::new();
+    for c in joined.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                norm.pop();
+            }
+            std::path::Component::CurDir => {}
+            c => norm.push(c),
+        }
+    }
+    norm
+}
+
+/// Every path the command *names*, whatever verb it applies to it.
+///
+/// The audit's blind spot is a form it did not classify as a write (`sed -i`,
+/// `tee`, `patch`, `git checkout`, an arbitrary program), never a path it
+/// failed to see. [`writes_out_of_scope`] answers "which recognized writes
+/// escape"; this answers "which places does this line reach at all" — the
+/// fallback for a caller that has no other way to contain the command.
+pub fn paths_named(cmd: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    collect_named(&parse(cmd), &mut out);
+    out
+}
+
+fn collect_named(node: &Node, out: &mut Vec<PathBuf>) {
+    match node {
+        Node::And(a, b) | Node::Or(a, b) | Node::Seq(a, b) => {
+            collect_named(a, out);
+            collect_named(b, out);
+        }
+        Node::Pipe(cmds) => {
+            for c in cmds {
+                collect_named(c, out);
+            }
+        }
+        Node::Subshell(inner) => collect_named(inner, out),
+        Node::Simple(cmd) => {
+            for word in std::iter::once(&cmd.program).chain(cmd.args.iter()) {
+                push_path_word(word, out);
+            }
+            for r in &cmd.redirects {
+                push_path_word(&r.target, out);
+            }
+            for sub in &cmd.substitutions {
+                collect_named(sub, out);
+            }
+        }
+    }
+}
+
+/// A word may be a path, carry one (`--target=/x/y`), or embed one inside a
+/// quoted payload (`python -c 'open("/w/x","w")'`). All three count: the point
+/// is to notice the place, not to understand the program.
+fn push_path_word(word: &str, out: &mut Vec<PathBuf>) {
+    // A URL is not a path; `https://…` would otherwise read as `/…`.
+    if word.contains("://") {
+        return;
+    }
+    let after_eq = word.split_once('=').map(|(_, v)| v).unwrap_or(word);
+    if let Some(p) = as_path(after_eq) {
+        out.push(p);
+        return;
+    }
+    // Embedded in a payload: take every `/…` or `~/…` run out of it.
+    for (i, _) in word.match_indices('/') {
+        let head = &word[..i];
+        let boundary = head.is_empty()
+            || head.ends_with(['\'', '"', '(', ',', ';', '=', '|', ' ']);
+        let root_ish = i > 0 && word[..i].ends_with('~');
+        if !(boundary || root_ish) {
+            continue;
+        }
+        let start = if root_ish { i - 1 } else { i };
+        let rest = &word[start..];
+        let end = rest
+            .find(['\'', '"', ')', ',', ';', '|', ' '])
+            .unwrap_or(rest.len());
+        let frag = &rest[..end];
+        if frag.len() > 1 {
+            out.push(PathBuf::from(frag));
+        }
+    }
+}
+
+/// A word as a path: absolute, `~/`-rooted, or a `..`-relative climb.
+fn as_path(word: &str) -> Option<PathBuf> {
+    let w = word.trim_matches(['\'', '"']);
+    if w.starts_with('/') && w.len() > 1 {
+        return Some(PathBuf::from(w));
+    }
+    if w == "~" || w.starts_with("~/") {
+        return Some(PathBuf::from(w));
+    }
+    if w.starts_with("../") || w == ".." {
+        return Some(PathBuf::from(w));
+    }
+    None
 }
 
 /// Human-readable reasons for the approval card, derived from capabilities.
@@ -163,10 +399,14 @@ fn reasons_for(caps: &[Capability]) -> Vec<String> {
     out
 }
 
-/// Is `path` outside `workspace`? Resolves a relative path against the
-/// workspace root and normalizes `.`/`..` components so `../../etc/shadow`
-/// can't sneak through as "relative".
-fn is_out_of_scope(path: &std::path::Path, workspace: &std::path::Path) -> bool {
+/// Is `path` outside `workspace` and every `granted` root? Resolves a relative
+/// path against the workspace root and normalizes `.`/`..` components so
+/// `../../etc/shadow` can't sneak through as "relative".
+fn is_out_of_scope<'a>(
+    path: &std::path::Path,
+    workspace: &std::path::Path,
+    mut granted: impl Iterator<Item = &'a std::path::PathBuf>,
+) -> bool {
     use std::path::{Component, PathBuf};
     // Resolve relative paths against the workspace, then normalize so a
     // `..` can't climb above the root.
@@ -201,7 +441,7 @@ fn is_out_of_scope(path: &std::path::Path, workspace: &std::path::Path) -> bool 
     }
     // Component-wise prefix check (not string prefix — `/proj_evil` must not
     // match `/proj`).
-    !normalized.starts_with(workspace)
+    !normalized.starts_with(workspace) && !granted.any(|r| normalized.starts_with(r))
 }
 
 #[cfg(test)]
@@ -293,6 +533,50 @@ mod tests {
                 .any(|c| matches!(c, Capability::OutOfScope { .. })),
             "/proj_evil must not match /proj"
         );
+    }
+
+    #[test]
+    fn granted_roots_are_in_scope_by_access() {
+        let ws = PathBuf::from("/home/u/proj");
+        let rw = vec![PathBuf::from("/home/u/kernel")];
+        let ro = vec![PathBuf::from("/home/u/docs")];
+        let scoped = |cmd: &str| {
+            audit_command_rooted(cmd, Some(&ws), &ro, &rw)
+                .capabilities
+                .iter()
+                .any(|c| matches!(c, Capability::OutOfScope { .. }))
+        };
+        assert!(!scoped("cat /home/u/kernel/a.rs"));
+        assert!(!scoped("echo x > /home/u/kernel/a.rs"));
+        assert!(!scoped("cat /home/u/docs/a.md"));
+        assert!(scoped("echo x > /home/u/docs/a.md"), "read-only root takes no writes");
+        assert!(scoped("cat /home/u/other/a"));
+        // `/kernel_evil` is not `/kernel`.
+        assert!(scoped("cat /home/u/kernel_evil/a"));
+    }
+
+    #[test]
+    fn sensitive_dirs_stay_out_of_scope_even_when_granted() {
+        let ws = PathBuf::from("/home/u/proj");
+        let v = audit_command_rooted("cat /etc/passwd", Some(&ws), &[], &[PathBuf::from("/etc")]);
+        assert!(v
+            .capabilities
+            .iter()
+            .any(|c| matches!(c, Capability::OutOfScope { .. })));
+    }
+
+    #[test]
+    fn writes_out_of_scope_lists_ungranted_writes_only() {
+        let ws = PathBuf::from("/home/u/proj");
+        let rw = vec![PathBuf::from("/home/u/kernel")];
+        assert!(writes_out_of_scope("cat /home/u/other/a", &ws, &rw).is_empty());
+        assert!(writes_out_of_scope("echo x > out.txt", &ws, &rw).is_empty());
+        assert!(writes_out_of_scope("echo x > /home/u/kernel/a", &ws, &rw).is_empty());
+        assert_eq!(
+            writes_out_of_scope("echo x > /home/u/other/a", &ws, &rw),
+            [PathBuf::from("/home/u/other/a")]
+        );
+        assert!(!writes_out_of_scope("rm -rf ../other", &ws, &rw).is_empty());
     }
 
     #[test]
