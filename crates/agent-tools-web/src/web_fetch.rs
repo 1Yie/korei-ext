@@ -58,6 +58,7 @@ pub fn spec<C: WorkspaceCtx>() -> ToolSpec<C> {
         network: true,
         staged: false,
         review: None,
+        cancel_aware: false,
         exec: Arc::new(|args, ctx| exec(args, ctx).boxed()),
     }
 }

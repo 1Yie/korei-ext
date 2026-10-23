@@ -1237,6 +1237,7 @@ pub fn spec<C: WorkspaceCtx + SandboxCtx>() -> ToolSpec<C> {
         network: false,
         staged: false,
         review: Some(Arc::new(review::<C>)),
+        cancel_aware: false,
         exec: std::sync::Arc::new(|args, ctx| exec(args, ctx).boxed()),
     }
 }

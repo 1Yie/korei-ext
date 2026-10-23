@@ -390,6 +390,7 @@ fn office_create<C: WorkspaceCtx + SandboxCtx>() -> ToolSpec<C> {
         network: false,
         staged: false,
         review: None,
+        cancel_aware: false,
         exec: Arc::new(|args, ctx| {
             async move {
                 let a: CreateArgs = serde_json::from_value(args)
@@ -428,6 +429,7 @@ fn office_open<C: WorkspaceCtx + SandboxCtx>() -> ToolSpec<C> {
         network: false,
         staged: false,
         review: None,
+        cancel_aware: false,
         // Starting a real resident would leave a doomed process holding
         // unflushed state — every command's process group is killed when the
         // call returns — and the corpse marks the file "unflushed session",
@@ -458,6 +460,7 @@ fn office_close<C: WorkspaceCtx + SandboxCtx>() -> ToolSpec<C> {
         network: false,
         staged: false,
         review: None,
+        cancel_aware: false,
         exec: Arc::new(|args, ctx| {
             async move {
                 let a: FileArgs = serde_json::from_value(args)
@@ -487,6 +490,7 @@ fn office_save<C: WorkspaceCtx + SandboxCtx>() -> ToolSpec<C> {
         network: false,
         staged: false,
         review: None,
+        cancel_aware: false,
         exec: Arc::new(|args, ctx| {
             async move {
                 let a: FileArgs = serde_json::from_value(args)
@@ -516,6 +520,7 @@ fn office_get<C: WorkspaceCtx + SandboxCtx>() -> ToolSpec<C> {
         network: false,
         staged: false,
         review: None,
+        cancel_aware: false,
         exec: Arc::new(|args, ctx| {
             async move {
                 let a: GetArgs = serde_json::from_value(args)
@@ -552,6 +557,7 @@ fn office_query<C: WorkspaceCtx + SandboxCtx>() -> ToolSpec<C> {
         network: false,
         staged: false,
         review: None,
+        cancel_aware: false,
         exec: Arc::new(|args, ctx| {
             async move {
                 let a: QueryArgs = serde_json::from_value(args)
@@ -586,6 +592,7 @@ fn office_set<C: WorkspaceCtx + SandboxCtx>() -> ToolSpec<C> {
         network: false,
         staged: false,
         review: None,
+        cancel_aware: false,
         exec: Arc::new(|args, ctx| {
             async move {
                 let a: SetArgs = serde_json::from_value(args)
@@ -618,6 +625,7 @@ fn office_add<C: WorkspaceCtx + SandboxCtx>() -> ToolSpec<C> {
         network: false,
         staged: false,
         review: None,
+        cancel_aware: false,
         exec: Arc::new(|args, ctx| {
             async move {
                 let a: AddArgs = serde_json::from_value(args)
@@ -659,6 +667,7 @@ fn office_remove<C: WorkspaceCtx + SandboxCtx>() -> ToolSpec<C> {
         network: false,
         staged: false,
         review: None,
+        cancel_aware: false,
         exec: Arc::new(|args, ctx| {
             async move {
                 let a: RemoveArgs = serde_json::from_value(args)
@@ -693,6 +702,7 @@ fn office_move<C: WorkspaceCtx + SandboxCtx>() -> ToolSpec<C> {
         network: false,
         staged: false,
         review: None,
+        cancel_aware: false,
         exec: Arc::new(|args, ctx| {
             async move {
                 let a: MoveArgs = serde_json::from_value(args)
@@ -728,6 +738,7 @@ fn office_batch<C: WorkspaceCtx + SandboxCtx>() -> ToolSpec<C> {
         network: false,
         staged: false,
         review: None,
+        cancel_aware: false,
         exec: Arc::new(|args, ctx| {
             async move {
                 let a: BatchArgs = serde_json::from_value(args)
@@ -768,6 +779,7 @@ fn office_merge<C: WorkspaceCtx + SandboxCtx>() -> ToolSpec<C> {
         network: false,
         staged: false,
         review: None,
+        cancel_aware: false,
         exec: Arc::new(|args, ctx| {
             async move {
                 let a: MergeArgs = serde_json::from_value(args)
@@ -807,6 +819,7 @@ fn office_import<C: WorkspaceCtx + SandboxCtx>() -> ToolSpec<C> {
         network: false,
         staged: false,
         review: None,
+        cancel_aware: false,
         exec: Arc::new(|args, ctx| {
             async move {
                 let a: ImportArgs = serde_json::from_value(args)
@@ -858,6 +871,7 @@ fn office_view<C: WorkspaceCtx + SandboxCtx>() -> ToolSpec<C> {
         network: false,
         staged: false,
         review: None,
+        cancel_aware: false,
         exec: Arc::new(|args, ctx| {
             async move {
                 let a: ViewArgs = serde_json::from_value(args)
@@ -900,6 +914,7 @@ fn office_validate<C: WorkspaceCtx + SandboxCtx>() -> ToolSpec<C> {
         network: false,
         staged: false,
         review: None,
+        cancel_aware: false,
         exec: Arc::new(|args, ctx| {
             async move {
                 let a: FileArgs = serde_json::from_value(args)
@@ -931,6 +946,7 @@ fn office_help<C: WorkspaceCtx + SandboxCtx>() -> ToolSpec<C> {
         network: false,
         staged: false,
         review: None,
+        cancel_aware: false,
         exec: Arc::new(|args, ctx| {
             async move {
                 let a: HelpArgs = serde_json::from_value(args)
@@ -961,6 +977,7 @@ fn office_skill<C: WorkspaceCtx + SandboxCtx>() -> ToolSpec<C> {
         network: false,
         staged: false,
         review: None,
+        cancel_aware: false,
         exec: Arc::new(|args, ctx| {
             async move {
                 let a: SkillArgs = serde_json::from_value(args)
@@ -990,6 +1007,7 @@ fn office_raw<C: WorkspaceCtx + SandboxCtx>() -> ToolSpec<C> {
         network: false,
         staged: false,
         review: None,
+        cancel_aware: false,
         exec: Arc::new(|args, ctx| {
             async move {
                 let a: RawArgs = serde_json::from_value(args)
@@ -1054,6 +1072,7 @@ fn office_exec<C: WorkspaceCtx + SandboxCtx>() -> ToolSpec<C> {
         network: false,
         staged: false,
         review: None,
+        cancel_aware: false,
         exec: Arc::new(|args, ctx| {
             async move {
                 let a: ExecArgs = serde_json::from_value(args)

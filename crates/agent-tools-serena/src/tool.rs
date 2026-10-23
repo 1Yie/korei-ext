@@ -114,6 +114,7 @@ pub fn spec<C: WorkspaceCtx>() -> ToolSpec<C> {
         network: false,
         staged: false,
         review: None,
+        cancel_aware: false,
         exec,
     }
 }
