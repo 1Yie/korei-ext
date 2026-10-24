@@ -273,33 +273,49 @@ fn resolve_against(word: &str, cwd: &std::path::Path) -> PathBuf {
 /// failed to see. [`writes_out_of_scope`] answers "which recognized writes
 /// escape"; this answers "which places does this line reach at all" — the
 /// fallback for a caller that has no other way to contain the command.
-pub fn paths_named(cmd: &str) -> Vec<PathBuf> {
+///
+/// Relative names resolve against the directory `cd` put them in, which is
+/// what `cd ../other && grep x y` means; without `workspace` there is no
+/// starting directory and they stay as written.
+pub fn paths_named(cmd: &str, workspace: Option<&std::path::Path>) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    collect_named(&parse(cmd), &mut out);
+    let mut cwd = workspace.map(|w| w.to_path_buf());
+    collect_named(&parse(cmd), &mut cwd, &mut out);
     out
 }
 
-fn collect_named(node: &Node, out: &mut Vec<PathBuf>) {
+fn collect_named(node: &Node, cwd: &mut Option<PathBuf>, out: &mut Vec<PathBuf>) {
     match node {
         Node::And(a, b) | Node::Or(a, b) | Node::Seq(a, b) => {
-            collect_named(a, out);
-            collect_named(b, out);
+            collect_named(a, cwd, out);
+            collect_named(b, cwd, out);
         }
         Node::Pipe(cmds) => {
             for c in cmds {
-                collect_named(c, out);
+                collect_named(c, cwd, out);
             }
         }
-        Node::Subshell(inner) => collect_named(inner, out),
+        Node::Subshell(inner) => collect_named(inner, cwd, out),
         Node::Simple(cmd) => {
+            // `cd` names the directory the rest of the line is relative to; it
+            // is not itself a place the command reaches into.
+            if cmd.program == "cd" {
+                if let Some(target) = cmd.args.first() {
+                    let base = cwd.clone().unwrap_or_default();
+                    *cwd = Some(resolve_against(target, &base));
+                }
+                return;
+            }
+            let here = cwd.clone().unwrap_or_default();
+            let base = cwd.as_deref();
             for word in std::iter::once(&cmd.program).chain(cmd.args.iter()) {
-                push_path_word(word, out);
+                push_path_word(word, &here, base, out);
             }
             for r in &cmd.redirects {
-                push_path_word(&r.target, out);
+                push_path_word(&r.target, &here, base, out);
             }
             for sub in &cmd.substitutions {
-                collect_named(sub, out);
+                collect_named(sub, cwd, out);
             }
         }
     }
@@ -308,14 +324,18 @@ fn collect_named(node: &Node, out: &mut Vec<PathBuf>) {
 /// A word may be a path, carry one (`--target=/x/y`), or embed one inside a
 /// quoted payload (`python -c 'open("/w/x","w")'`). All three count: the point
 /// is to notice the place, not to understand the program.
-fn push_path_word(word: &str, out: &mut Vec<PathBuf>) {
+fn push_path_word(word: &str, cwd: &std::path::Path, base: Option<&std::path::Path>, out: &mut Vec<PathBuf>) {
+    let place = |p: PathBuf| match base {
+        Some(_) => resolve_against(&p.to_string_lossy(), cwd),
+        None => p,
+    };
     // A URL is not a path; `https://…` would otherwise read as `/…`.
     if word.contains("://") {
         return;
     }
     let after_eq = word.split_once('=').map(|(_, v)| v).unwrap_or(word);
     if let Some(p) = as_path(after_eq) {
-        out.push(p);
+        out.push(place(p));
         return;
     }
     // Embedded in a payload: take every `/…` or `~/…` run out of it.
@@ -334,7 +354,7 @@ fn push_path_word(word: &str, out: &mut Vec<PathBuf>) {
             .unwrap_or(rest.len());
         let frag = &rest[..end];
         if frag.len() > 1 {
-            out.push(PathBuf::from(frag));
+            out.push(place(PathBuf::from(frag)));
         }
     }
 }
@@ -399,6 +419,26 @@ fn reasons_for(caps: &[Capability]) -> Vec<String> {
     out
 }
 
+/// The places a command may name without that being a reach to grant: the null
+/// and standard descriptors, and the system temp dirs. Discarding output into
+/// `/dev/null` and staging a scratch file in `/tmp` are what every shell line
+/// does — asking about them is a card with nothing behind it.
+pub fn is_scratch(path: &std::path::Path) -> bool {
+    let s = path.to_string_lossy();
+    if matches!(
+        s.as_ref(),
+        "/dev/null" | "/dev/zero" | "/dev/stdin" | "/dev/stdout" | "/dev/stderr" | "/dev/tty"
+    ) || s.starts_with("/dev/fd/")
+    {
+        return true;
+    }
+    // `/var/tmp` is scratch, `/var` is not — the explicit list keeps that
+    // distinction instead of letting the sensitive-dir check decide it.
+    path.starts_with(std::env::temp_dir())
+        || path.starts_with("/tmp")
+        || path.starts_with("/var/tmp")
+}
+
 /// Is `path` outside `workspace` and every `granted` root? Resolves a relative
 /// path against the workspace root and normalizes `.`/`..` components so
 /// `../../etc/shadow` can't sneak through as "relative".
@@ -424,6 +464,11 @@ fn is_out_of_scope<'a>(
             Component::CurDir => {}
             c => normalized.push(c),
         }
+    }
+    // Before the sensitive-dir list: `/dev/null` sits under `/dev`, and `/var`
+    // being sensitive must not take `/var/tmp` with it.
+    if is_scratch(&normalized) {
+        return false;
     }
     let s = normalized.to_string_lossy();
     // Sensitive system + secret dirs are always out of scope.

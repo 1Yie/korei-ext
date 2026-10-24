@@ -25,7 +25,8 @@ pub mod traits;
 pub mod windows_job;
 
 pub use audit::{
-    audit_command, audit_command_rooted, audit_command_scoped, paths_named, writes_out_of_scope,
+    audit_command, audit_command_rooted, audit_command_scoped, is_scratch, paths_named,
+    writes_out_of_scope,
     AuditLevel,
     AuditResult, AuditVerdict,
 };

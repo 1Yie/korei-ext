@@ -1204,10 +1204,21 @@ fn review<C: WorkspaceCtx + SandboxCtx>(args: &Args, ctx: &Arc<C>) -> Review {
         .then(|| args.get("command").and_then(|v| v.as_str()))
         .flatten()
         .map(|command| format!("background job: {}", crate::util::head(command, 120)));
+    // A job that could not be spawned is refused before the card, for the same
+    // reason `bash` is: the answer to the card would not change the outcome.
+    let deny = (action == "run")
+        .then(|| args.get("command").and_then(|v| v.as_str()))
+        .flatten()
+        .and_then(|command| {
+            crate::sandbox_cfg::refuse_unconfined_write(&**ctx, command)
+                .err()
+                .map(|e| e.to_string())
+        });
     Review {
         risk,
         summary,
         action: Some(action.to_string()),
+        deny,
         ..Default::default()
     }
 }

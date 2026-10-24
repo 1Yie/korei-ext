@@ -191,10 +191,13 @@ mod tests {
         use agent_capabilities::{LinkedRoot, LinkedRoots};
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().canonicalize().unwrap();
-        let [ws, rw, ro] = ["ws", "rw", "ro"].map(|n| base.join(n));
-        for d in [&ws, &rw, &ro] {
+        let [ws, rw] = ["ws", "rw"].map(|n| base.join(n));
+        for d in [&ws, &rw] {
             std::fs::create_dir_all(d).unwrap();
         }
+        // The read-only link lives outside scrub space: a temp path is
+        // reachable by definition, which would make the scope assertion vacuous.
+        let ro = std::path::PathBuf::from("/zx/ro");
         std::fs::create_dir_all(rw.join(".git/hooks")).unwrap();
         let roots = std::sync::Arc::new(LinkedRoots::default());
         roots.set(vec![
@@ -228,15 +231,15 @@ mod tests {
     /// able to edit another workspace silently. It now refuses — the same
     /// answer the file tools give — and names the workspace it would have
     /// reached, so the model can ask for a link instead of guessing.
+    ///
+    /// `other` is a lexical path outside `/tmp`: the rule compares places and
+    /// never touches disk, and scrub space is deliberately not a reach.
     #[test]
     fn an_unconfined_shell_refuses_writes_outside_the_granted_roots() {
         let dir = tempfile::tempdir().unwrap();
-        let base = dir.path().canonicalize().unwrap();
-        let [ws, other] = ["ws", "other"].map(|n| base.join(n));
-        for d in [&ws, &other] {
-            std::fs::create_dir_all(d).unwrap();
-            std::fs::write(d.join("f.rs"), "x\n").unwrap();
-        }
+        let ws = dir.path().canonicalize().unwrap();
+        std::fs::write(ws.join("f.rs"), "x\n").unwrap();
+        let other = std::path::PathBuf::from("/zx/other");
         let ctx = unconfined_ctx(&ws);
         let other_file = other.join("f.rs");
         // A write the audit recognized is refused outright: with nothing to
@@ -299,11 +302,11 @@ mod tests {
     fn a_linked_root_lifts_the_refusal_for_writes() {
         use agent_capabilities::{LinkedRoot, LinkedRoots, RootAccess};
         let dir = tempfile::tempdir().unwrap();
-        let base = dir.path().canonicalize().unwrap();
-        let [ws, kernel] = ["ws", "kernel"].map(|n| base.join(n));
-        for d in [&ws, &kernel] {
-            std::fs::create_dir_all(d).unwrap();
-        }
+        let ws = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(&ws).unwrap();
+        // Outside `/tmp`: a link under scrub space would pass for the wrong
+        // reason, since scrub space is always reachable.
+        let kernel = std::path::PathBuf::from("/zx/kernel");
         let roots = std::sync::Arc::new(LinkedRoots::default());
         roots.set(vec![LinkedRoot {
             path: kernel.clone(),

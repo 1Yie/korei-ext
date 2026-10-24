@@ -152,6 +152,18 @@ fn tokenize(input: &str) -> Vec<String> {
                             chars.next();
                             flush(&mut cur, &mut out);
                             out.push("&&".into());
+                        } else if chars.peek() == Some(&'>') {
+                            // `&>file` / `&>>file`: both streams into one file,
+                            // which is a plain write — not a background `&`
+                            // followed by a redirect.
+                            chars.next();
+                            flush(&mut cur, &mut out);
+                            if chars.peek() == Some(&'>') {
+                                chars.next();
+                                out.push(">>".into());
+                            } else {
+                                out.push(">".into());
+                            }
                         } else {
                             flush(&mut cur, &mut out);
                             out.push("&".into()); // background → seq
@@ -162,18 +174,46 @@ fn tokenize(input: &str) -> Vec<String> {
                         out.push(";".into());
                     }
                     '>' if subst_depth == 0 => {
-                        // `>>` or `2>`/`&>` handled: the `2`/`&` would already
-                        // be in `cur` — peel it as the fd prefix.
+                        // `2>`/`1>>`: the digits in `cur` are an fd prefix, not
+                        // a word — left in, the `2` of `2>/dev/null` became an
+                        // argument and a redirect target of its own.
+                        if !cur.is_empty() && cur.bytes().all(|b| b.is_ascii_digit()) {
+                            cur.clear();
+                        }
                         if chars.peek() == Some(&'>') {
                             chars.next();
                             flush(&mut cur, &mut out);
                             out.push(">>".into());
+                        } else if chars.peek() == Some(&'&') {
+                            // `>&2` / `2>&1` / `>&-`: duplicating an open
+                            // descriptor writes no file. The target is consumed
+                            // so it never reads as a path, and nothing enters the
+                            // token stream — `>&file` (no descriptor) is the one
+                            // form that does write, and falls through below.
+                            chars.next();
+                            let mut dup = false;
+                            while let Some(&c) = chars.peek() {
+                                if c.is_ascii_digit() || (c == '-' && !dup) {
+                                    dup = true;
+                                    chars.next();
+                                } else {
+                                    break;
+                                }
+                            }
+                            if !dup {
+                                flush(&mut cur, &mut out);
+                                out.push(">".into());
+                            }
                         } else {
                             flush(&mut cur, &mut out);
                             out.push(">".into());
                         }
                     }
                     '<' if subst_depth == 0 => {
+                        // `0<file`: same fd prefix as above.
+                        if !cur.is_empty() && cur.bytes().all(|b| b.is_ascii_digit()) {
+                            cur.clear();
+                        }
                         flush(&mut cur, &mut out);
                         out.push("<".into());
                     }
@@ -375,6 +415,51 @@ mod tests {
         assert_eq!(c.program, "cat");
         assert!(c.redirects[0].write);
         assert_eq!(c.redirects[0].target, "b.txt");
+    }
+
+    /// `2>&1` duplicates an open descriptor — it writes no file, and neither
+    /// the `2` nor the `1` is an argument or a redirect target.
+    #[test]
+    fn a_descriptor_dup_is_not_a_redirect() {
+        for (cmd, program) in [
+            ("cargo build 2>&1", "cargo"),
+            ("cmd >&2", "cmd"),
+            ("cmd 2>&-", "cmd"),
+        ] {
+            let n = parse(cmd);
+            let c = first_simple(&n);
+            assert!(c.redirects.is_empty(), "{cmd}: {:?}", c.redirects);
+            assert_eq!(c.program, program, "{cmd}");
+            assert!(
+                !c.args.iter().any(|a| a.chars().all(|ch| ch.is_ascii_digit())),
+                "{cmd}: the fd prefix became an argument: {:?}",
+                c.args
+            );
+        }
+    }
+
+    /// The fd prefix (`2>`) belongs to the operator, not to the words.
+    #[test]
+    fn a_descriptor_prefix_does_not_become_a_word() {
+        let n = parse("cat a 2>/dev/null");
+        let c = first_simple(&n);
+        assert_eq!(c.program, "cat");
+        assert_eq!(c.args, ["a"]);
+        assert_eq!(c.redirects.len(), 1);
+        assert_eq!(c.redirects[0].target, "/dev/null");
+    }
+
+    /// `&>file` writes one file with both streams; it is not a background job.
+    #[test]
+    fn both_streams_into_a_file_parses_as_a_write() {
+        let n = parse("make &> build.log");
+        let c = first_simple(&n);
+        assert_eq!(c.program, "make");
+        assert!(c.redirects[0].write);
+        assert_eq!(c.redirects[0].target, "build.log");
+        let appended = parse("make &>> build.log");
+        let append = first_simple(&appended);
+        assert!(append.redirects[0].append);
     }
 
     #[test]

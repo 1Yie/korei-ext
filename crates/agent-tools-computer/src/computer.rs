@@ -105,6 +105,7 @@ fn review<C: DesktopCtx>(args: &Args, ctx: &Arc<C>) -> agent_tool::Review {
             }
             .boxed(),
         ),
+        ..Default::default()
     }
 }
 
