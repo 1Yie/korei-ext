@@ -35,7 +35,7 @@ windows = { version = "0.62", features = [
 # only. `ashpd` runs the portal handshake (granted once, remembered by the
 # compositor); `reis` speaks the EI protocol on the socket it hands back.
 [target.'cfg(target_os = "linux")'.dependencies]
-ashpd = { version = "0.13", default-features = false, features = ["tokio", "remote_desktop", "screencast"] }
+ashpd = { version = "0.13", default-features = false, features = ["async-io", "remote_desktop", "screencast"] }
 reis = { version = "0.7", features = ["tokio"] }
 futures-util = "0.3"
 
