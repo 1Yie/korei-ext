@@ -260,7 +260,7 @@ const AUDIT_ARCH: u32 = 0;
 
 /// Syscalls that only exist for namespace/mount escape, kernel-module or
 /// tracing abuse — denied outright under the sandbox.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 const DENY_NRS: &[u32] = &[
     libc::SYS_mount as u32,
     libc::SYS_umount2 as u32,
@@ -471,6 +471,12 @@ mod tests {
     #[test]
     fn deny_prog_layout() {
         let prog = seccomp_prog();
+        assert_eq!(prog[1].k, AUDIT_ARCH);
+        assert_eq!(prog[2 + prog[1].jf as usize].k, SECCOMP_RET_KILL_PROCESS);
+        assert_eq!(prog[3 + DENY_NRS.len()].k, SECCOMP_RET_ALLOW);
+        for (instruction, syscall) in prog[3..3 + DENY_NRS.len()].iter().zip(DENY_NRS) {
+            assert_eq!(instruction.k, *syscall);
+        }
         // deny JEQ jumps must land on the ERRNO return, not past it.
         for (i, ins) in prog.iter().enumerate() {
             if ins.code == (BPF_JMP | BPF_JEQ | BPF_K) && ins.jt > 0 {
