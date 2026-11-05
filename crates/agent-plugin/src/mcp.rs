@@ -629,6 +629,10 @@ impl McpClient {
         }
         if r["isError"].as_bool().unwrap_or(false) {
             warn!(tool = name, "MCP tool error");
+            if out.trim().is_empty() {
+                anyhow::bail!("MCP tool `{name}` failed without error content");
+            }
+            return Err(anyhow::anyhow!(out));
         }
         Ok(out)
     }

@@ -565,7 +565,7 @@ impl PluginManager {
         let out = plugin
             .call_tool(&real, args)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| truncate(&e.to_string(), PLUGIN_OUTPUT_CAP))?;
         Ok(truncate(&out, PLUGIN_OUTPUT_CAP))
     }
 
