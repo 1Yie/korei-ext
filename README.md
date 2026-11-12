@@ -5,6 +5,7 @@ kernel.
 
 | crate | what it is |
 |---|---|
+| [`agent-code-mode`](crates/agent-code-mode/README.md) | bounded JavaScript worker and host-mediated tool bridge |
 | `agent-tools-fs` | read, search and edit files in a workspace |
 | `agent-tools-shell` | run commands and keep background services up |
 | `agent-tools-web` | fetch and search the web |
