@@ -23,10 +23,20 @@ pub enum SandboxTier {
 pub enum SnapshotMode {
     /// Write directly to the real workspace.
     Off,
-    /// Clone-on-write: agent mutates a reflink copy, merge back on success.
+    /// Request an isolated clone-on-write workspace. Unsupported backends refuse.
     Cow,
-    /// Every write-bearing command must run against a CoW snapshot.
+    /// Require an isolated CoW workspace; never degrade to direct writes.
     Required,
+}
+/// Explicit enforcement claims, not inferred from a backend's id or tier.
+/// Defaults are deliberately closed for third-party backends.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SandboxCapabilities {
+    pub filesystem: bool,
+    pub network: bool,
+    /// Real per-execution staging, not just a changed working directory.
+    /// No built-in backend currently implements snapshots.
+    pub snapshots: bool,
 }
 
 /// Per-run configuration — the caller builds this per tool call.
@@ -128,15 +138,52 @@ pub struct CommandOutput {
     pub elapsed_ms: u64,
 }
 
-/// One sandbox backend. `run_command` is the only entry — all four control
-/// dimensions (fs isolation, network, resource limits, env sanitization)
-/// live behind it.
+/// One sandbox backend. Both execution entries must call `validate_config`
+/// before any subprocess or other execution setup. Returning a Command from
+/// `wrap_spawn` alone does not prove confinement (notably on `none`).
 #[async_trait::async_trait]
 pub trait SandboxBackend: Send + Sync {
     /// Stable id for telemetry/UI (`"bwrap"`, `"landlock"`, `"none"`…).
     fn id(&self) -> &'static str;
     /// Isolation tier.
     fn tier(&self) -> SandboxTier;
+    fn capabilities(&self) -> SandboxCapabilities {
+        SandboxCapabilities::default()
+    }
+
+    /// Reject unsupported snapshot requests before any process can start.
+    /// Both Cow and Required are requests, not best-effort hints.
+    fn validate_config(&self, cfg: &SandboxConfig) -> anyhow::Result<()> {
+        if cfg.snapshot != SnapshotMode::Off && !self.capabilities().snapshots {
+            anyhow::bail!(
+                "sandbox backend `{}` cannot enforce {:?} snapshots; refusing before execution",
+                self.id(),
+                cfg.snapshot,
+            );
+        }
+        Ok(())
+    }
+
+    /// Fail-closed entry for a caller that declared filesystem/network
+    /// confinement. Resource-only or unconfined backends are not sufficient.
+    fn wrap_spawn_sandboxed(
+        &self,
+        cfg: &SandboxConfig,
+        cmd: &str,
+        args: &[&str],
+    ) -> anyhow::Result<tokio::process::Command> {
+        self.validate_config(cfg)?;
+        let capabilities = self.capabilities();
+        if !capabilities.filesystem || !capabilities.network {
+            anyhow::bail!(
+                "sandbox backend `{}` cannot enforce declared filesystem/network confinement; refusing before spawn",
+                self.id(),
+            );
+        }
+        self.wrap_spawn(cfg, cmd, args).ok_or_else(|| {
+            anyhow::anyhow!("sandbox backend `{}` cannot wrap this spawn", self.id())
+        })
+    }
     /// Run `cmd` with `args` inside the sandbox. The backend applies env
     /// sanitization + resource limits + timeout-tree-kill itself — callers
     /// must not pre-sanitize.
@@ -151,8 +198,9 @@ pub trait SandboxBackend: Send + Sync {
     /// — for servers the caller keeps alive (MCP stdio children, plugin
     /// hooks). Unlike `run_command` nothing pipes output or enforces a
     /// timeout; the caller wires its own stdio and lifetime. `None` means
-    /// the backend cannot wrap spawns — the caller decides whether that is
-    /// a hard error (declared sandbox policy) or a loud fallback.
+    /// the backend cannot wrap this config (including unsupported snapshots).
+    /// Declared sandbox policy must use `wrap_spawn_sandboxed`, never fall back
+    /// to host execution. Legacy explicitly unconfined callers may use this API.
     fn wrap_spawn(
         &self,
         _cfg: &SandboxConfig,
@@ -160,5 +208,87 @@ pub trait SandboxBackend: Send + Sync {
         _args: &[&str],
     ) -> Option<tokio::process::Command> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn builtins() -> Vec<Box<dyn SandboxBackend>> {
+        #[allow(unused_mut)]
+        let mut backends: Vec<Box<dyn SandboxBackend>> = vec![Box::new(crate::NoneBackend)];
+        #[cfg(target_os = "linux")]
+        backends.extend([
+            Box::new(crate::LinuxBwrap) as Box<dyn SandboxBackend>,
+            Box::new(crate::LinuxLandlock) as Box<dyn SandboxBackend>,
+        ]);
+        #[cfg(target_os = "macos")]
+        backends.push(Box::new(crate::MacSandboxExec));
+        #[cfg(target_os = "windows")]
+        backends.push(Box::new(crate::WindowsJob));
+        backends
+    }
+
+    /// This runs even if bwrap/Seatbelt/Landlock is unavailable: refusal must
+    /// happen before backend setup, not as an accidental OS launch failure.
+    #[tokio::test]
+    async fn unsupported_snapshots_refuse_before_execution_or_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+        for backend in builtins() {
+            assert!(!backend.capabilities().snapshots, "{}", backend.id());
+            for snapshot in [SnapshotMode::Required, SnapshotMode::Cow] {
+                let cfg = SandboxConfig {
+                    workspace_dir: dir.path().to_path_buf(),
+                    snapshot,
+                    ..Default::default()
+                };
+                let marker = dir.path().join("must-not-execute");
+                let err = backend
+                    .run_command("echo launched > must-not-execute", &[], &cfg)
+                    .await
+                    .expect_err(backend.id());
+                let message = err.to_string();
+                assert!(message.contains("snapshots"), "{message}");
+                assert!(message.contains("before execution"), "{message}");
+                assert!(!marker.exists(), "{} launched a child", backend.id());
+                assert!(backend.wrap_spawn(&cfg, "must-not-start", &[]).is_none());
+                assert!(backend
+                    .wrap_spawn_sandboxed(&cfg, "must-not-start", &[])
+                    .is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn resource_only_and_unconfined_backends_do_not_claim_confinement() {
+        let cfg = SandboxConfig::default();
+        assert!(crate::NoneBackend
+            .wrap_spawn_sandboxed(&cfg, "must-not-start", &[])
+            .is_err());
+        #[cfg(target_os = "linux")]
+        assert!(crate::LinuxLandlock
+            .wrap_spawn_sandboxed(&cfg, "must-not-start", &[])
+            .is_err());
+        #[cfg(target_os = "windows")]
+        assert!(crate::WindowsJob
+            .wrap_spawn_sandboxed(&cfg, "must-not-start", &[])
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn off_still_allows_explicit_legacy_host_execution() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = SandboxConfig {
+            workspace_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        let out = crate::NoneBackend
+            .run_command("echo launched > off-marker", &[], &cfg)
+            .await
+            .unwrap();
+        assert_eq!(out.status, 0);
+        assert!(dir.path().join("off-marker").exists());
+        assert!(crate::NoneBackend.wrap_spawn(&cfg, "legacy", &[]).is_some());
     }
 }

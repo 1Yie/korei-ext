@@ -8,7 +8,7 @@ pub use workspace::{
 #[cfg(feature = "sandbox")]
 pub mod sandbox;
 #[cfg(feature = "sandbox")]
-pub use sandbox::{SandboxCtx, SandboxLimitsSlot, SandboxSlot};
+pub use sandbox::{SandboxCtx, SandboxLimitsProviderSlot, SandboxLimitsSlot, SandboxSlot};
 #[cfg(feature = "desktop")]
 pub mod desktop;
 #[cfg(feature = "desktop")]

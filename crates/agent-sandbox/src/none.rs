@@ -31,6 +31,7 @@ impl SandboxBackend for NoneBackend {
         _args: &[&str],
         cfg: &SandboxConfig,
     ) -> Result<CommandOutput> {
+        self.validate_config(cfg)?;
         let started = Instant::now();
         let timeout = std::time::Duration::from_secs(cfg.timeout_secs.min(600));
 
@@ -130,6 +131,7 @@ impl SandboxBackend for NoneBackend {
         cmd: &str,
         args: &[&str],
     ) -> Option<tokio::process::Command> {
+        self.validate_config(cfg).ok()?;
         let mut envs = sanitize_env(&cfg.env_vars);
         let denied = vec![cfg.workspace_dir.clone()];
         crate::env_sanitize::apply_environment_policy(&mut envs, &cfg.environment, None, &denied);

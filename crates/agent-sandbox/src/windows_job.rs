@@ -134,6 +134,7 @@ impl SandboxBackend for WindowsJob {
         _args: &[&str],
         cfg: &SandboxConfig,
     ) -> Result<CommandOutput> {
+        self.validate_config(cfg)?;
         let started = Instant::now();
         let timeout = std::time::Duration::from_secs(cfg.timeout_secs.min(600));
         let mut envs = sanitize_env(&cfg.env_vars);

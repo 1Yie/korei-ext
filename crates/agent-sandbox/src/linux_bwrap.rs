@@ -474,6 +474,13 @@ impl SandboxBackend for LinuxBwrap {
     fn tier(&self) -> SandboxTier {
         SandboxTier::L2
     }
+    fn capabilities(&self) -> crate::SandboxCapabilities {
+        crate::SandboxCapabilities {
+            filesystem: true,
+            network: true,
+            snapshots: false,
+        }
+    }
 
     async fn run_command(
         &self,
@@ -481,6 +488,7 @@ impl SandboxBackend for LinuxBwrap {
         _args: &[&str],
         cfg: &SandboxConfig,
     ) -> Result<CommandOutput> {
+        self.validate_config(cfg)?;
         let started = Instant::now();
         let run_dir = run_dir();
         let ws = cfg
@@ -579,6 +587,7 @@ impl SandboxBackend for LinuxBwrap {
         cmd: &str,
         args: &[&str],
     ) -> Option<tokio::process::Command> {
+        self.validate_config(cfg).ok()?;
         let run_dir = run_dir();
         let ws = cfg
             .workspace_dir

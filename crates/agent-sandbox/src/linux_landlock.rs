@@ -361,6 +361,12 @@ impl SandboxBackend for LinuxLandlock {
     fn tier(&self) -> SandboxTier {
         SandboxTier::L2
     }
+    fn capabilities(&self) -> crate::SandboxCapabilities {
+        crate::SandboxCapabilities {
+            filesystem: true,
+            ..Default::default()
+        }
+    }
 
     async fn run_command(
         &self,
@@ -368,6 +374,7 @@ impl SandboxBackend for LinuxLandlock {
         _args: &[&str],
         cfg: &SandboxConfig,
     ) -> Result<CommandOutput> {
+        self.validate_config(cfg)?;
         let started = Instant::now();
         let timeout = std::time::Duration::from_secs(cfg.timeout_secs.min(600));
         let ws = cfg
@@ -444,6 +451,7 @@ impl SandboxBackend for LinuxLandlock {
         cmd: &str,
         args: &[&str],
     ) -> Option<tokio::process::Command> {
+        self.validate_config(cfg).ok()?;
         let ws = cfg
             .workspace_dir
             .canonicalize()

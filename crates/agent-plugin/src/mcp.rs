@@ -264,16 +264,8 @@ impl McpClient {
             };
             let (backend, _loud) = agent_sandbox::detect_backend();
             let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-            backend
-                .wrap_spawn(&cfg, command, &arg_refs)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "MCP `{}` declared sandboxed spawn but this platform has \
-                         no sandbox backend — refusing instead of spawning \
-                         unsandboxed",
-                        manifest.id
-                    )
-                })?
+            declared_sandbox_command(&*backend, &cfg, command, &arg_refs)
+                .with_context(|| format!("MCP `{}` declared sandboxed spawn", manifest.id))?
         } else {
             let mut c = tokio::process::Command::new(command);
             c.args(&args).env_clear().envs(&env);
@@ -732,6 +724,17 @@ fn host_env_is_secret(name: &str) -> bool {
     SECRET_EXACT.contains(&u.as_str()) || SECRET_SUFFIXES.iter().any(|s| u.ends_with(s))
 }
 
+/// Kept separate so a missing/partial backend can be tested without relying
+/// on the platform's detected backend or launching an MCP handshake.
+fn declared_sandbox_command(
+    backend: &dyn agent_sandbox::SandboxBackend,
+    cfg: &agent_sandbox::SandboxConfig,
+    command: &str,
+    args: &[&str],
+) -> Result<tokio::process::Command> {
+    backend.wrap_spawn_sandboxed(cfg, command, args)
+}
+
 /// Loopback hosts bypass `permissions.network` — a same-machine MCP server
 /// is a local process in every sandbox model, not outbound network.
 fn is_loopback_host(host: &str) -> bool {
@@ -756,6 +759,100 @@ fn host_allowed(host: &str, allow: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct SpawnProbe {
+        capabilities: agent_sandbox::SandboxCapabilities,
+        wraps: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl agent_sandbox::SandboxBackend for SpawnProbe {
+        fn id(&self) -> &'static str {
+            "probe"
+        }
+        fn tier(&self) -> agent_sandbox::SandboxTier {
+            agent_sandbox::SandboxTier::L2
+        }
+        fn capabilities(&self) -> agent_sandbox::SandboxCapabilities {
+            self.capabilities
+        }
+        async fn run_command(
+            &self,
+            _: &str,
+            _: &[&str],
+            _: &agent_sandbox::SandboxConfig,
+        ) -> Result<agent_sandbox::CommandOutput> {
+            panic!("MCP must only use the spawn path")
+        }
+        fn wrap_spawn(
+            &self,
+            _: &agent_sandbox::SandboxConfig,
+            command: &str,
+            args: &[&str],
+        ) -> Option<tokio::process::Command> {
+            self.wraps.fetch_add(1, Ordering::SeqCst);
+            let mut cmd = tokio::process::Command::new(command);
+            cmd.args(args);
+            Some(cmd)
+        }
+    }
+
+    #[test]
+    fn declared_sandbox_rejects_partial_backends_before_wrapping() {
+        for (filesystem, network) in [(false, false), (true, false), (false, true)] {
+            let backend = SpawnProbe {
+                capabilities: agent_sandbox::SandboxCapabilities {
+                    filesystem,
+                    network,
+                    snapshots: false,
+                },
+                wraps: 0.into(),
+            };
+            let result =
+                declared_sandbox_command(&backend, &Default::default(), "must-not-start", &[]);
+            assert!(result.is_err());
+            assert_eq!(backend.wraps.load(Ordering::SeqCst), 0);
+        }
+        // Confining capabilities allow command construction (not execution).
+        let backend = SpawnProbe {
+            capabilities: agent_sandbox::SandboxCapabilities {
+                filesystem: true,
+                network: true,
+                snapshots: false,
+            },
+            wraps: 0.into(),
+        };
+        assert!(declared_sandbox_command(&backend, &Default::default(), "server", &[]).is_ok());
+        assert_eq!(backend.wraps.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn declared_sandbox_never_launches_none_backend_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("must-not-launch");
+        let cfg = agent_sandbox::SandboxConfig {
+            workspace_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        // NoneBackend.wrap_spawn returns Some(raw host Command), the exact
+        // regression: merely checking Option used to accept it.
+        let result = declared_sandbox_command(
+            &agent_sandbox::NoneBackend,
+            &cfg,
+            "/bin/sh",
+            &["-c", "echo launched > must-not-launch"],
+        );
+        let refused = result.is_err();
+        if let Ok(mut command) = result {
+            command.status().await.unwrap();
+        }
+        assert!(
+            !marker.exists(),
+            "declared sandbox launched a raw host child"
+        );
+        assert!(refused);
+    }
 
     /// Servers echo the id they were sent; our ids are numbers, but a
     /// stringified echo must still resolve (the old `as_u64()` missed it and

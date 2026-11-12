@@ -26,9 +26,7 @@ pub mod windows_job;
 
 pub use audit::{
     audit_command, audit_command_rooted, audit_command_scoped, is_scratch, paths_named,
-    writes_out_of_scope,
-    AuditLevel,
-    AuditResult, AuditVerdict,
+    writes_out_of_scope, AuditLevel, AuditResult, AuditVerdict,
 };
 pub use env_sanitize::{is_denied, sanitize_env};
 pub use limits::{apply_limits, network_from_label, SandboxLimits};
@@ -39,7 +37,9 @@ pub use linux_landlock::{landlock_supported, LinuxLandlock};
 #[cfg(target_os = "macos")]
 pub use mac_sandbox_exec::{sandbox_exec_on_path, MacSandboxExec};
 pub use none::NoneBackend;
-pub use traits::{CommandOutput, SandboxBackend, SandboxConfig, SandboxTier, SnapshotMode};
+pub use traits::{
+    CommandOutput, SandboxBackend, SandboxCapabilities, SandboxConfig, SandboxTier, SnapshotMode,
+};
 #[cfg(target_os = "windows")]
 pub use windows_job::WindowsJob;
 
