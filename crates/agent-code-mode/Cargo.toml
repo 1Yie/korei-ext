@@ -1,0 +1,22 @@
+[package]
+name = "agent-code-mode"
+version = "0.1.0"
+edition = "2021"
+description = "Bounded JavaScript Code Mode worker prototype and parent bridge"
+license = "MIT"
+
+[dependencies]
+async-trait.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+rquickjs = { version = "=0.14.0", default-features = false, features = ["std"] }
+agent-tool.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[[bin]]
+name = "agent-code-mode-worker"
+path = "src/bin/worker.rs"
