@@ -7,6 +7,12 @@ use agent_tool::{ToolContext, ToolError};
 pub struct SandboxSlot(pub Arc<dyn agent_sandbox::SandboxBackend>);
 pub struct SandboxLimitsSlot(pub agent_sandbox::SandboxLimits);
 
+/// Live host policy source, inherited by child contexts. When installed it
+/// takes precedence over the backward-compatible static `SandboxLimitsSlot`.
+pub struct SandboxLimitsProviderSlot(
+    pub Arc<dyn Fn() -> agent_sandbox::SandboxLimits + Send + Sync>,
+);
+
 pub trait SandboxCtx: ToolContext + Sized {
     fn sandbox(&self) -> Result<Arc<dyn agent_sandbox::SandboxBackend>, ToolError> {
         self.service::<SandboxSlot>()
@@ -17,6 +23,9 @@ pub trait SandboxCtx: ToolContext + Sized {
     }
 
     fn sandbox_limits(&self) -> agent_sandbox::SandboxLimits {
+        if let Some(provider) = self.service::<SandboxLimitsProviderSlot>() {
+            return (provider.0)();
+        }
         self.service::<SandboxLimitsSlot>()
             .map(|s| s.0.clone())
             .unwrap_or_default()
@@ -36,6 +45,14 @@ pub trait SandboxCtx: ToolContext + Sized {
         self.extensions_mut()
             .insert_shared(Arc::new(SandboxLimitsSlot(limits)));
         self
+    }
+
+    fn install_sandbox_limits_provider(
+        &mut self,
+        provider: impl Fn() -> agent_sandbox::SandboxLimits + Send + Sync + 'static,
+    ) {
+        self.extensions_mut()
+            .insert_shared(Arc::new(SandboxLimitsProviderSlot(Arc::new(provider))));
     }
 }
 

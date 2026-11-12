@@ -172,6 +172,13 @@ impl SandboxBackend for MacSandboxExec {
     fn tier(&self) -> SandboxTier {
         SandboxTier::L2
     }
+    fn capabilities(&self) -> crate::SandboxCapabilities {
+        crate::SandboxCapabilities {
+            filesystem: true,
+            network: true,
+            snapshots: false,
+        }
+    }
 
     async fn run_command(
         &self,
@@ -179,6 +186,7 @@ impl SandboxBackend for MacSandboxExec {
         _args: &[&str],
         cfg: &SandboxConfig,
     ) -> Result<CommandOutput> {
+        self.validate_config(cfg)?;
         let started = Instant::now();
         let timeout = std::time::Duration::from_secs(cfg.timeout_secs.min(600));
         let ws = cfg
@@ -274,6 +282,7 @@ impl SandboxBackend for MacSandboxExec {
         cmd: &str,
         args: &[&str],
     ) -> Option<tokio::process::Command> {
+        self.validate_config(cfg).ok()?;
         let ws = cfg
             .workspace_dir
             .canonicalize()
