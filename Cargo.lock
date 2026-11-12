@@ -62,7 +62,7 @@ dependencies = [
 [[package]]
 name = "agent-llm-core"
 version = "0.1.0"
-source = "git+https://github.com/1Yie/korei.git?rev=bae91dd2f27a71a669d79d053528e24574a7a433#bae91dd2f27a71a669d79d053528e24574a7a433"
+source = "git+https://github.com/1Yie/korei.git?rev=312138a2cb6dda8bffbd720a623c85b84541c086#312138a2cb6dda8bffbd720a623c85b84541c086"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -134,7 +134,7 @@ dependencies = [
 [[package]]
 name = "agent-tool"
 version = "0.1.0"
-source = "git+https://github.com/1Yie/korei.git?rev=bae91dd2f27a71a669d79d053528e24574a7a433#bae91dd2f27a71a669d79d053528e24574a7a433"
+source = "git+https://github.com/1Yie/korei.git?rev=312138a2cb6dda8bffbd720a623c85b84541c086#312138a2cb6dda8bffbd720a623c85b84541c086"
 dependencies = [
  "agent-llm-core",
  "futures",
