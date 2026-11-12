@@ -1,4 +1,6 @@
-use crate::{types::check_bytes, CodeModeError, CodeModeRequest, ConsoleEntry, ErrorKind};
+use crate::{
+    types::check_bytes, BridgeOperation, CodeModeError, CodeModeRequest, ConsoleEntry, ErrorKind,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io::{BufRead, Write};
@@ -13,6 +15,14 @@ pub(crate) enum Operation {
 }
 
 impl Operation {
+    pub fn kind(&self) -> BridgeOperation {
+        match self {
+            Self::List { .. } => BridgeOperation::List,
+            Self::Describe { .. } => BridgeOperation::Describe,
+            Self::Call { .. } => BridgeOperation::Call,
+        }
+    }
+
     pub fn summary(&self) -> (&'static str, Option<String>) {
         match self {
             Self::List { .. } => ("list", None),

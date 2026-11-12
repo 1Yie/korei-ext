@@ -176,6 +176,63 @@ pub(crate) fn check_bytes(label: &str, actual: usize, limit: usize) -> Result<()
 
 pub type ToolError = CodeModeError;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BridgeOperation {
+    List,
+    Describe,
+    Call,
+}
+
+/// Parent-validated correlation, never guest-supplied authorization.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BridgeRequestContext {
+    pub(crate) request_id: u64,
+    pub(crate) operation: BridgeOperation,
+}
+
+impl BridgeRequestContext {
+    pub fn request_id(&self) -> u64 {
+        self.request_id
+    }
+
+    pub fn operation(&self) -> BridgeOperation {
+        self.operation
+    }
+}
+
+/// Controller provenance, independent of any guest-provided error kind.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ControllerStopCause {
+    GuestFinished,
+    ParentCancelled,
+    DeadlineExceeded,
+    ControllerFailed(ErrorKind),
+    ExecuteDropped,
+}
+
+/// Bounded observations; Stopping precedes bridge Drop, not Host durable drain.
+#[derive(Debug)]
+pub enum ExecutionEvent<'a> {
+    Started,
+    RequestAccepted {
+        context: BridgeRequestContext,
+        name: Option<&'a str>,
+    },
+    RequestCompleted {
+        context: BridgeRequestContext,
+        error: Option<ErrorKind>,
+        duration_ms: u64,
+    },
+    Console(&'a ConsoleEntry),
+    Stopping(ControllerStopCause),
+}
+
+/// Runs synchronously on the controller task. Only update bounded state or notify;
+/// blocking I/O and asynchronous persistence belong to the Host's execution owner.
+pub trait ExecutionObserver: Send + Sync {
+    fn on_event(&self, event: ExecutionEvent<'_>);
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConsoleStream {

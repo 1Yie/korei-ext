@@ -24,7 +24,7 @@ after exit must be safe against process-identifier reuse.
 ```rust,no_run
 use agent_code_mode::{
     execute, CodeModeLimits, CodeModeRequest, CodeModeResponse, ProcessEndpoint,
-    SchemaBudget, ToolBridge,
+    ExecutionObserver, SchemaBudget, ToolBridge,
 };
 use serde_json::Value;
 use std::future::Future;
@@ -32,6 +32,7 @@ use std::future::Future;
 async fn run_in_host(
     worker: ProcessEndpoint,
     gateway: &dyn ToolBridge,
+    observer: &dyn ExecutionObserver,
     schema_budget: &SchemaBudget,
     cancelled: impl Future<Output = ()>,
 ) -> CodeModeResponse {
@@ -48,6 +49,7 @@ async fn run_in_host(
             metadata: Value::Null,
         },
         gateway,
+        Some(observer),
         schema_budget.clone(),
         cancelled,
     ).await
@@ -57,7 +59,16 @@ async fn run_in_host(
 `ToolBridge` owns authorization and registry lookup. Its methods return JSON
 values or `ToolError`. Bridges may borrow turn-owned policy/hooks: `execute`
 accepts `&dyn ToolBridge` and drives scoped futures without spawning bridge
-tasks or requiring `'static`. `describe(name)` returns the current registry description:
+tasks or requiring `'static`. Every method receives `&BridgeRequestContext`,
+constructed by the parent after frame, sequence, and request-budget validation.
+Its `request_id()` and `operation()` identify the protocol request. A call's
+preparation `describe(context, name)` and final `call(context, name, args)` share
+the same context with `BridgeOperation::Call`; preparation is not an actual tool
+dispatch. Explicit descriptions use `BridgeOperation::Describe`. The Host maps
+these IDs to trusted execution/call identities and owns actual-dispatch counts.
+The context carries no guest-provided authorization fields.
+
+`describe(context, name)` returns the current registry description:
 
 ```json
 {
@@ -87,10 +98,35 @@ completion, including after execution cancellation or Drop. An execution
 waiting for capacity remains subject to its cancellation and deadline.
 
 The host keeps execution metadata and authorization context. Metadata is
-withheld from the worker. Bridge futures must be cancellation-safe and own all
-their work: dropping them must stop local work. External effects already
-dispatched may have completed. An implementation that spawns detached work
-violates this contract.
+withheld from the worker. Bridge futures are scoped waiters: the Host owns a
+bounded per-execution ledger and shared completion for already-dispatched work.
+It retains that completion when Runtime drops a waiter, drains Gateway work,
+finishes Gateway audit, and stores original results durably. This work remains
+owned by the Host rather than detached bridge tasks.
+
+The optional borrowed `ExecutionObserver` receives synchronous `on_event`
+callbacks on the controller task. `Started` is emitted when `execute` constructs
+its future, including a future dropped before its first poll. Validated requests,
+bounded result summaries, and console entries produce `RequestAccepted`,
+`RequestCompleted`, and `Console`. Summaries contain correlation, error kind,
+and duration; source, arguments, and raw tool results are withheld. Request names
+remain within frame/request budgets and console entries retain the existing
+entry/byte budgets. Runtime creates no observer queue or background observer
+task. Callbacks only update bounded Host state or notify; blocking/async
+persistence belongs to the Host owner. Observer callbacks are trusted Host code
+and must return normally.
+
+Exactly one `Stopping(ControllerStopCause)` precedes releasing active or queued
+bridge work on Finish, VM error, cancellation, deadline, controller failure, or
+future Drop. The Host synchronously invalidates/cancels its execution scope on
+this event so subsequent dispatch is rejected, then drains shared completions.
+`GuestFinished` identifies a validated VM Finish even when its guest-controlled
+error kind says `Cancelled` or `Limit`. `ParentCancelled`, `DeadlineExceeded`,
+`ControllerFailed(kind)`, and `ExecuteDropped` are trusted controller causes.
+Human rejection comes from Host Gateway audit/UserRejected; a guest error kind
+supplies no such authority. `Stopping` claims neither child/Gateway drain nor
+durable audit completion. Only the Host emits the product execution terminal
+after confirming durable terminal state.
 
 ## JavaScript Contract
 
@@ -144,7 +180,7 @@ Each execution tracks its schema tasks. Completion and cancellation abort
 queued computations and await already-running bounded computations; that
 cleanup can finish after the caller's execution deadline. Running blocking
 work cannot be forcibly stopped. Dropping `execute` schedules child reaping
-and schema-task draining on the current Tokio runtime, retaining compute
+and schema-task draining on the current Tokio runtime after synchronous stopping, retaining compute
 permits until their tasks really end. Keep that runtime alive for cleanup.
 
 On completion, same-turn unawaited requests are discarded before dispatch.
@@ -182,5 +218,10 @@ nor JavaScript access to the workspace.
 Cross-target checks need the target Rust standard library and a compatible C
 compiler/SDK for QuickJS. Native Windows/Linux execution and Sandbox containment
 need their own integration verification.
+
+This package has no native OS Sandbox adapter or production Host/Kernel strategy
+integration. Its mock and direct-child tests verify the Runtime contract; native
+containment, Gateway durable drain, and product terminal delivery require those
+integrations and end-to-end verification.
 
 Dependency versions/features and the crate license are in `Cargo.toml`.

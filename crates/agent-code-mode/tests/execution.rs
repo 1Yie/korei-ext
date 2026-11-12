@@ -12,6 +12,43 @@ use tokio::{
     sync::{oneshot, Notify},
 };
 
+#[tokio::test]
+async fn guest_error_kind_cannot_claim_controller_cancellation() {
+    #[derive(Default)]
+    struct Stops(std::sync::Mutex<Vec<ControllerStopCause>>);
+    impl ExecutionObserver for Stops {
+        fn on_event(&self, event: ExecutionEvent<'_>) {
+            if let ExecutionEvent::Stopping(cause) = event {
+                self.0.lock().unwrap().push(cause);
+            }
+        }
+    }
+    for kind in ["cancelled", "limit", "timeout"] {
+        let observer = Stops::default();
+        let bridge = Mock::default();
+        let child = Command::new(env!("CARGO_BIN_EXE_agent-code-mode-worker"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let response = execute(
+            child.try_into().unwrap(),
+            request(&format!("throw {{kind:'{kind}',message:'guest spoof'}};")),
+            &bridge,
+            Some(&observer),
+            SchemaBudget::new(1).unwrap(),
+            pending(),
+        )
+        .await;
+        assert!(response.error.is_some(), "{response:?}");
+        assert_eq!(
+            *observer.0.lock().unwrap(),
+            [ControllerStopCause::GuestFinished]
+        );
+    }
+}
+
 // Direct launch is an isolated VM/process experiment, not a production sandbox.
 fn worker() -> Child {
     Command::new(env!("CARGO_BIN_EXE_agent-code-mode-worker"))
@@ -40,14 +77,14 @@ impl Drop for Active<'_> {
 
 #[async_trait]
 impl ToolBridge for Mock {
-    async fn list(&self, cursor: Value) -> Result<Value, ToolError> {
+    async fn list(&self, _: &BridgeRequestContext, cursor: Value) -> Result<Value, ToolError> {
         Ok(if cursor.is_null() {
             json!({"tools":["mock.echo"], "cursor":1})
         } else {
             json!({"tools":["mock.fail"], "cursor":null})
         })
     }
-    async fn describe(&self, name: &str) -> Result<Value, ToolError> {
+    async fn describe(&self, _: &BridgeRequestContext, name: &str) -> Result<Value, ToolError> {
         if name == "mock.external" {
             return Ok(json!({"name":name,"input_schema":{"$ref":"file:///not-readable"}}));
         }
@@ -77,7 +114,12 @@ impl ToolBridge for Mock {
             "output_schema":{"type":"object","properties":{"value":{"type":"integer"}},"required":["value"],"additionalProperties":false}
         }))
     }
-    async fn call(&self, name: &str, args: Value) -> Result<Value, ToolError> {
+    async fn call(
+        &self,
+        _: &BridgeRequestContext,
+        name: &str,
+        args: Value,
+    ) -> Result<Value, ToolError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let current = self.active.fetch_add(1, Ordering::SeqCst) + 1;
         self.peak.fetch_max(current, Ordering::SeqCst);
@@ -115,6 +157,7 @@ async fn evaluate(request: CodeModeRequest, bridge: &dyn ToolBridge) -> CodeMode
             worker().try_into().unwrap(),
             request,
             bridge,
+            None,
             SchemaBudget::new(1).unwrap(),
             pending(),
         ),
@@ -164,16 +207,29 @@ async fn bridge_can_borrow_turn_owned_state() {
     }
     #[async_trait]
     impl ToolBridge for Borrowed<'_> {
-        async fn list(&self, cursor: Value) -> Result<Value, ToolError> {
-            let mut value = self.inner.list(cursor).await?;
+        async fn list(
+            &self,
+            context: &BridgeRequestContext,
+            cursor: Value,
+        ) -> Result<Value, ToolError> {
+            let mut value = self.inner.list(context, cursor).await?;
             value["policy"] = json!(self.policy);
             Ok(value)
         }
-        async fn describe(&self, name: &str) -> Result<Value, ToolError> {
-            self.inner.describe(name).await
+        async fn describe(
+            &self,
+            context: &BridgeRequestContext,
+            name: &str,
+        ) -> Result<Value, ToolError> {
+            self.inner.describe(context, name).await
         }
-        async fn call(&self, name: &str, args: Value) -> Result<Value, ToolError> {
-            self.inner.call(name, args).await
+        async fn call(
+            &self,
+            context: &BridgeRequestContext,
+            name: &str,
+            args: Value,
+        ) -> Result<Value, ToolError> {
+            self.inner.call(context, name, args).await
         }
     }
     let inner = Mock::default();
@@ -324,6 +380,7 @@ async fn deadline_and_cancel_drop_active_bridge_and_reap_child() {
             child.try_into().unwrap(),
             request,
             &bridge,
+            None,
             SchemaBudget::new(1).unwrap(),
             async {
                 let _ = cancel_rx.await;
@@ -402,6 +459,7 @@ async fn startup_deadline_reaps_worker_before_any_bridge_dispatch() {
             child.try_into().unwrap(),
             request,
             &bridge,
+            None,
             SchemaBudget::new(1).unwrap(),
             pending(),
         ),
@@ -434,14 +492,19 @@ async fn invalidated_execution_prevents_validated_call_dispatch() {
     }
     #[async_trait]
     impl ToolBridge for Described {
-        async fn list(&self, _: Value) -> Result<Value, ToolError> {
+        async fn list(&self, _: &BridgeRequestContext, _: Value) -> Result<Value, ToolError> {
             unreachable!()
         }
-        async fn describe(&self, name: &str) -> Result<Value, ToolError> {
+        async fn describe(&self, _: &BridgeRequestContext, name: &str) -> Result<Value, ToolError> {
             self.described.notify_one();
             Ok(json!({"name":name,"input_schema":{"type":"object"}}))
         }
-        async fn call(&self, _: &str, _: Value) -> Result<Value, ToolError> {
+        async fn call(
+            &self,
+            _: &BridgeRequestContext,
+            _: &str,
+            _: Value,
+        ) -> Result<Value, ToolError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(Value::Null)
         }
@@ -458,6 +521,7 @@ async fn invalidated_execution_prevents_validated_call_dispatch() {
             worker().try_into().unwrap(),
             request,
             &bridge,
+            None,
             SchemaBudget::new(1).unwrap(),
             async {
                 let _ = cancel_rx.await;
@@ -593,17 +657,22 @@ async fn limit_matrix_rejects_overflow_with_measured_byte_counts() {
     }
     #[async_trait]
     impl ToolBridge for ReturnedJson {
-        async fn list(&self, _: Value) -> Result<Value, ToolError> {
+        async fn list(&self, _: &BridgeRequestContext, _: Value) -> Result<Value, ToolError> {
             Ok(self.value.clone())
         }
-        async fn describe(&self, name: &str) -> Result<Value, ToolError> {
+        async fn describe(&self, _: &BridgeRequestContext, name: &str) -> Result<Value, ToolError> {
             let mut description = json!({"name":name,"input_schema":{},"output_schema":{}});
             if name == "mock.description" {
                 description["notes"] = self.value.clone();
             }
             Ok(description)
         }
-        async fn call(&self, _: &str, _: Value) -> Result<Value, ToolError> {
+        async fn call(
+            &self,
+            _: &BridgeRequestContext,
+            _: &str,
+            _: Value,
+        ) -> Result<Value, ToolError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(self.value.clone())
         }
@@ -613,7 +682,9 @@ async fn limit_matrix_rejects_overflow_with_measured_byte_counts() {
         value: value.clone(),
         calls: AtomicUsize::new(0),
     };
-    let description = bridge.describe("mock.description").await.unwrap();
+    let description = json!({
+        "name": "mock.description", "input_schema": {}, "output_schema": {}, "notes": value
+    });
     assert!(value.as_str().unwrap().len() < 256);
     for (source, measured_value, output, rejected_calls, accepted_calls) in [
         (
@@ -818,13 +889,18 @@ async fn shared_schema_preparation_rejects_invalid_contracts_before_side_effects
     }
     #[async_trait]
     impl ToolBridge for SchemaBridge {
-        async fn list(&self, _: Value) -> Result<Value, ToolError> {
+        async fn list(&self, _: &BridgeRequestContext, _: Value) -> Result<Value, ToolError> {
             unreachable!()
         }
-        async fn describe(&self, name: &str) -> Result<Value, ToolError> {
+        async fn describe(&self, _: &BridgeRequestContext, name: &str) -> Result<Value, ToolError> {
             Ok(json!({"name":name, "input_schema":self.input, "output_schema":self.output}))
         }
-        async fn call(&self, _: &str, args: Value) -> Result<Value, ToolError> {
+        async fn call(
+            &self,
+            _: &BridgeRequestContext,
+            _: &str,
+            args: Value,
+        ) -> Result<Value, ToolError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(args)
         }
@@ -888,6 +964,7 @@ async fn dead_worker_is_contained() {
         child.try_into().unwrap(),
         request("return 42"),
         &Mock::default(),
+        None,
         SchemaBudget::new(1).unwrap(),
         pending(),
     )
@@ -914,6 +991,7 @@ async fn dropping_controller_kills_and_reaps_worker() {
             child.try_into().unwrap(),
             request("await tools.call('mock.pending',{value:1})"),
             owned_bridge.as_ref(),
+            None,
             SchemaBudget::new(1).unwrap(),
             pending(),
         )

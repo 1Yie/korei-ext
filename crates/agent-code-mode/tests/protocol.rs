@@ -221,13 +221,13 @@ async fn vm_interrupt_reports_timeout_without_parent_controller() {
 struct Never;
 #[async_trait]
 impl ToolBridge for Never {
-    async fn list(&self, _: Value) -> Result<Value, ToolError> {
+    async fn list(&self, _: &BridgeRequestContext, _: Value) -> Result<Value, ToolError> {
         pending().await
     }
-    async fn describe(&self, _: &str) -> Result<Value, ToolError> {
+    async fn describe(&self, _: &BridgeRequestContext, _: &str) -> Result<Value, ToolError> {
         pending().await
     }
-    async fn call(&self, _: &str, _: Value) -> Result<Value, ToolError> {
+    async fn call(&self, _: &BridgeRequestContext, _: &str, _: Value) -> Result<Value, ToolError> {
         pending().await
     }
 }
@@ -287,6 +287,7 @@ async fn parent_rejects_malformed_duplicate_out_of_order_and_excess_messages() {
                 child.try_into().unwrap(),
                 request,
                 &Never,
+                None,
                 SchemaBudget::new(1).unwrap(),
                 pending(),
             ),
