@@ -1,9 +1,9 @@
 use crate::{
     process::OwnedProcess,
-    protocol::{self, bounded_json, Operation, ParentFrame, ToolRequest, WorkerFrame},
+    protocol::{self, bounded_json, Operation, ParentFrame, WorkerFrame},
     types::check_bytes,
-    CallSummary, CodeModeError, CodeModeRequest, CodeModeResponse, ErrorKind, ProcessEndpoint,
-    ToolError,
+    BridgeRequestContext, CallSummary, CodeModeError, CodeModeRequest, CodeModeResponse,
+    ControllerStopCause, ErrorKind, ExecutionEvent, ExecutionObserver, ProcessEndpoint, ToolError,
 };
 use agent_tool::schema::{self, BoundedValidator};
 use async_trait::async_trait;
@@ -38,14 +38,24 @@ impl SchemaBudget {
     }
 }
 
-/// Host authority boundary. Implementations must be cancellation-safe: dropping a
-/// future stops local work; a dispatched external side effect may already have happened.
+/// Host authority boundary. Dropping a waiter cancels local waiting. The Host
+/// retains shared completion to drain dispatched work and finish its durable audit.
 #[async_trait]
 pub trait ToolBridge: Send + Sync {
-    async fn list(&self, cursor: Value) -> Result<Value, ToolError>;
+    async fn list(&self, context: &BridgeRequestContext, cursor: Value)
+        -> Result<Value, ToolError>;
     /// Return registry data with `name`, `input_schema`, and optional `output_schema`.
-    async fn describe(&self, name: &str) -> Result<Value, ToolError>;
-    async fn call(&self, name: &str, args: Value) -> Result<Value, ToolError>;
+    async fn describe(
+        &self,
+        context: &BridgeRequestContext,
+        name: &str,
+    ) -> Result<Value, ToolError>;
+    async fn call(
+        &self,
+        context: &BridgeRequestContext,
+        name: &str,
+        args: Value,
+    ) -> Result<Value, ToolError>;
 }
 
 fn schema_error(error: schema::ValidationError) -> ToolError {
@@ -127,18 +137,19 @@ impl SchemaWork {
 
 async fn invoke(
     bridge: &dyn ToolBridge,
+    context: &BridgeRequestContext,
     operation: Operation,
     limit: usize,
 ) -> Result<InvocationValue, CodeModeError> {
     let value = match operation {
         Operation::List { cursor } => {
             bounded_json(&cursor, limit, "cursor")?;
-            bridge.list(cursor).await?
+            bridge.list(context, cursor).await?
         }
-        Operation::Describe { name } => bridge.describe(&name).await?,
+        Operation::Describe { name } => bridge.describe(context, &name).await?,
         Operation::Call { name, args } => {
             bounded_json(&args, limit, "tool arguments")?;
-            let description = bridge.describe(&name).await?;
+            let description = bridge.describe(context, &name).await?;
             bounded_json(&description, limit, "tool description")?;
             if description.get("name").and_then(Value::as_str) != Some(name.as_str()) {
                 return Err(CodeModeError::new(
@@ -157,8 +168,47 @@ async fn invoke(
     Ok(InvocationValue::Complete(value))
 }
 
-type InvocationResult = (u64, Result<InvocationValue, CodeModeError>, Instant);
+type InvocationResult = (
+    BridgeRequestContext,
+    Result<InvocationValue, CodeModeError>,
+    Instant,
+);
 type Invocation<'a> = BoxFuture<'a, InvocationResult>;
+
+struct ControllerWork<'a> {
+    observer: Option<&'a dyn ExecutionObserver>,
+    stopped: bool,
+    queue: VecDeque<(BridgeRequestContext, Operation)>,
+    active: FuturesUnordered<Invocation<'a>>,
+}
+
+impl ControllerWork<'_> {
+    fn observe(&self, event: ExecutionEvent<'_>) {
+        if let Some(observer) = self.observer {
+            observer.on_event(event);
+        }
+    }
+
+    fn stop(&mut self, cause: ControllerStopCause) {
+        if !self.stopped {
+            self.stopped = true;
+            self.observe(ExecutionEvent::Stopping(cause));
+        }
+    }
+}
+
+impl Drop for ControllerWork<'_> {
+    fn drop(&mut self) {
+        self.stop(ControllerStopCause::ExecuteDropped);
+    }
+}
+
+// Field order keeps synchronous stopping ahead of asynchronous schema/reap cleanup.
+struct ExecutionOwner<'a> {
+    work: ControllerWork<'a>,
+    schema_jobs: SchemaJobs,
+    child: OwnedProcess,
+}
 
 #[derive(Default)]
 struct SchemaJobs(Option<tokio::task::JoinSet<InvocationResult>>);
@@ -185,17 +235,18 @@ impl Drop for SchemaJobs {
     }
 }
 
-async fn run(
+async fn run<'a>(
     pipes: (
         Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
         Box<dyn tokio::io::AsyncRead + Send + Unpin>,
         Box<dyn tokio::io::AsyncRead + Send + Unpin>,
     ),
     request: &CodeModeRequest,
-    bridge: &dyn ToolBridge,
+    bridge: &'a dyn ToolBridge,
     response: &mut CodeModeResponse,
     deadline: tokio::time::Instant,
     schema: (&mut tokio::task::JoinSet<InvocationResult>, &SchemaBudget),
+    work: &mut ControllerWork<'a>,
 ) -> Result<Value, CodeModeError> {
     let (mut input, output, mut stderr) = pipes;
     let (schema_jobs, schema_budget) = schema;
@@ -223,25 +274,24 @@ async fn run(
         limits.max_frame_bytes,
     )
     .await?;
-    let mut queue: VecDeque<ToolRequest> = VecDeque::new();
-    let mut active: FuturesUnordered<Invocation<'_>> = FuturesUnordered::new();
     let mut next_id = 1;
     let mut pending = 0;
     let mut console_bytes = 0usize;
     let mut stderr_open = true;
     let mut stderr_buf = [0u8; 1024];
     loop {
-        while active.len() + schema_jobs.len() < limits.max_concurrent {
-            let Some(tool_request) = queue.pop_front() else {
+        while work.active.len() + schema_jobs.len() < limits.max_concurrent {
+            let Some((context, operation)) = work.queue.pop_front() else {
                 break;
             };
-            active.push(
+            let limit = limits.max_result_bytes;
+            work.active.push(
                 async move {
                     let started = Instant::now();
-                    let result = invoke(bridge, tool_request.operation, limits.max_result_bytes)
+                    let result = invoke(bridge, &context, operation, limit)
                         .await
                         .map_err(CodeModeError::bounded);
-                    (tool_request.id, result, started)
+                    (context, result, started)
                 }
                 .boxed(),
             );
@@ -260,9 +310,17 @@ async fn run(
                             if name.is_empty() || name.len() > 1024 { return Err(protocol::protocol("invalid tool name")); }
                         }
                         bounded_json(&tool_request.operation, limits.max_result_bytes, "tool request")?;
+                        let context = BridgeRequestContext {
+                            request_id: tool_request.id,
+                            operation: tool_request.operation.kind(),
+                        };
                         next_id += 1;
                         pending += 1;
                         let (operation, name) = tool_request.operation.summary();
+                        work.observe(ExecutionEvent::RequestAccepted {
+                            context,
+                            name: name.as_deref(),
+                        });
                         response.calls.push(CallSummary {
                             id: tool_request.id,
                             operation: operation.into(),
@@ -270,7 +328,7 @@ async fn run(
                             error: Some(CodeModeError::new(ErrorKind::Cancelled, "execution ended before this request completed")),
                             duration_ms: 0,
                         });
-                        queue.push_back(tool_request);
+                        work.queue.push_back((context, tool_request.operation));
                     }
                     WorkerFrame::Console { entry } => {
                         console_bytes = console_bytes.saturating_add(entry.text.len());
@@ -278,13 +336,14 @@ async fn run(
                         if response.console.len() >= limits.max_console_entries {
                             return Err(CodeModeError::new(ErrorKind::Limit, "parent console entry limit exceeded"));
                         }
+                        work.observe(ExecutionEvent::Console(&entry));
                         response.console.push(entry);
                     }
                     WorkerFrame::Finish { result } => {
                         if let Ok(value) = &result { bounded_json(value, limits.max_output_bytes, "output")?; }
-                        // Drop queued/active futures before observing process termination.
-                        drop(active);
-                        drop(queue);
+                        work.stop(ControllerStopCause::GuestFinished);
+                        work.active.clear();
+                        work.queue.clear();
                         drop(input);
                         let frame: Result<WorkerFrame, _> = protocol::read_async(&mut output, &mut bytes, limits.max_frame_bytes).await;
                         match frame {
@@ -298,25 +357,27 @@ async fn run(
             }
             event = async {
                 tokio::select! {
-                    Some(result) = active.next(), if !active.is_empty() => Ok(result),
+                    Some(result) = work.active.next(), if !work.active.is_empty() => Ok(result),
                     Some(result) = schema_jobs.join_next(), if !schema_jobs.is_empty() =>
                         result.map_err(|error| CodeModeError::new(ErrorKind::Tool, error.to_string())),
                 }
-            }, if !active.is_empty() || !schema_jobs.is_empty() => {
-                let (id, result, started) = event?;
+            }, if !work.active.is_empty() || !schema_jobs.is_empty() => {
+                let (context, result, started) = event?;
+                let id = context.request_id();
                 let mut result = match result {
                     Ok(value @ (InvocationValue::DescribedCall { .. } | InvocationValue::UnvalidatedResult { .. })) => {
-                        let work = match value {
+                        let schema_work = match value {
                             InvocationValue::DescribedCall { name, args, description } =>
                                 SchemaWork::Prepare { name, args, description },
                             InvocationValue::UnvalidatedResult { result, validator } =>
                                 SchemaWork::Validate { result, validator },
                             _ => unreachable!(),
                         };
-                        active.push(async move {
-                            let result = schema_budget.acquire().await
-                                .map(|permit| InvocationValue::ReadySchema { work, permit });
-                            (id, result, started)
+                        let budget = schema_budget.clone();
+                        work.active.push(async move {
+                            let result = budget.acquire().await
+                                .map(|permit| InvocationValue::ReadySchema { work: schema_work, permit });
+                            (context, result, started)
                         }.boxed());
                         continue;
                     }
@@ -324,12 +385,13 @@ async fn run(
                         schema_jobs.spawn_blocking(move || {
                             let _permit = permit;
                             let result = work.run().map_err(CodeModeError::bounded);
-                            (id, result, started)
+                            (context, result, started)
                         });
                         continue;
                     }
                     Ok(InvocationValue::ValidatedCall { name, args, output_validator }) => {
-                        active.push(async move {
+                        let limit = limits.max_result_bytes;
+                        work.active.push(async move {
                             let result = async {
                                 if tokio::time::Instant::now() >= deadline {
                                     return Err(CodeModeError::new(
@@ -337,14 +399,14 @@ async fn run(
                                         "parent execution deadline exceeded",
                                     ));
                                 }
-                                let result = bridge.call(&name, args).await?;
-                                bounded_json(&result, limits.max_result_bytes, "tool result")?;
+                                let result = bridge.call(&context, &name, args).await?;
+                                bounded_json(&result, limit, "tool result")?;
                                 if let Some(validator) = output_validator {
                                     return Ok(InvocationValue::UnvalidatedResult { result, validator });
                                 }
                                 Ok(InvocationValue::Complete(result))
                             }.await.map_err(CodeModeError::bounded);
-                            (id, result, started)
+                            (context, result, started)
                         }.boxed());
                         // Yield from run itself: FuturesUnordered can repoll a
                         // yielding child before the outer execution guard runs.
@@ -363,6 +425,11 @@ async fn run(
                 let summary = &mut response.calls[(id - 1) as usize];
                 summary.error = result.err();
                 summary.duration_ms = duration_ms;
+                work.observe(ExecutionEvent::RequestCompleted {
+                    context,
+                    error: summary.error.as_ref().map(|error| error.kind),
+                    duration_ms,
+                });
                 pending -= 1;
                 protocol::write_async(&mut input, &frame, limits.max_frame_bytes).await?;
             }
@@ -381,98 +448,119 @@ async fn run(
 /// Run framed worker I/O alongside a continuously polled native supervisor.
 /// Cancellation and deadline cover startup, schema preparation and stdout drain.
 /// Drop cleanup requires the owning Tokio runtime to remain alive until reaping.
-pub async fn execute(
+pub fn execute<'a>(
     endpoint: ProcessEndpoint,
     request: CodeModeRequest,
-    bridge: &dyn ToolBridge,
+    bridge: &'a dyn ToolBridge,
+    observer: Option<&'a dyn ExecutionObserver>,
     schema_budget: SchemaBudget,
-    cancellation: impl Future<Output = ()>,
-) -> CodeModeResponse {
-    let started = Instant::now();
-    let mut response = CodeModeResponse {
-        execution_id: request.execution_id.clone(),
-        output: None,
-        error: None,
-        console: Vec::new(),
-        calls: Vec::new(),
-        duration_ms: 0,
-    };
+    cancellation: impl Future<Output = ()> + 'a,
+) -> impl Future<Output = CodeModeResponse> + 'a {
     let ProcessEndpoint {
         process,
         stdin,
         stdout,
         stderr,
     } = endpoint;
-    let mut child = OwnedProcess(Some(process));
-    let mut schema_jobs = SchemaJobs(Some(tokio::task::JoinSet::new()));
-    let deadline = tokio::time::Instant::now()
-        + std::time::Duration::from_millis(request.limits.deadline_ms.clamp(1, 30_000));
-    let mut reaped = false;
-    let mut result = {
-        let execution = run(
-            (stdin, stdout, stderr),
-            &request,
-            bridge,
-            &mut response,
-            deadline,
-            (schema_jobs.0.as_mut().unwrap(), &schema_budget),
-        );
-        let supervision = async {
-            let result = child.0.as_mut().unwrap().wait().await;
-            reaped = result.is_ok();
-            result
-        };
-        // try_join retains each future across wakeups: sampling clocks in wait
-        // cannot be reset by unrelated protocol or tool activity.
-        let supervised = async {
-            let (value, ()) = futures::try_join!(execution, supervision)?;
-            Ok(value)
-        };
-        tokio::select! {
-            biased;
-            _ = cancellation => Err(CodeModeError::new(ErrorKind::Cancelled, "execution cancelled")),
-            _ = tokio::time::sleep_until(deadline) => Err(CodeModeError::new(ErrorKind::Timeout, "parent execution deadline exceeded")),
-            result = supervised => result,
-        }
+    let owner = ExecutionOwner {
+        work: ControllerWork {
+            observer,
+            stopped: false,
+            queue: VecDeque::new(),
+            active: FuturesUnordered::new(),
+        },
+        schema_jobs: SchemaJobs(Some(tokio::task::JoinSet::new())),
+        child: OwnedProcess(Some(process)),
     };
-    if result
-        .as_ref()
-        .is_err_and(|e| e.kind == ErrorKind::Protocol && e.message == "unexpected EOF")
-    {
-        // EOF is the worker crash signal; explicit malformed frames remain protocol errors.
-        result = Err(CodeModeError::new(
-            ErrorKind::WorkerCrash,
-            "worker closed stdout before finishing",
-        ));
-    }
-    if !reaped {
-        let process = child.0.as_mut().unwrap();
-        let _ = process.start_kill();
-        if let Err(error) = process.wait().await {
-            // A killed child's exit error is expected; preserve the triggering
-            // cancellation, protocol, VM or supervisor error.
-            if result.is_ok() {
-                result = Err(error);
+    owner.work.observe(ExecutionEvent::Started);
+    async move {
+        let mut owner = owner;
+        let started = Instant::now();
+        let mut response = CodeModeResponse {
+            execution_id: request.execution_id.clone(),
+            output: None,
+            error: None,
+            console: Vec::new(),
+            calls: Vec::new(),
+            duration_ms: 0,
+        };
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_millis(request.limits.deadline_ms.clamp(1, 30_000));
+        let mut reaped = false;
+        let (mut result, stop_cause) = {
+            let execution = run(
+                (stdin, stdout, stderr),
+                &request,
+                bridge,
+                &mut response,
+                deadline,
+                (owner.schema_jobs.0.as_mut().unwrap(), &schema_budget),
+                &mut owner.work,
+            );
+            let supervision = async {
+                let result = owner.child.0.as_mut().unwrap().wait().await;
+                reaped = result.is_ok();
+                result
+            };
+            // try_join retains each future across wakeups: sampling clocks in wait
+            // cannot be reset by unrelated protocol or tool activity.
+            let supervised = async {
+                let (value, ()) = futures::try_join!(execution, supervision)?;
+                Ok(value)
+            };
+            tokio::select! {
+                biased;
+                _ = cancellation => (Err(CodeModeError::new(ErrorKind::Cancelled, "execution cancelled")), Some(ControllerStopCause::ParentCancelled)),
+                _ = tokio::time::sleep_until(deadline) => (Err(CodeModeError::new(ErrorKind::Timeout, "parent execution deadline exceeded")), Some(ControllerStopCause::DeadlineExceeded)),
+                result = supervised => (result, None),
+            }
+        };
+        if result
+            .as_ref()
+            .is_err_and(|e| e.kind == ErrorKind::Protocol && e.message == "unexpected EOF")
+        {
+            // EOF is the worker crash signal; explicit malformed frames remain protocol errors.
+            result = Err(CodeModeError::new(
+                ErrorKind::WorkerCrash,
+                "worker closed stdout before finishing",
+            ));
+        }
+        owner.work.stop(stop_cause.unwrap_or(match &result {
+            Ok(_) => ControllerStopCause::GuestFinished,
+            Err(error) => ControllerStopCause::ControllerFailed(error.kind),
+        }));
+        owner.work.active.clear();
+        owner.work.queue.clear();
+        if !reaped {
+            let process = owner.child.0.as_mut().unwrap();
+            let _ = process.start_kill();
+            if let Err(error) = process.wait().await {
+                // A killed child's exit error is expected; preserve the triggering
+                // cancellation, protocol, VM or supervisor error.
+                if result.is_ok() {
+                    result = Err(error);
+                }
             }
         }
-    }
-    schema_jobs.finish().await;
-    child.0.take();
-    match result {
-        Ok(value) => response.output = Some(value),
-        Err(error) => {
-            if response.error.is_none() {
-                response.error = Some(error);
+        owner.schema_jobs.finish().await;
+        owner.child.0.take();
+        match result {
+            Ok(value) => response.output = Some(value),
+            Err(error) => {
+                if response.error.is_none() {
+                    response.error = Some(error);
+                }
             }
         }
+        response.duration_ms = started.elapsed().as_millis() as u64;
+        response
     }
-    response.duration_ms = started.elapsed().as_millis() as u64;
-    response
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::ToolRequest;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::{oneshot, watch, Notify};
 
@@ -502,14 +590,19 @@ mod tests {
 
     #[async_trait]
     impl ToolBridge for TestBridge {
-        async fn list(&self, _: Value) -> Result<Value, ToolError> {
+        async fn list(&self, _: &BridgeRequestContext, _: Value) -> Result<Value, ToolError> {
             unreachable!()
         }
-        async fn describe(&self, name: &str) -> Result<Value, ToolError> {
+        async fn describe(&self, _: &BridgeRequestContext, name: &str) -> Result<Value, ToolError> {
             self.described.notify_one();
             Ok(serde_json::json!({"name":name,"input_schema":{},"output_schema":{}}))
         }
-        async fn call(&self, _: &str, _: Value) -> Result<Value, ToolError> {
+        async fn call(
+            &self,
+            _: &BridgeRequestContext,
+            _: &str,
+            _: Value,
+        ) -> Result<Value, ToolError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(serde_json::json!(42))
         }
@@ -579,6 +672,7 @@ mod tests {
                     limits: Default::default(),
                 },
                 bridge.as_ref(),
+                None,
                 budget,
                 async {
                     let _ = cancellation.await;
@@ -602,7 +696,10 @@ mod tests {
                 started_tx.send(()).unwrap();
                 release_rx.blocking_recv().unwrap();
                 (
-                    1,
+                    BridgeRequestContext {
+                        request_id: 1,
+                        operation: crate::BridgeOperation::Call,
+                    },
                     Ok(InvocationValue::Complete(Value::Null)),
                     Instant::now(),
                 )
@@ -668,7 +765,10 @@ mod tests {
                 release_rx.blocking_recv().unwrap();
                 finished_tx.send(()).unwrap();
                 (
-                    1,
+                    BridgeRequestContext {
+                        request_id: 1,
+                        operation: crate::BridgeOperation::Call,
+                    },
                     Ok(InvocationValue::Complete(Value::Null)),
                     Instant::now(),
                 )
@@ -721,7 +821,10 @@ mod tests {
                 let _permit = permit;
                 work_ran.store(true, std::sync::atomic::Ordering::SeqCst);
                 (
-                    1,
+                    BridgeRequestContext {
+                        request_id: 1,
+                        operation: crate::BridgeOperation::Call,
+                    },
                     Ok(InvocationValue::Complete(Value::Null)),
                     Instant::now(),
                 )
