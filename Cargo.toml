@@ -28,10 +28,10 @@ grep-matcher = "0.1"
 libc = "0.2.189"
 
 # The kernel's contracts, from the korei repository.
-agent-llm-core = { git = "https://github.com/1Yie/korei.git", rev = "312138a2cb6dda8bffbd720a623c85b84541c086" }
-agent-tool = { git = "https://github.com/1Yie/korei.git", rev = "312138a2cb6dda8bffbd720a623c85b84541c086" }
-agent-ipc = { git = "https://github.com/1Yie/korei.git", rev = "312138a2cb6dda8bffbd720a623c85b84541c086" }
-agent-kernel = { git = "https://github.com/1Yie/korei.git", rev = "312138a2cb6dda8bffbd720a623c85b84541c086" }
+agent-llm-core = { git = "https://github.com/1Yie/korei.git", rev = "1f0cc3f7bf021b92c926cb569f0eb73251c7845a" }
+agent-tool = { git = "https://github.com/1Yie/korei.git", rev = "1f0cc3f7bf021b92c926cb569f0eb73251c7845a" }
+agent-ipc = { git = "https://github.com/1Yie/korei.git", rev = "1f0cc3f7bf021b92c926cb569f0eb73251c7845a" }
+agent-kernel = { git = "https://github.com/1Yie/korei.git", rev = "1f0cc3f7bf021b92c926cb569f0eb73251c7845a" }
 
 [profile.dev]
 panic = "unwind"       # tests need unwinding; debug UX needs backtraces
