@@ -21,6 +21,14 @@ kernel.
 Tool packages depend only on korei's contracts (`agent-tool`, `agent-llm-core`),
 never on the engine, so they work with any host.
 
+## Documentation
+
+- This README is the project entry point and documentation profile.
+- Package READMEs describe contracts, usage and verification. Example READMEs
+  explain how to use the examples.
+- Code, tests and configuration own exact APIs and limits.
+- Change rationale lives in commit messages.
+
 ## License
 
 MIT
