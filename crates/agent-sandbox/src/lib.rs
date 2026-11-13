@@ -11,6 +11,8 @@ pub mod limits;
 #[cfg(target_os = "linux")]
 pub mod linux_bwrap;
 #[cfg(target_os = "linux")]
+mod linux_cgroup;
+#[cfg(target_os = "linux")]
 pub mod linux_landlock;
 #[cfg(target_os = "macos")]
 pub mod mac_sandbox_exec;
@@ -20,7 +22,14 @@ pub mod none;
 pub mod proxy;
 #[cfg(unix)]
 mod shared;
+pub mod snapshot;
+mod snapshot_fs;
+pub mod spawn;
 pub mod traits;
+#[cfg(windows)]
+mod windows_acl;
+#[cfg(windows)]
+mod windows_isolated;
 #[cfg(target_os = "windows")]
 pub mod windows_job;
 

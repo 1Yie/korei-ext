@@ -154,9 +154,9 @@ pub trait SandboxBackend: Send + Sync {
     /// Reject unsupported snapshot requests before any process can start.
     /// Both Cow and Required are requests, not best-effort hints.
     fn validate_config(&self, cfg: &SandboxConfig) -> anyhow::Result<()> {
-        if cfg.snapshot != SnapshotMode::Off && !self.capabilities().snapshots {
+        if cfg.snapshot != SnapshotMode::Off {
             anyhow::bail!(
-                "sandbox backend `{}` cannot enforce {:?} snapshots; refusing before execution",
+                "sandbox backend `{}` requires a live SnapshotLease for {:?} snapshots; refusing before execution; use spawn_isolated",
                 self.id(),
                 cfg.snapshot,
             );

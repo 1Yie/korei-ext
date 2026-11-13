@@ -1,0 +1,1058 @@
+//! Per-execution private workspaces. Hosts quiesce every tool before sealing.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
+
+use anyhow::{bail, Context, Result};
+
+use crate::snapshot_fs::{clone_into, Dir};
+
+static NEXT: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotPreference {
+    NativePreferred,
+    PrivateCopy,
+}
+
+/// Preparation limits, measured as logical bytes across baseline and working
+/// copies. These limits do not enforce disk usage after execution starts.
+#[derive(Debug, Clone, Copy)]
+pub struct SnapshotBudget {
+    pub max_bytes: u64,
+    pub max_entries: u64,
+    pub max_depth: usize,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotStats {
+    pub native_cow_files: u64,
+    pub private_copy_files: u64,
+    pub prepared_bytes: u64,
+    pub prepared_entries: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RootId(usize);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotState {
+    Prepared,
+    Sealed,
+    Published,
+    RecoveryRequired,
+    RolledBack,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeKind {
+    CreateFile,
+    ModifyFile,
+    DeleteFile,
+    CreateDirectory,
+    ModifyDirectory,
+    DeleteDirectory,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotChange {
+    pub root: RootId,
+    pub path: PathBuf,
+    pub kind: ChangeKind,
+}
+
+#[derive(Debug, Clone)]
+pub struct PublishConflict {
+    pub change: SnapshotChange,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct RecoveryRecord {
+    pub root: RootId,
+    pub target: PathBuf,
+    /// A private, same-volume directory containing displaced originals and
+    /// staged replacements. Retain this path in the host's durable audit.
+    pub directory: PathBuf,
+    pub reason: String,
+}
+
+#[derive(Debug, Default)]
+pub struct PublishReport {
+    pub applied: Vec<SnapshotChange>,
+    pub conflicts: Vec<PublishConflict>,
+    pub recovery_required: Vec<RecoveryRecord>,
+    pub recovery_material: Vec<PathBuf>,
+    pub cancelled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Entry {
+    directory: bool,
+    identity: (u64, u64),
+    mode: u32,
+}
+
+struct Root {
+    source: Dir,
+    identity: (u64, u64),
+    root_mode: u32,
+    baseline: Dir,
+    working: Dir,
+    original: BTreeMap<PathBuf, Entry>,
+}
+
+struct Private {
+    container: Option<Dir>,
+    roots: Vec<Root>,
+    active: AtomicUsize,
+}
+
+impl Drop for Private {
+    fn drop(&mut self) {
+        // A displaced container is retained rather than following an attacker
+        // controlled path during cleanup.
+        self.roots.clear();
+        if let Some(container) = self.container.take() {
+            if Dir::open(&container.path).and_then(|d| d.identity()).ok()
+                == container.identity().ok()
+            {
+                let _ = remove_contents(&container);
+                let path = container.path.clone();
+                drop(container);
+                if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
+                    if let Ok(parent) = Dir::open(parent) {
+                        let _ = parent.unlink(Path::new(name), true);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A host-minted capability. Keeping a lease alive prevents sealing.
+pub struct SnapshotLease {
+    private: Arc<Private>,
+}
+
+/// A file capability that keeps its snapshot unsealable until closed.
+pub struct SnapshotFile {
+    file: File,
+    lease: SnapshotLease,
+}
+
+impl SnapshotFile {
+    pub fn try_clone(&self) -> std::io::Result<Self> {
+        Ok(Self {
+            file: self.file.try_clone()?,
+            lease: self.lease.retain(),
+        })
+    }
+
+    pub fn metadata(&self) -> std::io::Result<std::fs::Metadata> {
+        self.file.metadata()
+    }
+
+    pub fn sync_all(&self) -> std::io::Result<()> {
+        self.file.sync_all()
+    }
+}
+
+impl Read for SnapshotFile {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.file.read(buf)
+    }
+}
+
+impl Write for SnapshotFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.file.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
+impl Seek for SnapshotFile {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        self.file.seek(position)
+    }
+}
+
+/// Empty private launch directory with no workspace read/write capability.
+pub struct WorkerScope {
+    private: Arc<Private>,
+}
+
+impl WorkerScope {
+    pub fn prepare(storage_root: &Path) -> Result<Self> {
+        let storage = Dir::open(storage_root)?;
+        check_private(&storage)?;
+        let container = storage.mkdir(Path::new(&unique("worker")))?;
+        Ok(Self {
+            private: Arc::new(Private {
+                container: Some(container),
+                roots: Vec::new(),
+                active: AtomicUsize::new(0),
+            }),
+        })
+    }
+
+    pub(crate) fn directory(&self) -> Result<&Path> {
+        let dir = self
+            .private
+            .container
+            .as_ref()
+            .context("missing worker directory")?;
+        if Dir::open(&dir.path)?.identity()? != dir.identity()? {
+            bail!("private worker directory identity changed");
+        }
+        Ok(&dir.path)
+    }
+}
+
+impl Drop for SnapshotLease {
+    fn drop(&mut self) {
+        self.private.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl SnapshotLease {
+    fn retain(&self) -> Self {
+        self.private.active.fetch_add(1, Ordering::AcqRel);
+        Self {
+            private: Arc::clone(&self.private),
+        }
+    }
+
+    pub fn roots(&self) -> impl Iterator<Item = RootId> + '_ {
+        (0..self.private.roots.len()).map(RootId)
+    }
+
+    pub fn working_root(&self, root: RootId) -> Result<&Path> {
+        Ok(&self.root(root)?.working.path)
+    }
+
+    pub fn source_root(&self, root: RootId) -> Result<&Path> {
+        Ok(&self.root(root)?.source.path)
+    }
+
+    /// Maps a host absolute path to its linked private root and relative path.
+    pub fn map_source(&self, path: &Path) -> Result<(RootId, PathBuf)> {
+        for (id, root) in self.private.roots.iter().enumerate() {
+            if let Ok(relative) = path.strip_prefix(&root.source.path) {
+                if !relative.as_os_str().is_empty() {
+                    crate::snapshot_fs::relative(relative)?;
+                }
+                return Ok((RootId(id), relative.to_owned()));
+            }
+        }
+        bail!("path is outside the leased source roots")
+    }
+
+    pub fn read_file(&self, root: RootId, path: &Path) -> Result<SnapshotFile> {
+        Ok(SnapshotFile {
+            file: self.root(root)?.working.read(path)?,
+            lease: self.retain(),
+        })
+    }
+
+    /// Creates a new regular file using O_EXCL/handle-relative traversal.
+    pub fn create_file(&self, root: RootId, path: &Path) -> Result<SnapshotFile> {
+        Ok(SnapshotFile {
+            file: self.root(root)?.working.create(path)?,
+            lease: self.retain(),
+        })
+    }
+
+    /// Opens the inode before checking its type, then truncates that handle.
+    pub fn write_file(&self, root: RootId, path: &Path, bytes: &[u8]) -> Result<()> {
+        let mut file = self.root(root)?.working.write(path)?;
+        file.set_len(0)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        Ok(())
+    }
+
+    pub fn create_directory(&self, root: RootId, path: &Path) -> Result<()> {
+        self.root(root)?.working.mkdir(path)?;
+        Ok(())
+    }
+
+    fn root(&self, root: RootId) -> Result<&Root> {
+        self.private
+            .roots
+            .get(root.0)
+            .context("unknown snapshot root")
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        for root in &self.private.roots {
+            if Dir::open(&root.working.path)?.identity()? != root.working.identity()? {
+                bail!("private execution root identity changed");
+            }
+        }
+        Ok(())
+    }
+}
+
+pub struct WorkspaceSnapshot {
+    private: Arc<Private>,
+    state: SnapshotState,
+    stats: SnapshotStats,
+    budget: SnapshotBudget,
+    changes: Vec<SnapshotChange>,
+}
+
+impl WorkspaceSnapshot {
+    pub fn prepare(
+        source_roots: &[PathBuf],
+        storage_root: &Path,
+        budget: SnapshotBudget,
+        preference: SnapshotPreference,
+    ) -> Result<Self> {
+        if source_roots.is_empty() || budget.max_entries == 0 || budget.max_depth == 0 {
+            bail!("snapshot requires roots and explicit nonzero entry/depth budgets");
+        }
+        let storage = Dir::open(storage_root).context("open private snapshot storage")?;
+        check_private(&storage)?;
+        let mut sources = Vec::new();
+        for path in source_roots {
+            let source = Dir::open(path).context("open source root without links")?;
+            for previous in &sources {
+                let previous: &Dir = previous;
+                if roots_overlap(&source, previous)? {
+                    bail!("source roots overlap");
+                }
+            }
+            if roots_overlap(&source, &storage)? {
+                bail!("source and snapshot storage overlap");
+            }
+            sources.push(source);
+        }
+        let name = unique("execution");
+        let container = storage.mkdir(Path::new(&name))?;
+        let mut private = Private {
+            container: Some(container),
+            roots: Vec::new(),
+            active: AtomicUsize::new(0),
+        };
+        let mut stats = SnapshotStats::default();
+        for (index, source) in sources.into_iter().enumerate() {
+            let container = private.container.as_ref().unwrap();
+            let base = container.mkdir(Path::new(&format!("baseline-{index}")))?;
+            let work = container.mkdir(Path::new(&format!("working-{index}")))?;
+            let original = inventory(&source, budget)?;
+            copy_tree(&source, &base, &original, budget, preference, &mut stats)?;
+            copy_tree(
+                &base,
+                &work,
+                &inventory(&base, budget)?,
+                budget,
+                preference,
+                &mut stats,
+            )?;
+            if !tree_equal(&source, &base, &original, budget)? {
+                bail!("source changed during snapshot preparation");
+            }
+            let identity = source.identity()?;
+            let root_mode = mode(&source.metadata()?);
+            private.roots.push(Root {
+                source,
+                identity,
+                root_mode,
+                baseline: base,
+                working: work,
+                original,
+            });
+        }
+        private.container.as_ref().unwrap().sync()?;
+        Ok(Self {
+            private: Arc::new(private),
+            state: SnapshotState::Prepared,
+            stats,
+            budget,
+            changes: Vec::new(),
+        })
+    }
+
+    pub fn state(&self) -> SnapshotState {
+        self.state
+    }
+    pub fn stats(&self) -> SnapshotStats {
+        self.stats
+    }
+
+    pub fn lease(&self) -> Result<SnapshotLease> {
+        if self.state != SnapshotState::Prepared {
+            bail!("snapshot is not accepting new work");
+        }
+        self.private.active.fetch_add(1, Ordering::AcqRel);
+        Ok(SnapshotLease {
+            private: Arc::clone(&self.private),
+        })
+    }
+
+    /// Host must first stop admission and quiesce all capability users. Active
+    /// process guards and leases make an early seal fail closed.
+    pub fn seal(&mut self) -> Result<&[SnapshotChange]> {
+        if self.state != SnapshotState::Prepared {
+            bail!("snapshot is not prepared");
+        }
+        if self.private.active.load(Ordering::Acquire) != 0 {
+            bail!("snapshot still has active execution leases");
+        }
+        let mut changes = Vec::new();
+        for (id, root) in self.private.roots.iter().enumerate() {
+            if mode(&root.working.metadata()?) != mode(&root.baseline.metadata()?) {
+                bail!("execution root permission changes are unsupported");
+            }
+            let working = inventory(&root.working, self.budget)?;
+            let baseline = inventory(&root.baseline, self.budget)?;
+            let paths: BTreeSet<_> = baseline.keys().chain(working.keys()).collect();
+            for path in paths {
+                let old = baseline.get(path);
+                let new = working.get(path);
+                if let (Some(old), Some(new)) = (old, new) {
+                    if old.directory != new.directory {
+                        bail!("file/directory type replacement requires separate executions");
+                    }
+                    if old.mode == new.mode
+                        && (old.directory
+                            || files_equal(&root.baseline.read(path)?, &root.working.read(path)?)?)
+                    {
+                        continue;
+                    }
+                }
+                let kind = match (old, new) {
+                    (None, Some(e)) if e.directory => ChangeKind::CreateDirectory,
+                    (None, Some(_)) => ChangeKind::CreateFile,
+                    (Some(e), None) if e.directory => ChangeKind::DeleteDirectory,
+                    (Some(_), None) => ChangeKind::DeleteFile,
+                    (Some(e), Some(_)) if e.directory => ChangeKind::ModifyDirectory,
+                    (Some(_), Some(_)) => ChangeKind::ModifyFile,
+                    _ => unreachable!(),
+                };
+                changes.push(SnapshotChange {
+                    root: RootId(id),
+                    path: path.clone(),
+                    kind,
+                });
+            }
+        }
+        changes.sort_by_key(|c| {
+            let depth = c.path.components().count();
+            match c.kind {
+                ChangeKind::CreateDirectory => (0, depth),
+                ChangeKind::DeleteDirectory => (2, usize::MAX - depth),
+                ChangeKind::ModifyDirectory => (3, usize::MAX - depth),
+                _ => (1, depth),
+            }
+        });
+        self.changes = changes;
+        self.state = SnapshotState::Sealed;
+        Ok(&self.changes)
+    }
+
+    pub fn diff(&self) -> Result<&[SnapshotChange]> {
+        if self.state == SnapshotState::Prepared {
+            bail!("seal before reading the diff");
+        }
+        Ok(&self.changes)
+    }
+
+    /// Cancellation is honored before the first host mutation. Once publishing
+    /// starts the host receives every partial result and recovery location.
+    pub fn publish(&mut self, cancelled: impl Fn() -> bool) -> Result<PublishReport> {
+        if self.state != SnapshotState::Sealed {
+            bail!("publish requires a sealed snapshot");
+        }
+        let mut report = PublishReport::default();
+        if cancelled() {
+            report.cancelled = true;
+            return Ok(report);
+        }
+        for change in &self.changes {
+            let root = &self.private.roots[change.root.0];
+            if let Err(error) = preflight(root, change) {
+                report.conflicts.push(PublishConflict {
+                    change: change.clone(),
+                    reason: error.to_string(),
+                });
+            }
+        }
+        // Preflight every path before making recovery directories or staging.
+        if !report.conflicts.is_empty() {
+            return Ok(report);
+        }
+        if cancelled() {
+            report.cancelled = true;
+            return Ok(report);
+        }
+        let mut created = BTreeMap::new();
+        for change in &self.changes {
+            if change.kind == ChangeKind::ModifyDirectory {
+                continue;
+            }
+            let root = &self.private.roots[change.root.0];
+            if let Err(error) = publish_one(root, change, &mut report, &created) {
+                report.conflicts.push(PublishConflict {
+                    change: change.clone(),
+                    reason: error.to_string(),
+                });
+                break;
+            }
+            if change.kind == ChangeKind::CreateDirectory {
+                match root.source.child(&change.path).and_then(|dir| {
+                    Ok(Entry {
+                        directory: true,
+                        identity: dir.identity()?,
+                        mode: mode(&dir.metadata()?),
+                    })
+                }) {
+                    Ok(entry) => {
+                        created.insert((change.root, change.path.clone()), entry);
+                    }
+                    Err(error) => {
+                        report.conflicts.push(PublishConflict {
+                            change: change.clone(),
+                            reason: error.to_string(),
+                        });
+                        break;
+                    }
+                }
+            }
+            if !report.recovery_required.is_empty() {
+                break;
+            }
+        }
+        if report.conflicts.is_empty() && report.recovery_required.is_empty() {
+            let mut directories: Vec<_> = self
+                .changes
+                .iter()
+                .filter(|change| {
+                    matches!(
+                        change.kind,
+                        ChangeKind::CreateDirectory | ChangeKind::ModifyDirectory
+                    )
+                })
+                .collect();
+            directories.sort_by_key(|change| std::cmp::Reverse(change.path.components().count()));
+            for change in directories {
+                let root = &self.private.roots[change.root.0];
+                let result = if change.kind == ChangeKind::ModifyDirectory {
+                    publish_one(root, change, &mut report, &created)
+                } else {
+                    (|| -> Result<()> {
+                        let (parent, name) = checked_parent(root, change, &created)?;
+                        let directory = parent.child(Path::new(&name))?;
+                        let expected = &created[&(change.root, change.path.clone())];
+                        if directory.identity()? != expected.identity
+                            || mode(&directory.metadata()?) != expected.mode
+                        {
+                            bail!("created directory identity or permissions changed");
+                        }
+                        directory.set_permissions(
+                            root.working.child(&change.path)?.metadata()?.permissions(),
+                        )?;
+                        directory.sync()?;
+                        Ok(())
+                    })()
+                };
+                if let Err(error) = result {
+                    report.conflicts.push(PublishConflict {
+                        change: change.clone(),
+                        reason: error.to_string(),
+                    });
+                    break;
+                }
+            }
+        }
+        if !report.applied.is_empty()
+            && !report.conflicts.is_empty()
+            && report.recovery_required.is_empty()
+        {
+            let completed_files = report.applied.iter().filter(|change| {
+                !matches!(
+                    change.kind,
+                    ChangeKind::CreateDirectory | ChangeKind::DeleteDirectory
+                )
+            });
+            for (change, directory) in completed_files.zip(&report.recovery_material) {
+                report.recovery_required.push(RecoveryRecord {
+                    root: change.root,
+                    target: self.private.roots[change.root.0]
+                        .source
+                        .path
+                        .join(&change.path),
+                    directory: directory.clone(),
+                    reason: "partial publication requires host reconciliation of applied changes"
+                        .into(),
+                });
+            }
+            if report.recovery_required.is_empty() {
+                let change = &report.applied[0];
+                let source = &self.private.roots[change.root.0].source.path;
+                report.recovery_required.push(RecoveryRecord {
+                    root: change.root,
+                    target: source.join(&change.path),
+                    directory: source.clone(),
+                    reason: "partial directory publication requires host reconciliation".into(),
+                });
+            }
+        }
+        self.state = if !report.recovery_required.is_empty() {
+            SnapshotState::RecoveryRequired
+        } else if report.conflicts.is_empty() {
+            SnapshotState::Published
+        } else {
+            SnapshotState::Sealed
+        };
+        Ok(report)
+    }
+
+    /// Discards only the private execution state. Published host effects and
+    /// same-volume recovery material remain owned by the host.
+    pub fn rollback(mut self) -> Result<()> {
+        if self.private.active.load(Ordering::Acquire) != 0 {
+            bail!("cannot discard an active snapshot");
+        }
+        self.state = SnapshotState::RolledBack;
+        Ok(())
+    }
+}
+
+fn overlaps(a: &Path, b: &Path) -> bool {
+    a.starts_with(b) || b.starts_with(a)
+}
+fn roots_overlap(a: &Dir, b: &Dir) -> Result<bool> {
+    Ok(overlaps(&a.path, &b.path)
+        || a.lineage()?.contains(&b.identity()?)
+        || b.lineage()?.contains(&a.identity()?))
+}
+fn unique(prefix: &str) -> String {
+    format!(
+        ".korei-{prefix}-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+fn inventory(root: &Dir, budget: SnapshotBudget) -> Result<BTreeMap<PathBuf, Entry>> {
+    fn visit(
+        dir: &Dir,
+        prefix: &Path,
+        map: &mut BTreeMap<PathBuf, Entry>,
+        budget: SnapshotBudget,
+        bytes: &mut u64,
+    ) -> Result<()> {
+        for name in dir.names()? {
+            let path = prefix.join(&name);
+            if path.components().count() > budget.max_depth
+                || map.len() as u64 >= budget.max_entries
+            {
+                bail!("snapshot entry/depth budget exceeded");
+            }
+            let directory = dir.is_dir(Path::new(&name))?;
+            let (identity, mode) = if directory {
+                let child = dir.child(Path::new(&name))?;
+                let identity = child.identity()?;
+                let mode = mode(&child.metadata()?);
+                map.insert(
+                    path.clone(),
+                    Entry {
+                        directory,
+                        identity,
+                        mode,
+                    },
+                );
+                visit(&child, &path, map, budget, bytes)?;
+                continue;
+            } else {
+                let file = dir.read(Path::new(&name))?;
+                let metadata = file.metadata()?;
+                *bytes = bytes
+                    .checked_add(metadata.len())
+                    .context("snapshot byte count overflow")?;
+                if *bytes > budget.max_bytes {
+                    bail!("snapshot byte budget exceeded");
+                }
+                (file_identity(&file)?, mode(&metadata))
+            };
+            map.insert(
+                path,
+                Entry {
+                    directory,
+                    identity,
+                    mode,
+                },
+            );
+        }
+        Ok(())
+    }
+    let mut entries = BTreeMap::new();
+    visit(root, Path::new(""), &mut entries, budget, &mut 0)?;
+    if entries
+        .values()
+        .any(|entry| entry.identity.0 != root.identity().map(|id| id.0).unwrap_or(u64::MAX))
+    {
+        bail!("cross-device source trees are forbidden");
+    }
+    Ok(entries)
+}
+
+fn copy_tree(
+    source: &Dir,
+    target: &Dir,
+    entries: &BTreeMap<PathBuf, Entry>,
+    budget: SnapshotBudget,
+    preference: SnapshotPreference,
+    stats: &mut SnapshotStats,
+) -> Result<()> {
+    for (path, entry) in entries {
+        stats.prepared_entries = stats
+            .prepared_entries
+            .checked_add(1)
+            .context("entry overflow")?;
+        if stats.prepared_entries > budget.max_entries {
+            bail!("snapshot preparation entry budget exceeded");
+        }
+        if entry.directory {
+            target.mkdir(path)?;
+            continue;
+        }
+        let input = source.read(path)?;
+        let before = input.metadata()?;
+        if file_identity(&input)? != entry.identity {
+            bail!("source file identity changed");
+        }
+        stats.prepared_bytes = stats
+            .prepared_bytes
+            .checked_add(before.len())
+            .context("byte overflow")?;
+        if stats.prepared_bytes > budget.max_bytes {
+            bail!("snapshot preparation byte budget exceeded");
+        }
+        let (output, native) = clone_into(
+            &input,
+            target,
+            path,
+            preference == SnapshotPreference::NativePreferred,
+        )?;
+        set_mode(&output, entry.mode)?;
+        output.sync_all()?;
+        if !files_equal(&input, &output)? || before.len() != input.metadata()?.len() {
+            bail!("source changed during copy");
+        }
+        if native {
+            stats.native_cow_files += 1;
+        } else {
+            stats.private_copy_files += 1;
+        }
+    }
+    for (path, entry) in entries.iter().rev() {
+        if entry.directory {
+            target
+                .child(path)?
+                .set_permissions(source.child(path)?.metadata()?.permissions())?;
+        }
+    }
+    target.sync()?;
+    Ok(())
+}
+
+fn tree_equal(
+    source: &Dir,
+    baseline: &Dir,
+    original: &BTreeMap<PathBuf, Entry>,
+    budget: SnapshotBudget,
+) -> Result<bool> {
+    let current = inventory(source, budget)?;
+    if &current != original {
+        return Ok(false);
+    }
+    for (path, entry) in original {
+        if !entry.directory && !files_equal(&source.read(path)?, &baseline.read(path)?)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn files_equal(a: &File, b: &File) -> Result<bool> {
+    if a.metadata()?.len() != b.metadata()?.len() {
+        return Ok(false);
+    }
+    let mut a = a.try_clone()?;
+    let mut b = b.try_clone()?;
+    a.seek(SeekFrom::Start(0))?;
+    b.seek(SeekFrom::Start(0))?;
+    let mut x = [0; 65536];
+    let mut y = [0; 65536];
+    loop {
+        let nx = a.read(&mut x)?;
+        let ny = b.read(&mut y)?;
+        if nx != ny || x[..nx] != y[..ny] {
+            return Ok(false);
+        }
+        if nx == 0 {
+            return Ok(true);
+        }
+    }
+}
+
+fn preflight(root: &Root, change: &SnapshotChange) -> Result<()> {
+    let current_root = Dir::open(&root.source.path)?;
+    if current_root.identity()? != root.identity
+        || mode(&current_root.metadata()?) != root.root_mode
+    {
+        bail!("source root identity or permissions changed");
+    }
+    let mut parent = change.path.parent();
+    while let Some(path) = parent.filter(|p| !p.as_os_str().is_empty()) {
+        if let Some(entry) = root.original.get(path) {
+            let current = root.source.child(path)?;
+            if current.identity()? != entry.identity || mode(&current.metadata()?) != entry.mode {
+                bail!("source parent identity or permissions changed");
+            }
+        }
+        parent = path.parent();
+    }
+    match root.original.get(&change.path) {
+        Some(entry) => {
+            if root.source.is_dir(&change.path)? != entry.directory {
+                bail!("target type changed");
+            }
+            if entry.directory {
+                let directory = root.source.child(&change.path)?;
+                if directory.identity()? != entry.identity
+                    || mode(&directory.metadata()?) != entry.mode
+                {
+                    bail!("target directory identity or permissions changed");
+                }
+            } else {
+                let file = root.source.read(&change.path)?;
+                if file_identity(&file)? != entry.identity
+                    || mode(&file.metadata()?) != entry.mode
+                    || !files_equal(&file, &root.baseline.read(&change.path)?)?
+                {
+                    bail!("target content, permissions or identity changed");
+                }
+            }
+        }
+        None => match root.source.is_dir(&change.path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => bail!("new target already exists or is unsafe"),
+        },
+    }
+    Ok(())
+}
+
+fn publish_one(
+    root: &Root,
+    change: &SnapshotChange,
+    report: &mut PublishReport,
+    created: &BTreeMap<(RootId, PathBuf), Entry>,
+) -> Result<()> {
+    preflight(root, change)?;
+    let (parent, name) = checked_parent(root, change, created)?;
+    if change.kind == ChangeKind::CreateDirectory {
+        parent.mkdir(Path::new(&name))?;
+        report.applied.push(change.clone());
+        parent.sync()?;
+        return Ok(());
+    }
+    if change.kind == ChangeKind::DeleteDirectory {
+        // rmdir refuses to discard concurrent additions.
+        parent.unlink(Path::new(&name), true)?;
+        report.applied.push(change.clone());
+        return Ok(());
+    }
+    let recovery = parent.mkdir(Path::new(&unique("publish")))?;
+    report.recovery_material.push(recovery.path.clone());
+    if change.kind == ChangeKind::ModifyDirectory {
+        let original = recovery.mkdir(Path::new("original"))?;
+        original.set_permissions(root.baseline.child(&change.path)?.metadata()?.permissions())?;
+        original.sync()?;
+        recovery.sync()?;
+        parent.sync()?;
+        preflight(root, change)?;
+        let directory = parent.child(Path::new(&name))?;
+        directory.set_permissions(root.working.child(&change.path)?.metadata()?.permissions())?;
+        report.applied.push(change.clone());
+        directory.sync()?;
+        return Ok(());
+    }
+    let stage = Path::new("replacement");
+    if change.kind != ChangeKind::DeleteFile {
+        let input = root.working.read(&change.path)?;
+        let (output, _) = clone_into(&input, &recovery, stage, true)?;
+        set_mode(&output, mode(&input.metadata()?))?;
+        output.sync_all()?;
+        recovery.sync()?;
+    }
+    if change.kind != ChangeKind::CreateFile {
+        // NOREPLACE prevents overwriting an existing recovery object.
+        // Moving the original is the first destructive publish operation.
+        preflight(root, change)?;
+        report.recovery_required.push(RecoveryRecord {
+            root: change.root,
+            target: root.source.path.join(&change.path),
+            directory: recovery.path.clone(),
+            reason: "publish interrupted after preparing recovery material".into(),
+        });
+        parent.rename_new(Path::new(&name), &recovery, Path::new("original"))?;
+        recovery.sync()?;
+        parent.sync()?;
+        let displaced = recovery.read(Path::new("original"))?;
+        let original = &root.original[&change.path];
+        if file_identity(&displaced)? != original.identity
+            || mode(&displaced.metadata()?) != original.mode
+            || !files_equal(&displaced, &root.baseline.read(&change.path)?)?
+        {
+            let reason = "target changed during publish; displaced data retained";
+            if recovery
+                .rename_new(Path::new("original"), &parent, Path::new(&name))
+                .is_ok()
+            {
+                recovery.sync()?;
+                parent.sync()?;
+                report.recovery_required.pop();
+            }
+            bail!("{reason}");
+        }
+    }
+    if change.kind == ChangeKind::CreateFile {
+        report.recovery_required.push(RecoveryRecord {
+            root: change.root,
+            target: root.source.path.join(&change.path),
+            directory: recovery.path.clone(),
+            reason: "publish interrupted while installing a new file".into(),
+        });
+    }
+    if change.kind != ChangeKind::DeleteFile {
+        if let Err(error) = recovery.rename_new(stage, &parent, Path::new(&name)) {
+            // Restore only into a vacant name; never overwrite a user change.
+            if change.kind == ChangeKind::ModifyFile
+                && recovery
+                    .rename_new(Path::new("original"), &parent, Path::new(&name))
+                    .is_ok()
+            {
+                recovery.sync()?;
+                parent.sync()?;
+                report.recovery_required.pop();
+            }
+            return Err(error.into());
+        }
+    }
+    recovery.sync()?;
+    parent.sync()?;
+    report.recovery_required.pop();
+    report.applied.push(change.clone());
+    Ok(())
+}
+
+fn checked_parent(
+    root: &Root,
+    change: &SnapshotChange,
+    created: &BTreeMap<(RootId, PathBuf), Entry>,
+) -> Result<(Dir, std::ffi::OsString)> {
+    let mut dir = Dir::open(&root.source.path)?;
+    if dir.identity()? != root.identity || mode(&dir.metadata()?) != root.root_mode {
+        bail!("source root identity or permissions changed");
+    }
+    let mut prefix = PathBuf::new();
+    let mut components = change.path.components().peekable();
+    while let Some(component) = components.next() {
+        let name = component.as_os_str();
+        if components.peek().is_none() {
+            return Ok((dir, name.to_owned()));
+        }
+        prefix.push(name);
+        dir = dir.child(Path::new(name))?;
+        let expected = root
+            .original
+            .get(&prefix)
+            .or_else(|| created.get(&(change.root, prefix.clone())))
+            .context("unrecognized publish parent")?;
+        if dir.identity()? != expected.identity || mode(&dir.metadata()?) != expected.mode {
+            bail!("publish parent identity or permissions changed");
+        }
+    }
+    bail!("empty publish path")
+}
+
+fn remove_contents(dir: &Dir) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        dir.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+    }
+    for name in dir.names()? {
+        let path = Path::new(&name);
+        if let Ok(child) = dir.child(path) {
+            remove_contents(&child)?;
+            drop(child);
+            dir.unlink(path, true)?;
+        } else {
+            dir.unlink(path, false)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn file_identity(f: &File) -> Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let m = f.metadata()?;
+    Ok((m.dev(), m.ino()))
+}
+#[cfg(unix)]
+fn mode(m: &std::fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    m.permissions().mode() & 0o7777
+}
+#[cfg(unix)]
+fn set_mode(f: &File, mode: u32) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    f.set_permissions(std::fs::Permissions::from_mode(mode))?;
+    Ok(())
+}
+#[cfg(unix)]
+fn check_private(dir: &Dir) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = dir.metadata()?;
+    if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+        bail!("snapshot storage must be owned by this user with mode 0700");
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn file_identity(f: &File) -> Result<(u64, u64)> {
+    Ok(crate::snapshot_fs::file_identity(f)?)
+}
+#[cfg(windows)]
+fn mode(m: &std::fs::Metadata) -> u32 {
+    if m.permissions().readonly() {
+        0o444
+    } else {
+        0o666
+    }
+}
+#[cfg(windows)]
+fn set_mode(f: &File, mode: u32) -> Result<()> {
+    let mut permissions = f.metadata()?.permissions();
+    permissions.set_readonly(mode & 0o200 == 0);
+    f.set_permissions(permissions)?;
+    Ok(())
+}
+#[cfg(windows)]
+fn check_private(dir: &Dir) -> Result<()> {
+    crate::snapshot_fs::check_private(dir).map_err(Into::into)
+}
