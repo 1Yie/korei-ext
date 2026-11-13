@@ -1,0 +1,511 @@
+#![cfg(unix)]
+
+use std::fs;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::{symlink, PermissionsExt};
+use std::path::Path;
+
+use agent_sandbox::snapshot::*;
+
+fn budget() -> SnapshotBudget {
+    SnapshotBudget {
+        max_bytes: 8 * 1024 * 1024,
+        max_entries: 128,
+        max_depth: 8,
+    }
+}
+
+fn setup() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let source = root.join("source");
+    let storage = root.join("storage");
+    fs::create_dir(&source).unwrap();
+    fs::create_dir(&storage).unwrap();
+    fs::set_permissions(&storage, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(source.join("data"), vec![0x6d; 1024 * 1024]).unwrap();
+    (temp, source, storage)
+}
+
+fn prepare(source: &Path, storage: &Path, preference: SnapshotPreference) -> WorkspaceSnapshot {
+    WorkspaceSnapshot::prepare(&[source.to_owned()], storage, budget(), preference).unwrap()
+}
+
+#[test]
+fn native_or_explicit_copy_isolates_both_directions_and_preserves_bytes() {
+    for preference in [
+        SnapshotPreference::NativePreferred,
+        SnapshotPreference::PrivateCopy,
+    ] {
+        let (_temp, source, storage) = setup();
+        let snapshot = prepare(&source, &storage, preference);
+        let stats = snapshot.stats();
+        assert_eq!(stats.prepared_bytes, 2 * 1024 * 1024);
+        assert_eq!(stats.native_cow_files + stats.private_copy_files, 2);
+        if preference == SnapshotPreference::PrivateCopy {
+            assert_eq!(stats.private_copy_files, 2);
+        }
+        #[cfg(target_os = "macos")]
+        if preference == SnapshotPreference::NativePreferred {
+            assert_eq!(stats.native_cow_files, 2);
+        }
+        let lease = snapshot.lease().unwrap();
+        let root = lease.roots().next().unwrap();
+        let original = fs::read(source.join("data")).unwrap();
+        lease
+            .write_file(root, Path::new("data"), b"private write")
+            .unwrap();
+        assert_eq!(fs::read(source.join("data")).unwrap(), original);
+        fs::write(source.join("data"), b"host write").unwrap();
+        let mut private = Vec::new();
+        lease
+            .read_file(root, Path::new("data"))
+            .unwrap()
+            .read_to_end(&mut private)
+            .unwrap();
+        assert_eq!(private, b"private write");
+        assert_eq!(
+            lease.map_source(&source.join("data")).unwrap(),
+            (root, Path::new("data").to_owned())
+        );
+        assert!(lease.map_source(storage.join("other").as_path()).is_err());
+    }
+}
+
+#[test]
+fn preparation_budgets_fail_without_partial_storage_or_host_changes() {
+    for limits in [
+        SnapshotBudget {
+            max_bytes: 1024,
+            ..budget()
+        },
+        SnapshotBudget {
+            max_entries: 1,
+            ..budget()
+        },
+        SnapshotBudget {
+            max_depth: 1,
+            ..budget()
+        },
+    ] {
+        let (_temp, source, storage) = setup();
+        fs::create_dir(source.join("nested")).unwrap();
+        fs::write(source.join("nested/deep"), b"x").unwrap();
+        assert!(WorkspaceSnapshot::prepare(
+            &[source.clone()],
+            &storage,
+            limits,
+            SnapshotPreference::PrivateCopy
+        )
+        .is_err());
+        assert_eq!(fs::read_dir(&storage).unwrap().count(), 0);
+        assert_eq!(
+            fs::metadata(source.join("data")).unwrap().len(),
+            1024 * 1024
+        );
+    }
+}
+
+#[test]
+fn links_special_files_and_overlapping_roots_fail_closed() {
+    let (_temp, source, storage) = setup();
+    let outside = storage.join("outside");
+    fs::write(&outside, b"outside").unwrap();
+    symlink(&outside, source.join("escape")).unwrap();
+    assert!(WorkspaceSnapshot::prepare(
+        &[source.clone()],
+        &storage,
+        budget(),
+        SnapshotPreference::PrivateCopy
+    )
+    .is_err());
+    fs::remove_file(source.join("escape")).unwrap();
+    fs::hard_link(&outside, source.join("hardlink")).unwrap();
+    assert!(WorkspaceSnapshot::prepare(
+        &[source.clone()],
+        &storage,
+        budget(),
+        SnapshotPreference::PrivateCopy
+    )
+    .is_err());
+    fs::remove_file(source.join("hardlink")).unwrap();
+    assert!(WorkspaceSnapshot::prepare(
+        &[source.clone()],
+        &source,
+        budget(),
+        SnapshotPreference::PrivateCopy
+    )
+    .is_err());
+    assert!(WorkspaceSnapshot::prepare(
+        &[source.clone(), source.clone()],
+        &storage,
+        budget(),
+        SnapshotPreference::PrivateCopy
+    )
+    .is_err());
+    fs::create_dir(source.join("recursive")).unwrap();
+    fs::set_permissions(source.join("recursive"), fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(WorkspaceSnapshot::prepare(
+        &[source.clone()],
+        &source.join("recursive"),
+        budget(),
+        SnapshotPreference::PrivateCopy
+    )
+    .is_err());
+}
+
+#[test]
+fn leased_file_access_never_truncates_an_escaped_symlink_or_hardlink() {
+    let (_temp, source, storage) = setup();
+    let snapshot = prepare(&source, &storage, SnapshotPreference::PrivateCopy);
+    let lease = snapshot.lease().unwrap();
+    let root = lease.roots().next().unwrap();
+    let working = lease.working_root(root).unwrap();
+    symlink(source.join("data"), working.join("escape")).unwrap();
+    assert!(lease
+        .write_file(root, Path::new("escape"), b"destroy")
+        .is_err());
+    fs::hard_link(source.join("data"), working.join("hardlink")).unwrap();
+    assert!(lease
+        .write_file(root, Path::new("hardlink"), b"destroy")
+        .is_err());
+    assert!(lease
+        .write_file(root, Path::new("../baseline-0/data"), b"destroy")
+        .is_err());
+    symlink(&source, working.join("parent")).unwrap();
+    assert!(lease
+        .write_file(root, Path::new("parent/data"), b"destroy")
+        .is_err());
+    assert!(lease.create_file(root, Path::new("parent/new")).is_err());
+    assert_eq!(
+        fs::metadata(source.join("data")).unwrap().len(),
+        1024 * 1024
+    );
+}
+
+#[test]
+fn derived_files_keep_the_snapshot_unsealable_until_closed() {
+    let (_temp, source, storage) = setup();
+    let mut snapshot = prepare(&source, &storage, SnapshotPreference::PrivateCopy);
+    let lease = snapshot.lease().unwrap();
+    let root = lease.roots().next().unwrap();
+    let mut writer = lease.create_file(root, Path::new("new")).unwrap();
+    let reader = lease.read_file(root, Path::new("data")).unwrap();
+    writer.write_all(b"preview").unwrap();
+    let mut clone = writer.try_clone().unwrap();
+    drop(lease);
+    assert!(
+        snapshot.seal().is_err(),
+        "derived writer and reader outlive lease"
+    );
+    drop(writer);
+    assert!(snapshot.seal().is_err(), "derived reader outlives lease");
+    drop(reader);
+    assert!(
+        snapshot.seal().is_err(),
+        "controlled clone outlives original handles"
+    );
+    clone.seek(SeekFrom::Start(0)).unwrap();
+    clone.write_all(b"changed").unwrap();
+    clone.sync_all().unwrap();
+    assert_eq!(clone.metadata().unwrap().len(), 7);
+    drop(clone);
+    snapshot.seal().unwrap();
+    snapshot.publish(|| false).unwrap();
+    assert_eq!(fs::read(source.join("new")).unwrap(), b"changed");
+}
+
+#[test]
+fn seal_requires_quiescence_and_publish_has_recoverable_preimages() {
+    let (_temp, source, storage) = setup();
+    let mut snapshot = prepare(&source, &storage, SnapshotPreference::PrivateCopy);
+    let lease = snapshot.lease().unwrap();
+    let root = lease.roots().next().unwrap();
+    lease
+        .write_file(root, Path::new("data"), b"published")
+        .unwrap();
+    assert!(snapshot.seal().is_err());
+    drop(lease);
+    assert_eq!(snapshot.seal().unwrap().len(), 1);
+    assert!(snapshot.lease().is_err());
+    let report = snapshot.publish(|| false).unwrap();
+    assert_eq!(report.applied.len(), 1);
+    assert!(report.conflicts.is_empty());
+    assert!(report.recovery_required.is_empty());
+    assert_eq!(fs::read(source.join("data")).unwrap(), b"published");
+    assert_eq!(
+        fs::metadata(report.recovery_material[0].join("original"))
+            .unwrap()
+            .len(),
+        1024 * 1024
+    );
+    snapshot.rollback().unwrap();
+    assert_eq!(fs::read(source.join("data")).unwrap(), b"published");
+    assert!(report.recovery_material[0].join("original").exists());
+}
+
+#[test]
+fn failed_publication_keeps_sealed_or_requires_recovery_after_partial_changes() {
+    assert_ne!(
+        unsafe { libc::geteuid() },
+        0,
+        "requires ordinary user permissions"
+    );
+    for partial in [false, true] {
+        let (_temp, source, storage) = setup();
+        fs::create_dir(source.join("locked")).unwrap();
+        fs::write(source.join("locked/data"), b"original").unwrap();
+        fs::set_permissions(source.join("locked"), fs::Permissions::from_mode(0o555)).unwrap();
+        let mut snapshot = prepare(&source, &storage, SnapshotPreference::PrivateCopy);
+        let lease = snapshot.lease().unwrap();
+        let root = lease.roots().next().unwrap();
+        let working = lease.working_root(root).unwrap();
+        fs::write(working.join("locked/data"), b"replacement").unwrap();
+        if partial {
+            lease.write_file(root, Path::new("data"), b"first").unwrap();
+        }
+        drop(lease);
+        snapshot.seal().unwrap();
+        let report = snapshot.publish(|| false).unwrap();
+        assert_eq!(report.applied.len(), usize::from(partial));
+        assert_eq!(report.conflicts.len(), 1);
+        assert_eq!(fs::read(source.join("locked/data")).unwrap(), b"original");
+        if partial {
+            assert_eq!(snapshot.state(), SnapshotState::RecoveryRequired);
+            assert!(!report.recovery_required.is_empty());
+            assert_eq!(report.recovery_material.len(), 1);
+            assert_eq!(
+                fs::metadata(report.recovery_material[0].join("original"))
+                    .unwrap()
+                    .len(),
+                1024 * 1024
+            );
+            fs::write(source.join("data"), b"later user edit").unwrap();
+            assert!(snapshot.publish(|| false).is_err());
+            assert_eq!(fs::read(source.join("data")).unwrap(), b"later user edit");
+        } else {
+            assert_eq!(snapshot.state(), SnapshotState::Sealed);
+            assert!(report.recovery_required.is_empty());
+            assert!(report.recovery_material.is_empty());
+        }
+        fs::set_permissions(source.join("locked"), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+#[test]
+fn directory_modes_are_preserved_and_finalized_after_children() {
+    let (_temp, source, storage) = setup();
+    fs::create_dir(source.join("existing")).unwrap();
+    fs::set_permissions(source.join("existing"), fs::Permissions::from_mode(0o750)).unwrap();
+    let mut snapshot = prepare(&source, &storage, SnapshotPreference::PrivateCopy);
+    let lease = snapshot.lease().unwrap();
+    let root = lease.roots().next().unwrap();
+    let working = lease.working_root(root).unwrap();
+    assert_eq!(
+        fs::metadata(working.join("existing"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o750
+    );
+    fs::create_dir(working.join("existing/new")).unwrap();
+    fs::write(working.join("existing/new/file"), b"child").unwrap();
+    fs::set_permissions(
+        working.join("existing/new"),
+        fs::Permissions::from_mode(0o500),
+    )
+    .unwrap();
+    fs::set_permissions(working.join("existing"), fs::Permissions::from_mode(0o500)).unwrap();
+    drop(lease);
+    assert_eq!(snapshot.seal().unwrap().len(), 3);
+    let report = snapshot.publish(|| false).unwrap();
+    assert!(report.conflicts.is_empty(), "{report:?}");
+    assert!(report.recovery_required.is_empty());
+    assert_eq!(report.applied.len(), 3);
+    assert_eq!(snapshot.state(), SnapshotState::Published);
+    for path in ["existing", "existing/new"] {
+        assert_eq!(
+            fs::metadata(source.join(path))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o500
+        );
+    }
+    assert_eq!(
+        fs::read(source.join("existing/new/file")).unwrap(),
+        b"child"
+    );
+    fs::set_permissions(source.join("existing"), fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(
+        source.join("existing/new"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+}
+
+#[test]
+fn directory_mode_changes_conflict_with_concurrent_host_permissions() {
+    let (_temp, source, storage) = setup();
+    fs::create_dir(source.join("dir")).unwrap();
+    let mut snapshot = prepare(&source, &storage, SnapshotPreference::PrivateCopy);
+    let lease = snapshot.lease().unwrap();
+    let root = lease.roots().next().unwrap();
+    fs::set_permissions(
+        lease.working_root(root).unwrap().join("dir"),
+        fs::Permissions::from_mode(0o500),
+    )
+    .unwrap();
+    drop(lease);
+    assert_eq!(snapshot.seal().unwrap().len(), 1);
+    fs::set_permissions(source.join("dir"), fs::Permissions::from_mode(0o750)).unwrap();
+    let report = snapshot.publish(|| false).unwrap();
+    assert_eq!(report.conflicts.len(), 1);
+    assert!(report.applied.is_empty());
+    assert_eq!(snapshot.state(), SnapshotState::Sealed);
+    assert_eq!(
+        fs::metadata(source.join("dir"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o750
+    );
+}
+
+#[test]
+fn cancellation_and_host_concurrent_content_change_leave_host_untouched() {
+    let (_temp, source, storage) = setup();
+    let mut snapshot = prepare(&source, &storage, SnapshotPreference::PrivateCopy);
+    let lease = snapshot.lease().unwrap();
+    let root = lease.roots().next().unwrap();
+    lease
+        .write_file(root, Path::new("data"), b"private")
+        .unwrap();
+    drop(lease);
+    snapshot.seal().unwrap();
+    let report = snapshot.publish(|| true).unwrap();
+    assert!(report.cancelled);
+    assert!(report.applied.is_empty());
+    assert!(report.recovery_material.is_empty());
+    assert_eq!(snapshot.state(), SnapshotState::Sealed);
+    fs::write(source.join("data"), b"concurrent user content").unwrap();
+    let report = snapshot.publish(|| false).unwrap();
+    assert_eq!(report.conflicts.len(), 1);
+    assert!(report.applied.is_empty());
+    assert_eq!(
+        fs::read(source.join("data")).unwrap(),
+        b"concurrent user content"
+    );
+    assert!(report.recovery_material.is_empty());
+}
+
+#[test]
+fn root_parent_and_target_identity_substitution_are_conflicts() {
+    for substitution in ["root", "parent", "target", "type"] {
+        let (_temp, source, storage) = setup();
+        fs::create_dir(source.join("nested")).unwrap();
+        fs::write(source.join("nested/file"), b"old").unwrap();
+        let mut snapshot = prepare(&source, &storage, SnapshotPreference::PrivateCopy);
+        let lease = snapshot.lease().unwrap();
+        let root = lease.roots().next().unwrap();
+        lease
+            .write_file(root, Path::new("nested/file"), b"private")
+            .unwrap();
+        drop(lease);
+        snapshot.seal().unwrap();
+        match substitution {
+            "root" => {
+                fs::rename(&source, source.with_extension("original")).unwrap();
+                fs::create_dir(&source).unwrap();
+            }
+            "parent" => {
+                fs::rename(source.join("nested"), source.join("displaced")).unwrap();
+                fs::create_dir(source.join("nested")).unwrap();
+                fs::write(source.join("nested/file"), b"old").unwrap();
+            }
+            "target" => {
+                fs::rename(source.join("nested/file"), source.join("nested/old")).unwrap();
+                fs::write(source.join("nested/file"), b"old").unwrap();
+            }
+            "type" => {
+                fs::remove_file(source.join("nested/file")).unwrap();
+                fs::create_dir(source.join("nested/file")).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let report = snapshot.publish(|| false).unwrap();
+        assert_eq!(report.conflicts.len(), 1, "{substitution}");
+        assert!(report.applied.is_empty());
+        assert!(report.recovery_material.is_empty());
+    }
+}
+
+#[test]
+fn partial_publish_keeps_applied_preimages_and_never_overwrites_later_user_changes() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let (_temp, source, storage) = setup();
+    fs::write(source.join("a"), b"original a").unwrap();
+    fs::create_dir(source.join("nested")).unwrap();
+    fs::write(source.join("nested/b"), b"original b").unwrap();
+    fs::set_permissions(source.join("nested"), fs::Permissions::from_mode(0o555)).unwrap();
+    let mut snapshot = prepare(&source, &storage, SnapshotPreference::PrivateCopy);
+    let lease = snapshot.lease().unwrap();
+    let root = lease.roots().next().unwrap();
+    fs::set_permissions(
+        lease.working_root(root).unwrap().join("nested"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    lease
+        .write_file(root, Path::new("a"), b"published a")
+        .unwrap();
+    lease
+        .write_file(root, Path::new("nested/b"), b"unpublished b")
+        .unwrap();
+    drop(lease);
+    snapshot.seal().unwrap();
+    let report = snapshot.publish(|| false).unwrap();
+    assert_eq!(report.applied.len(), 1);
+    assert_eq!(report.recovery_required.len(), 1);
+    assert_eq!(snapshot.state(), SnapshotState::RecoveryRequired);
+    assert_eq!(fs::read(source.join("a")).unwrap(), b"published a");
+    assert_eq!(fs::read(source.join("nested/b")).unwrap(), b"original b");
+    let backup = report.recovery_material[0].join("original");
+    assert_eq!(fs::read(&backup).unwrap(), b"original a");
+    fs::write(source.join("a"), b"user edit after partial publish").unwrap();
+    snapshot.rollback().unwrap();
+    assert_eq!(fs::read(&backup).unwrap(), b"original a");
+    assert_eq!(
+        fs::read(source.join("a")).unwrap(),
+        b"user edit after partial publish"
+    );
+    fs::set_permissions(source.join("nested"), fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn native_unix_names_survive_without_lossy_conversion() {
+    use std::os::unix::ffi::OsStringExt;
+    let (_temp, source, storage) = setup();
+    let name = std::ffi::OsString::from_vec(vec![b'f', 0xff]);
+    fs::write(source.join(&name), b"native").unwrap();
+    fs::set_permissions(source.join(&name), fs::Permissions::from_mode(0o750)).unwrap();
+    let snapshot = prepare(&source, &storage, SnapshotPreference::PrivateCopy);
+    let lease = snapshot.lease().unwrap();
+    let root = lease.roots().next().unwrap();
+    let working = lease.working_root(root).unwrap();
+    assert_eq!(fs::read(working.join(&name)).unwrap(), b"native");
+    assert_eq!(
+        fs::metadata(working.join(&name))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o750
+    );
+}

@@ -313,7 +313,7 @@ impl SandboxBackend for MacSandboxExec {
 /// `sandbox-exec` shipped with macOS — absent ⇒ fall through to `none`.
 pub fn sandbox_exec_on_path() -> bool {
     std::process::Command::new("/usr/bin/sandbox-exec")
-        .arg("-h")
+        .args(["-p", "(version 1)(allow default)", "/usr/bin/true"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
