@@ -684,6 +684,95 @@ async fn native_tool_cannot_fork_out_of_its_scope() {
 
 #[tokio::test]
 #[cfg(target_os = "macos")]
+async fn running_owner_keeps_its_view_when_disjoint_roots_are_appended() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let (_temp, mut snapshot, source) = snapshot();
+    let extra = source.parent().unwrap().join("extra");
+    fs::create_dir(&extra).unwrap();
+    fs::write(extra.join("secret"), b"second source\n").unwrap();
+    let old = snapshot.lease().unwrap();
+    let script = "printf 'READY\\n'; IFS= read -r source; IFS= read -r private; \
+        if IFS= read -r value < \"$source\"; then printf 'SOURCE_VISIBLE\\n'; else printf 'SOURCE_DENIED\\n'; fi; \
+        if IFS= read -r value < \"$private\"; then printf 'PRIVATE_VISIBLE\\n'; else printf 'PRIVATE_DENIED\\n'; fi; \
+        printf old-edit > secret; printf 'CHECKED\\n'; IFS= read -r finish";
+    let mut old_request = request(&old, script.into(), ExecutionKind::Tool);
+    old_request.tool_policy = Some(agent_sandbox::SandboxConfig {
+        workspace_dir: source.clone(),
+        ..Default::default()
+    });
+    let mut process = spawn_isolated(old, &old_request).unwrap();
+    let pid = process.id().unwrap();
+    let mut input = process.stdin.take().unwrap();
+    let mut output = BufReader::new(process.stdout.take().unwrap());
+    let mut line = String::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        output.read_line(&mut line),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(line, "READY\n");
+    let added = snapshot.append_roots(&[extra.clone()]).unwrap();
+    let current = snapshot.lease().unwrap();
+    let private = current.working_root(added[0]).unwrap().to_path_buf();
+    input
+        .write_all(
+            format!(
+                "{}\n{}\n",
+                extra.join("secret").display(),
+                private.join("secret").display()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut observed = Vec::new();
+    for _ in 0..3 {
+        line.clear();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            output.read_line(&mut line),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        observed.push(line.clone());
+    }
+    let mut next_request = request(
+        &current,
+        "printf new-edit > secret".into(),
+        ExecutionKind::Tool,
+    );
+    next_request.root = Some(added[0]);
+    next_request.tool_policy = Some(agent_sandbox::SandboxConfig {
+        workspace_dir: extra.clone(),
+        ..Default::default()
+    });
+    let next = collect_output(spawn_isolated(current, &next_request).unwrap()).await;
+    let seal_while_running = snapshot.seal().is_ok();
+    process.kill().await.unwrap();
+    drop(input);
+    assert_eq!(
+        observed,
+        ["SOURCE_DENIED\n", "PRIVATE_DENIED\n", "CHECKED\n"]
+    );
+    assert!(
+        next.status.success(),
+        "{}",
+        String::from_utf8_lossy(&next.stderr)
+    );
+    assert!(!seal_while_running);
+    assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1);
+    assert_eq!(snapshot.seal().unwrap().len(), 2);
+    let report = snapshot.publish(|| false).unwrap();
+    assert!(report.conflicts.is_empty());
+    assert_eq!(fs::read(source.join("secret")).unwrap(), b"old-edit");
+    assert_eq!(fs::read(extra.join("secret")).unwrap(), b"new-edit");
+}
+
+#[tokio::test]
+#[cfg(target_os = "macos")]
 async fn running_process_cannot_release_its_scope() {
     let (_temp, mut snapshot, source) = snapshot();
     let lease = snapshot.lease().unwrap();
