@@ -15,6 +15,10 @@ tokio.workspace = true
 reqwest.workspace = true
 htmd.workspace = true
 
+[features]
+sandbox = ["agent-capabilities/sandbox"]
+
 [dev-dependencies]
+agent-sandbox = { path = "../agent-sandbox" }
 tempfile = "3"
 tokio.workspace = true

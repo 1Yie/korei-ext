@@ -249,6 +249,7 @@ version = "0.1.0"
 dependencies = [
  "agent-capabilities",
  "agent-llm-core",
+ "agent-sandbox",
  "agent-tool",
  "futures",
  "htmd",
