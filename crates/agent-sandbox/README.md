@@ -121,6 +121,20 @@ configuration changes can select prepared files, but cannot grant access to
 new Host targets. See `WorkspaceIo` in `agent-capabilities` for the caller
 binding and the FS leased tests for native ignore comparisons.
 
+`append_roots` prepares disjoint roots within the same snapshot and cumulative
+preparation budget. Existing `RootId` values and borrowed paths stay valid.
+Each lease, including retained file capabilities, keeps the root range granted
+when it was minted; a fresh lease sees an entire appended batch. Configuration
+reads classify newly prepared source and private paths globally, so old leases
+refuse them instead of reading them as Host configuration.
+
+Before appending, the Host must rule out overlap or aliases between the new
+sources and every running owner's effective OS read grants, or stop and drain
+the affected owners. OS process permissions remain fixed at launch, while the
+lease range bounds Rust file operations. The method validates snapshot state,
+directory identities, source/storage topology and budget; the Host owns the
+process-admission decision.
+
 Publication checks source identities and preimages. Multiple files and
 volumes are published incrementally. Consume the complete `PublishReport`,
 including applied changes, conflicts, recovery requirements and retained

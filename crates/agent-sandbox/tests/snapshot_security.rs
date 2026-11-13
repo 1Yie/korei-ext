@@ -107,6 +107,167 @@ fn preparation_budgets_fail_without_partial_storage_or_host_changes() {
 }
 
 #[test]
+fn appended_roots_keep_old_leases_bounded_and_publish_in_one_snapshot() {
+    let (_temp, source, storage) = setup();
+    fs::write(source.join("file"), b"before").unwrap();
+    let extra = source.parent().unwrap().join("extra");
+    fs::create_dir(&extra).unwrap();
+    fs::write(extra.join("file"), b"second").unwrap();
+    let mut snapshot = prepare(&source, &storage, SnapshotPreference::PrivateCopy);
+    let old = snapshot.lease().unwrap();
+    let first = old.roots().next().unwrap();
+    let borrowed = old.working_root(first).unwrap();
+    let mut file = old.read_file(first, Path::new("file")).unwrap();
+    let added = snapshot.append_roots(&[extra.clone()]).unwrap();
+    let current = snapshot.lease().unwrap();
+    let second = added[0];
+    let private = current.working_root(second).unwrap();
+    assert_eq!(borrowed, current.working_root(first).unwrap());
+    assert_eq!(old.roots().collect::<Vec<_>>(), vec![first]);
+    assert_eq!(current.roots().collect::<Vec<_>>(), vec![first, second]);
+    assert!(old.working_root(second).is_err());
+    assert!(old.map_source(&extra.join("file")).is_err());
+    assert!(old.read_file(second, Path::new("file")).is_err());
+    assert!(old
+        .write_file(second, Path::new("file"), b"ungranted")
+        .is_err());
+    for path in [extra.join("file"), private.join("file")] {
+        assert!(old.read_ignore_config(&path, |_| Ok(None)).is_err());
+        assert!(old
+            .read_ignore_config_baseline(&path, |_| Ok(None))
+            .is_err());
+    }
+    let third = source.parent().unwrap().join("third");
+    fs::create_dir(&third).unwrap();
+    let third = snapshot.append_roots(&[third]).unwrap()[0];
+    let newest = snapshot.lease().unwrap();
+    assert_eq!(
+        newest.roots().collect::<Vec<_>>(),
+        vec![first, second, third]
+    );
+    assert_eq!(current.roots().collect::<Vec<_>>(), vec![first, second]);
+    assert!(current.working_root(third).is_err());
+    assert_eq!(borrowed, newest.working_root(first).unwrap());
+    drop(newest);
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, b"before");
+    let clone = file.try_clone().unwrap();
+    current
+        .write_file(first, Path::new("file"), b"first edit")
+        .unwrap();
+    current
+        .write_file(second, Path::new("file"), b"second edit")
+        .unwrap();
+    assert_eq!(fs::read(source.join("file")).unwrap(), b"before");
+    assert_eq!(fs::read(extra.join("file")).unwrap(), b"second");
+    drop(current);
+    drop(old);
+    drop(file);
+    assert!(snapshot.seal().is_err());
+    drop(clone);
+    assert_eq!(snapshot.seal().unwrap().len(), 2);
+    assert!(snapshot.append_roots(&[extra.clone()]).is_err());
+    let report = snapshot.publish(|| false).unwrap();
+    assert!(report.conflicts.is_empty());
+    assert_eq!(report.applied.len(), 2);
+    assert_eq!(fs::read(source.join("file")).unwrap(), b"first edit");
+    assert_eq!(fs::read(extra.join("file")).unwrap(), b"second edit");
+}
+
+#[test]
+fn append_failure_preserves_roots_budget_and_private_material() {
+    for bytes_budget in [true, false] {
+        let (_temp, source, storage) = setup();
+        fs::remove_file(source.join("data")).unwrap();
+        fs::write(source.join("file"), b"aa").unwrap();
+        let extra = source.parent().unwrap().join("extra");
+        fs::create_dir(&extra).unwrap();
+        fs::write(extra.join("file"), b"bb").unwrap();
+        let mut snapshot = WorkspaceSnapshot::prepare(
+            &[source.clone()],
+            &storage,
+            SnapshotBudget {
+                max_bytes: if bytes_budget { 6 } else { 100 },
+                max_entries: if bytes_budget { 100 } else { 3 },
+                max_depth: 8,
+            },
+            SnapshotPreference::PrivateCopy,
+        )
+        .unwrap();
+        let lease = snapshot.lease().unwrap();
+        let first = lease.roots().next().unwrap();
+        let working = lease.working_root(first).unwrap().to_path_buf();
+        let container = working.parent().unwrap();
+        let names = || {
+            let mut names: Vec<_> = fs::read_dir(container)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            names.sort();
+            names
+        };
+        let before = names();
+        let stats = snapshot.stats();
+        let error = snapshot.append_roots(&[extra]).unwrap_err();
+        assert!(error.to_string().contains("budget"), "{error:#}");
+        assert_eq!(snapshot.stats(), stats);
+        assert_eq!(names(), before);
+        assert_eq!(snapshot.lease().unwrap().roots().count(), 1);
+        for path in [
+            source.as_path(),
+            source.parent().unwrap(),
+            storage.as_path(),
+        ] {
+            assert!(snapshot.append_roots(&[path.to_path_buf()]).is_err());
+        }
+        assert_eq!(fs::read(working.join("file")).unwrap(), b"aa");
+        let small = source.parent().unwrap().join("small");
+        fs::create_dir(&small).unwrap();
+        if bytes_budget {
+            fs::write(small.join("file"), b"x").unwrap();
+        }
+        let added = snapshot.append_roots(&[small]).unwrap();
+        let current = snapshot.lease().unwrap();
+        assert_eq!(current.roots().collect::<Vec<_>>(), vec![first, added[0]]);
+        assert_eq!(lease.roots().count(), 1);
+        assert_eq!(
+            snapshot.stats().prepared_bytes,
+            stats.prepared_bytes + if bytes_budget { 2 } else { 0 }
+        );
+        drop(current);
+        drop(lease);
+        assert!(snapshot.seal().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn appended_root_identity_and_derived_files_keep_the_original_lifetime() {
+    let (_temp, source, storage) = setup();
+    let extra = source.parent().unwrap().join("extra");
+    fs::create_dir(&extra).unwrap();
+    fs::write(extra.join("file"), b"second").unwrap();
+    let mut snapshot = prepare(&source, &storage, SnapshotPreference::PrivateCopy);
+    let added = snapshot.append_roots(&[extra]).unwrap();
+    let lease = snapshot.lease().unwrap();
+    let working = lease.working_root(added[0]).unwrap().to_path_buf();
+    let mut file = lease.read_file(added[0], Path::new("file")).unwrap();
+    let displaced = working.with_file_name("displaced");
+    fs::rename(&working, &displaced).unwrap();
+    fs::create_dir(&working).unwrap();
+    fs::write(working.join("file"), b"substitute").unwrap();
+    assert!(lease.read_file(added[0], Path::new("file")).is_err());
+    drop(lease);
+    drop(snapshot);
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, b"second");
+    assert!(displaced.exists());
+    drop(file);
+    assert_eq!(fs::read_dir(&storage).unwrap().count(), 0);
+}
+
+#[test]
 fn links_special_files_and_overlapping_roots_fail_closed() {
     let (_temp, source, storage) = setup();
     let outside = storage.join("outside");

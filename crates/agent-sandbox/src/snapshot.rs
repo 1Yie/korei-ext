@@ -1,4 +1,4 @@
-//! Per-execution private workspaces. Hosts quiesce every tool before sealing.
+//! Private workspaces with stable, lease-scoped root grants.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsString;
@@ -6,7 +6,7 @@ use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{bail, Context, Result};
 
@@ -107,9 +107,53 @@ struct Root {
     original: BTreeMap<PathBuf, Entry>,
 }
 
+#[derive(Default)]
+struct RootBatch {
+    values: Vec<Root>,
+    next: OnceLock<Box<RootBatch>>,
+}
+
+impl RootBatch {
+    fn iter(&self) -> impl Iterator<Item = &Root> {
+        std::iter::successors(Some(self), |batch| batch.next.get().map(Box::as_ref))
+            .flat_map(|batch| batch.values.iter())
+    }
+
+    fn len(&self) -> usize {
+        self.iter().count()
+    }
+
+    fn get(&self, index: usize) -> Option<&Root> {
+        self.iter().nth(index)
+    }
+
+    fn clear(&mut self) {
+        self.values.clear();
+        let mut next = self.next.take();
+        while let Some(mut batch) = next {
+            batch.values.clear();
+            next = batch.next.take();
+        }
+    }
+}
+
+impl Drop for RootBatch {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
+impl std::ops::Index<usize> for RootBatch {
+    type Output = Root;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        self.get(index).expect("snapshot root index out of bounds")
+    }
+}
+
 struct Private {
     container: Option<Dir>,
-    roots: Vec<Root>,
+    roots: RootBatch,
     active: AtomicUsize,
 }
 
@@ -138,6 +182,7 @@ impl Drop for Private {
 /// A host-minted capability. Keeping a lease alive prevents sealing.
 pub struct SnapshotLease {
     private: Arc<Private>,
+    root_count: usize,
 }
 
 /// A file capability that keeps its snapshot unsealable until closed.
@@ -293,7 +338,7 @@ impl WorkerScope {
         Ok(Self {
             private: Arc::new(Private {
                 container: Some(container),
-                roots: Vec::new(),
+                roots: RootBatch::default(),
                 active: AtomicUsize::new(0),
             }),
         })
@@ -326,7 +371,11 @@ impl SnapshotLease {
             .container
             .as_ref()
             .context("snapshot container is unavailable")?;
-        let current = container.child(Path::new(&format!("working-{}", root.0)))?;
+        let relative = working
+            .path
+            .strip_prefix(&container.path)
+            .context("working root left its snapshot container")?;
+        let current = container.child(relative)?;
         if current.identity()? != working.identity()? {
             bail!("private execution root identity changed");
         }
@@ -402,11 +451,12 @@ impl SnapshotLease {
         self.private.active.fetch_add(1, Ordering::AcqRel);
         Self {
             private: Arc::clone(&self.private),
+            root_count: self.root_count,
         }
     }
 
     pub fn roots(&self) -> impl Iterator<Item = RootId> + '_ {
-        (0..self.private.roots.len()).map(RootId)
+        (0..self.root_count).map(RootId)
     }
 
     pub fn working_root(&self, root: RootId) -> Result<&Path> {
@@ -419,7 +469,7 @@ impl SnapshotLease {
 
     /// Maps a host absolute path to its linked private root and relative path.
     pub fn map_source(&self, path: &Path) -> Result<(RootId, PathBuf)> {
-        for (id, root) in self.private.roots.iter().enumerate() {
+        for (id, root) in self.private.roots.iter().take(self.root_count).enumerate() {
             if let Ok(relative) = path.strip_prefix(&root.source.path) {
                 if !relative.as_os_str().is_empty() {
                     crate::snapshot_fs::relative(relative)?;
@@ -537,7 +587,7 @@ impl SnapshotLease {
                 return self.read_prepared_ignore(&path, target, &mut classify, baseline);
             }
             let identity = file_identity(&file)?;
-            for root in &self.private.roots {
+            for root in self.private.roots.iter() {
                 if let Some((relative, _)) = root
                     .original
                     .iter()
@@ -601,7 +651,7 @@ impl SnapshotLease {
 
     fn ignore_directory_alias(&self, directory: &Dir) -> Result<Option<PathBuf>> {
         let identity = directory.identity()?;
-        for root in &self.private.roots {
+        for root in self.private.roots.iter() {
             if identity == root.identity || identity == root.working.identity()? {
                 return Ok(Some(root.source.path.clone()));
             }
@@ -614,7 +664,7 @@ impl SnapshotLease {
             }
         }
         let lineage = directory.lineage()?;
-        for root in &self.private.roots {
+        for root in self.private.roots.iter() {
             if lineage.contains(&root.identity) || lineage.contains(&root.working.identity()?) {
                 bail!("Host configuration directory entered a prepared root");
             }
@@ -650,6 +700,9 @@ impl SnapshotLease {
     }
 
     fn root(&self, root: RootId) -> Result<&Root> {
+        if root.0 >= self.root_count {
+            bail!("root was not granted to this lease");
+        }
         self.private
             .roots
             .get(root.0)
@@ -657,7 +710,7 @@ impl SnapshotLease {
     }
 
     pub(crate) fn validate(&self) -> Result<()> {
-        for root in &self.private.roots {
+        for root in self.private.roots.iter().take(self.root_count) {
             if Dir::open(&root.working.path)?.identity()? != root.working.identity()? {
                 bail!("private execution root identity changed");
             }
@@ -700,10 +753,60 @@ fn ignore_relative_components(path: &Path) -> Result<VecDeque<OsString>> {
 
 pub struct WorkspaceSnapshot {
     private: Arc<Private>,
+    storage: Dir,
     state: SnapshotState,
     stats: SnapshotStats,
     budget: SnapshotBudget,
+    preference: SnapshotPreference,
     changes: Vec<SnapshotChange>,
+}
+
+fn prepare_batch(
+    sources: Vec<Dir>,
+    container: Dir,
+    first_index: usize,
+    budget: SnapshotBudget,
+    preference: SnapshotPreference,
+    stats: &mut SnapshotStats,
+) -> Result<Private> {
+    let mut private = Private {
+        container: Some(container),
+        roots: RootBatch::default(),
+        active: AtomicUsize::new(0),
+    };
+    for (offset, source) in sources.into_iter().enumerate() {
+        let index = first_index
+            .checked_add(offset)
+            .context("root index overflow")?;
+        let container = private.container.as_ref().unwrap();
+        let base = container.mkdir(Path::new(&format!("baseline-{index}")))?;
+        let work = container.mkdir(Path::new(&format!("working-{index}")))?;
+        let original = inventory(&source, budget)?;
+        copy_tree(&source, &base, &original, budget, preference, stats)?;
+        copy_tree(
+            &base,
+            &work,
+            &inventory(&base, budget)?,
+            budget,
+            preference,
+            stats,
+        )?;
+        if !tree_equal(&source, &base, &original, budget)? {
+            bail!("source changed during snapshot preparation");
+        }
+        let identity = source.identity()?;
+        let root_mode = mode(&source.metadata()?);
+        private.roots.values.push(Root {
+            source,
+            identity,
+            root_mode,
+            baseline: base,
+            working: work,
+            original,
+        });
+    }
+    private.container.as_ref().unwrap().sync()?;
+    Ok(private)
 }
 
 impl WorkspaceSnapshot {
@@ -734,48 +837,80 @@ impl WorkspaceSnapshot {
         }
         let name = unique("execution");
         let container = storage.mkdir(Path::new(&name))?;
-        let mut private = Private {
-            container: Some(container),
-            roots: Vec::new(),
-            active: AtomicUsize::new(0),
-        };
         let mut stats = SnapshotStats::default();
-        for (index, source) in sources.into_iter().enumerate() {
-            let container = private.container.as_ref().unwrap();
-            let base = container.mkdir(Path::new(&format!("baseline-{index}")))?;
-            let work = container.mkdir(Path::new(&format!("working-{index}")))?;
-            let original = inventory(&source, budget)?;
-            copy_tree(&source, &base, &original, budget, preference, &mut stats)?;
-            copy_tree(
-                &base,
-                &work,
-                &inventory(&base, budget)?,
-                budget,
-                preference,
-                &mut stats,
-            )?;
-            if !tree_equal(&source, &base, &original, budget)? {
-                bail!("source changed during snapshot preparation");
-            }
-            let identity = source.identity()?;
-            let root_mode = mode(&source.metadata()?);
-            private.roots.push(Root {
-                source,
-                identity,
-                root_mode,
-                baseline: base,
-                working: work,
-                original,
-            });
-        }
-        private.container.as_ref().unwrap().sync()?;
+        let private = prepare_batch(sources, container, 0, budget, preference, &mut stats)?;
         Ok(Self {
             private: Arc::new(private),
+            storage,
             state: SnapshotState::Prepared,
             stats,
             budget,
+            preference,
             changes: Vec::new(),
         })
+    }
+
+    /// Append disjoint roots without widening existing leases. The Host must
+    /// exclude overlap with every running owner's fixed OS read grants first.
+    pub fn append_roots(&mut self, source_roots: &[PathBuf]) -> Result<Vec<RootId>> {
+        if self.state != SnapshotState::Prepared || source_roots.is_empty() {
+            bail!("appending roots requires a prepared snapshot and nonempty roots");
+        }
+        if Dir::open(&self.storage.path)?.identity()? != self.storage.identity()? {
+            bail!("snapshot storage identity changed");
+        }
+        check_private(&self.storage)?;
+        let container = self
+            .private
+            .container
+            .as_ref()
+            .context("missing snapshot container")?;
+        if Dir::open(&container.path)?.identity()? != container.identity()? {
+            bail!("snapshot container identity changed");
+        }
+        let mut sources = Vec::new();
+        for path in source_roots {
+            let source = Dir::open(path).context("open source root without links")?;
+            for previous in self
+                .private
+                .roots
+                .iter()
+                .map(|root| &root.source)
+                .chain(&sources)
+            {
+                if roots_overlap(&source, previous)? {
+                    bail!("source roots overlap");
+                }
+            }
+            if roots_overlap(&source, &self.storage)? {
+                bail!("source and snapshot storage overlap");
+            }
+            sources.push(source);
+        }
+        let first = self.private.roots.len();
+        let end = first
+            .checked_add(sources.len())
+            .context("root index overflow")?;
+        let mut stats = self.stats;
+        let mut prepared = prepare_batch(
+            sources,
+            container.mkdir(Path::new(&unique("roots")))?,
+            first,
+            self.budget,
+            self.preference,
+            &mut stats,
+        )?;
+        let mut tail = &self.private.roots;
+        while let Some(next) = tail.next.get() {
+            tail = next;
+        }
+        if let Err(batch) = tail.next.set(Box::new(std::mem::take(&mut prepared.roots))) {
+            drop(batch);
+            bail!("snapshot root admission changed");
+        }
+        drop(prepared.container.take());
+        self.stats = stats;
+        Ok((first..end).map(RootId).collect())
     }
 
     pub fn state(&self) -> SnapshotState {
@@ -792,6 +927,7 @@ impl WorkspaceSnapshot {
         self.private.active.fetch_add(1, Ordering::AcqRel);
         Ok(SnapshotLease {
             private: Arc::clone(&self.private),
+            root_count: self.private.roots.len(),
         })
     }
 
