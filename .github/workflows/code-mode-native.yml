@@ -1,0 +1,61 @@
+name: Code Mode Native
+
+on:
+  push:
+    branches: [task/code-mode-integrated]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_BUILD_JOBS: "1"
+  RUST_TEST_THREADS: "1"
+
+jobs:
+  linux:
+    name: Linux Native Code Mode
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Prepare Native Test Prerequisites
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends bubblewrap build-essential
+          if [[ -e /proc/sys/kernel/unprivileged_userns_clone ]]; then
+            sudo sysctl -w kernel.unprivileged_userns_clone=1
+          fi
+          if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Test Delegated Execution and File Capabilities
+        shell: bash
+        run: |
+          .github/scripts/with-test-cgroup.sh \
+            nice -n 10 cargo test --locked \
+            -p agent-sandbox -p agent-code-mode \
+            -p agent-capabilities -p agent-tools-fs -p agent-tools-web \
+            --features agent-capabilities/sandbox,agent-tools-fs/sandbox,agent-tools-fs/tree-sitter,agent-tools-web/sandbox
+
+  windows:
+    name: Windows Native Code Mode
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test Native Isolation and File Capabilities
+        shell: pwsh
+        run: |
+          & ./.github/scripts/native-cargo-windows.ps1 -CargoArguments @(
+            'test', '--locked',
+            '-p', 'agent-sandbox', '-p', 'agent-code-mode',
+            '-p', 'agent-capabilities', '-p', 'agent-tools-fs', '-p', 'agent-tools-web',
+            '--features', 'agent-capabilities/sandbox,agent-tools-fs/sandbox,agent-tools-fs/tree-sitter,agent-tools-web/sandbox'
+          )
