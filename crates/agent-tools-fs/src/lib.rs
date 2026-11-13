@@ -13,3 +13,4 @@ pub mod grep;
 pub mod list_dir;
 #[cfg(feature = "tree-sitter")]
 pub mod outline_ts;
+mod walk;

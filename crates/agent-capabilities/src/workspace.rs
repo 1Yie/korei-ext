@@ -75,6 +75,22 @@ pub enum PathScope {
 }
 
 pub trait WorkspaceCtx: ToolContext + Sized {
+    /// Bind this context to one prepared snapshot for its entire execution.
+    #[cfg(feature = "sandbox")]
+    fn install_workspace_lease(
+        &mut self,
+        lease: agent_sandbox::snapshot::SnapshotLease,
+    ) -> Result<(), ToolError> {
+        let slot = super::workspace_io::WorkspaceLease::new(self.root()?, lease)?;
+        self.extensions_mut().insert_shared(Arc::new(slot));
+        Ok(())
+    }
+
+    /// Capture a file capability which rechecks live authorization at each operation.
+    fn workspace_io(self: &Arc<Self>) -> Result<super::WorkspaceIo<Self>, ToolError> {
+        super::WorkspaceIo::new(self.clone())
+    }
+
     fn with_workspace(mut self, root: impl Into<PathBuf>) -> Self {
         let root = root.into();
         let root = root.canonicalize().unwrap_or(root);
@@ -134,7 +150,18 @@ pub trait WorkspaceCtx: ToolContext + Sized {
     /// Classify a model-supplied path. Relative paths resolve against the
     /// workspace root, never against a linked root.
     fn scope_of(&self, path: &str) -> Result<PathScope, ToolError> {
-        let canon = self.canonical(path)?;
+        self.scope_path(Path::new(path))
+    }
+
+    fn scope_path(&self, path: &Path) -> Result<PathScope, ToolError> {
+        #[cfg(feature = "sandbox")]
+        if let Some(lease) = self
+            .extensions()
+            .get_ref::<super::workspace_io::WorkspaceLease>()
+        {
+            return lease.scope(self, path);
+        }
+        let canon = self.canonical_path(path)?;
         if canon.starts_with(self.root()?) {
             return Ok(PathScope::Workspace(canon));
         }
@@ -157,8 +184,19 @@ pub trait WorkspaceCtx: ToolContext + Sized {
     /// Canonical form of a model-supplied path. Proves nothing about where it
     /// lands — [`scope_of`](Self::scope_of) does that.
     fn canonical(&self, path: &str) -> Result<PathBuf, ToolError> {
+        self.canonical_path(Path::new(path))
+    }
+
+    fn canonical_path(&self, path: &Path) -> Result<PathBuf, ToolError> {
+        #[cfg(feature = "sandbox")]
+        if let Some(lease) = self
+            .extensions()
+            .get_ref::<super::workspace_io::WorkspaceLease>()
+        {
+            return lease.canonical(self, path);
+        }
         let workspace_root = self.root()?;
-        let p = Path::new(path);
+        let p = path;
         let joined = if p.is_absolute() {
             p.to_path_buf()
         } else {
@@ -187,14 +225,14 @@ pub trait WorkspaceCtx: ToolContext + Sized {
                         .map(|m| m.file_type().is_symlink())
                         .unwrap_or(false)
                     {
-                        return Err(ToolError::PathEscape(path.to_string()));
+                        return Err(ToolError::PathEscape(path.display().to_string()));
                     }
                     let Some(name) = cursor.file_name() else {
-                        return Err(ToolError::PathEscape(path.to_string()));
+                        return Err(ToolError::PathEscape(path.display().to_string()));
                     };
                     tail.push(name.to_os_string());
                     let Some(parent) = cursor.parent() else {
-                        return Err(ToolError::PathEscape(path.to_string()));
+                        return Err(ToolError::PathEscape(path.display().to_string()));
                     };
                     cursor = parent;
                 };
@@ -310,7 +348,10 @@ mod tests {
             c.resolve_read(&s(&f)),
             Err(ToolError::OutOfScope { .. })
         ));
-        assert!(matches!(c.resolve(&s(&f)), Err(ToolError::OutOfScope { .. })));
+        assert!(matches!(
+            c.resolve(&s(&f)),
+            Err(ToolError::OutOfScope { .. })
+        ));
         assert!(matches!(c.scope_of(&s(&f)).unwrap(), PathScope::Outside(p) if p == f));
     }
 
@@ -322,7 +363,10 @@ mod tests {
         // `../rw/f.txt` climbs out of the workspace into a linked root — that
         // is a real path into a granted root, so it resolves there.
         assert_eq!(c.resolve("../rw/f.txt").unwrap(), d.rw.join("f.txt"));
-        assert!(matches!(c.resolve("../other/f.txt"), Err(ToolError::OutOfScope { .. })));
+        assert!(matches!(
+            c.resolve("../other/f.txt"),
+            Err(ToolError::OutOfScope { .. })
+        ));
     }
 
     #[test]
@@ -333,10 +377,16 @@ mod tests {
         {
             std::os::unix::fs::symlink(&d.other, d.rw.join("link")).unwrap();
             let via = d.rw.join("link/f.txt");
-            assert!(matches!(c.resolve(&s(&via)), Err(ToolError::OutOfScope { .. })));
+            assert!(matches!(
+                c.resolve(&s(&via)),
+                Err(ToolError::OutOfScope { .. })
+            ));
             std::os::unix::fs::symlink(d.other.join("missing"), d.rw.join("dangling")).unwrap();
             let dangling = d.rw.join("dangling");
-            assert!(matches!(c.resolve(&s(&dangling)), Err(ToolError::PathEscape(_))));
+            assert!(matches!(
+                c.resolve(&s(&dangling)),
+                Err(ToolError::PathEscape(_))
+            ));
         }
     }
 
@@ -349,8 +399,14 @@ mod tests {
         let f = d.rw.join("f.txt");
         assert!(child.resolve(&s(&f)).is_ok());
         roots.set(Vec::new());
-        assert!(matches!(c.resolve(&s(&f)), Err(ToolError::OutOfScope { .. })));
-        assert!(matches!(child.resolve(&s(&f)), Err(ToolError::OutOfScope { .. })));
+        assert!(matches!(
+            c.resolve(&s(&f)),
+            Err(ToolError::OutOfScope { .. })
+        ));
+        assert!(matches!(
+            child.resolve(&s(&f)),
+            Err(ToolError::OutOfScope { .. })
+        ));
     }
 
     #[test]

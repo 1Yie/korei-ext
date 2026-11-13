@@ -118,6 +118,7 @@ async fn exec<C: WorkspaceCtx>(args: Args, ctx: Arc<C>) -> Result<ToolResult, To
         )));
     }
 
+    let io = ctx.workspace_io()?;
     let scope = ctx.scope_of(parsed.path.as_deref().unwrap_or("."))?;
 
     let mut builder = grep_regex::RegexMatcherBuilder::new();
@@ -156,8 +157,14 @@ async fn exec<C: WorkspaceCtx>(args: Args, ctx: Arc<C>) -> Result<ToolResult, To
     // workspace print workspace-relative paths; hits in a linked workspace
     // print absolute ones, since a relative path always means the workspace.
     let (base, glob_root, absolute) = match scope {
-        PathScope::Workspace(p) => (p, ctx.root()?.to_path_buf(), false),
-        PathScope::Linked { path, root, .. } => (path, root, true),
+        PathScope::Workspace(p) => {
+            let root = io.resolve(ctx.root()?, false)?;
+            (p, root, false)
+        }
+        PathScope::Linked { path, root, .. } => {
+            let root = io.resolve(&root, false)?;
+            (path, root, true)
+        }
         PathScope::Outside(_) => {
             return Err(ToolError::PathEscape(
                 parsed.path.clone().unwrap_or_else(|| ".".into()),
@@ -173,6 +180,7 @@ async fn exec<C: WorkspaceCtx>(args: Args, ctx: Arc<C>) -> Result<ToolResult, To
 
     let handle = tokio::task::spawn_blocking(move || {
         search_sync(
+            io,
             &base,
             &glob_root,
             absolute,
@@ -294,7 +302,8 @@ fn text_of(bytes: &[u8]) -> String {
     truncate_line(&String::from_utf8_lossy(bytes))
 }
 
-fn search_sync(
+fn search_sync<C: WorkspaceCtx>(
+    io: agent_capabilities::WorkspaceIo<C>,
     base: &std::path::Path,
     glob_root: &std::path::Path,
     absolute: bool,
@@ -316,22 +325,17 @@ fn search_sync(
     let mut stopped_early = false;
     let mut was_cancelled = false;
 
-    let mut walker = ignore::WalkBuilder::new(base);
-    walker
-        .hidden(!include_hidden)
-        .git_ignore(true)
-        .git_exclude(true)
-        .require_git(false)
-        .sort_by_file_name(|a, b| a.cmp(b));
-
-    'walk: for result in walker.build() {
+    'walk: for result in crate::walk::walk(io.clone(), base, include_hidden, None)? {
         if cancelled(stop, ctx_cancel) {
             was_cancelled = true;
             break;
         }
         let entry = match result {
             Ok(e) => e,
-            Err(_) => {
+            Err(error) => {
+                if io.is_leased() {
+                    return Err(error);
+                }
                 errors += 1;
                 continue;
             }
@@ -357,17 +361,29 @@ fn search_sync(
             skipped += 1;
             continue;
         }
-        if entry
-            .metadata()
-            .map(|m| m.len() > MAX_FILE_BYTES)
-            .unwrap_or(false)
-        {
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                if io.is_leased() {
+                    return Err(error);
+                }
+                errors += 1;
+                continue;
+            }
+        };
+        if metadata.len() > MAX_FILE_BYTES {
             skipped += 1;
             continue;
         }
 
         scanned += 1;
-        let shown = if absolute { entry.path() } else { rel_path };
+        let source;
+        let shown = if absolute {
+            source = io.source_path(entry.path())?;
+            source.as_path()
+        } else {
+            rel_path
+        };
         let rel = shown.to_string_lossy().replace('\\', "/");
 
         // Counting and the output budget live INSIDE the sink, so `Ok(false)`
@@ -389,7 +405,17 @@ fn search_sync(
             stop,
             ctx_cancel,
         };
-        match searcher.search_path(matcher, entry.path(), collected) {
+        let file = match io.open(entry.path()) {
+            Ok(file) => file,
+            Err(error) => {
+                if io.is_leased() {
+                    return Err(error);
+                }
+                errors += 1;
+                continue;
+            }
+        };
+        match searcher.search_reader(matcher, file, collected) {
             Ok(()) => {}
             Err(_) if cancelled(stop, ctx_cancel) => was_cancelled = true,
             Err(_) => errors += 1,
@@ -452,6 +478,22 @@ fn search_sync(
 mod tests {
     use super::*;
 
+    #[derive(Default)]
+    struct Ctx(agent_tool::Extensions);
+    impl agent_tool::ToolContext for Ctx {
+        fn extensions(&self) -> &agent_tool::Extensions {
+            &self.0
+        }
+        fn extensions_mut(&mut self) -> &mut agent_tool::Extensions {
+            &mut self.0
+        }
+    }
+    fn io(root: &std::path::Path) -> agent_capabilities::WorkspaceIo<Ctx> {
+        Arc::new(Ctx::default().with_workspace(root))
+            .workspace_io()
+            .unwrap()
+    }
+
     /// Run the real search over an on-disk tree. `context` is the only knob
     /// under test; every other bound is the default.
     fn search(root: &std::path::Path, pattern: &str, context: usize) -> String {
@@ -460,7 +502,17 @@ mod tests {
             .expect("pattern");
         let stop = AtomicBool::new(false);
         search_sync(
-            root, root, false, &matcher, None, false, context, MAX_HITS, &stop, &None,
+            io(root),
+            root,
+            root,
+            false,
+            &matcher,
+            None,
+            false,
+            context,
+            MAX_HITS,
+            &stop,
+            &None,
         )
         .expect("search")
         .content
@@ -519,13 +571,30 @@ mod tests {
         let root = dir.path().canonicalize().unwrap();
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/b.rs"), "line2\n").unwrap();
-        let matcher = grep_regex::RegexMatcherBuilder::new().build("line2$").unwrap();
+        let matcher = grep_regex::RegexMatcherBuilder::new()
+            .build("line2$")
+            .unwrap();
         let glob = globset::Glob::new("src/*.rs").unwrap().compile_matcher();
         let stop = AtomicBool::new(false);
-        let out = search_sync(&root, &root, true, &matcher, Some(&glob), false, 0, MAX_HITS, &stop, &None)
-            .unwrap()
-            .content;
-        assert!(out.starts_with(&format!("{}/src/b.rs:1 │ line2\n", root.display())), "{out}");
+        let out = search_sync(
+            io(&root),
+            &root,
+            &root,
+            true,
+            &matcher,
+            Some(&glob),
+            false,
+            0,
+            MAX_HITS,
+            &stop,
+            &None,
+        )
+        .unwrap()
+        .content;
+        assert!(
+            out.starts_with(&format!("{}/src/b.rs:1 │ line2\n", root.display())),
+            "{out}"
+        );
         assert!(out.contains("── 1 matches"), "{out}");
     }
 }

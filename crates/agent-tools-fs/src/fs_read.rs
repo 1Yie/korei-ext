@@ -71,8 +71,12 @@ pub fn spec<C: WorkspaceCtx>() -> ToolSpec<C> {
 async fn exec<C: WorkspaceCtx>(args: Args, ctx: Arc<C>) -> Result<ToolResult, ToolError> {
     let parsed: SmartReadArgs = serde_json::from_value(args)
         .map_err(|e| ToolError::Args(format!("smart_read args: {e}")))?;
-    let path = ctx.resolve_read(&parsed.path)?;
-    let content = tokio::fs::read_to_string(&path).await?;
+    let io = ctx.workspace_io()?;
+    let path = parsed.path.clone();
+    let content =
+        tokio::task::spawn_blocking(move || io.read_to_string(std::path::Path::new(&path)))
+            .await
+            .map_err(|e| ToolError::Failed(format!("file read task: {e}")))??;
     let hash = format!("{:016x}", xxh3_64(content.as_bytes()));
 
     let mode = parsed.mode.as_deref().unwrap_or_else(|| {

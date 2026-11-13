@@ -85,7 +85,8 @@ enum FileOp {
 /// In-memory per-path state for the patch pipeline — `original` is the
 /// disk content at first touch (None = absent), `current` the running
 /// result (None = deleted).
-struct FileState {
+struct FileState<C> {
+    target: agent_capabilities::WorkspaceWrite<C>,
     original: Option<String>,
     current: Option<String>,
 }
@@ -140,7 +141,8 @@ async fn exec<C: WorkspaceCtx>(args: Args, ctx: Arc<C>) -> Result<ToolResult, To
     // ops on one path compose (Update → Update → Move) instead of each
     // reading stale disk content and last-write-wins losing earlier hunks.
     // One staged write is emitted per touched path at the end.
-    let mut state: std::collections::HashMap<std::path::PathBuf, FileState> =
+    let io = ctx.workspace_io()?;
+    let mut state: std::collections::HashMap<std::path::PathBuf, FileState<C>> =
         std::collections::HashMap::new();
     let mut order: Vec<std::path::PathBuf> = Vec::new();
     let mut summary = String::new();
@@ -148,8 +150,8 @@ async fn exec<C: WorkspaceCtx>(args: Args, ctx: Arc<C>) -> Result<ToolResult, To
     for op in &ops {
         match op {
             FileOp::Add { path, content } => {
-                let abs = ctx.resolve(path)?;
-                let st = load_state(&mut state, &mut order, &abs).await?;
+                let abs = io.resolve(std::path::Path::new(path), true)?;
+                let st = load_state(&io, &mut state, &mut order, &abs).await?;
                 if st.current.is_some() {
                     return Err(ToolError::Args(format!(
                         "Add File {path}: file already exists — use Update File                          (or Delete File first to recreate)"
@@ -164,8 +166,8 @@ async fn exec<C: WorkspaceCtx>(args: Args, ctx: Arc<C>) -> Result<ToolResult, To
                 st.current = Some(content);
             }
             FileOp::Delete { path } => {
-                let abs = ctx.resolve(path)?;
-                let st = load_state(&mut state, &mut order, &abs).await?;
+                let abs = io.resolve(std::path::Path::new(path), true)?;
+                let st = load_state(&io, &mut state, &mut order, &abs).await?;
                 let old = st.current.clone().ok_or_else(|| {
                     ToolError::Failed(format!("Delete File {path}: does not exist"))
                 })?;
@@ -182,9 +184,9 @@ async fn exec<C: WorkspaceCtx>(args: Args, ctx: Arc<C>) -> Result<ToolResult, To
                         "Update File {path}: no `@@` hunks — each update needs                          at least one context/remove/add section"
                     )));
                 }
-                let abs = ctx.resolve(path)?;
+                let abs = io.resolve(std::path::Path::new(path), true)?;
                 let old = {
-                    let st = load_state(&mut state, &mut order, &abs).await?;
+                    let st = load_state(&io, &mut state, &mut order, &abs).await?;
                     st.current.clone().ok_or_else(|| {
                         ToolError::Failed(format!(
                             "Update File {path}: does not exist — use Add File"
@@ -194,10 +196,10 @@ async fn exec<C: WorkspaceCtx>(args: Args, ctx: Arc<C>) -> Result<ToolResult, To
                 let new = apply_hunks(path, &old, hunks)?;
                 summary.push_str(&format!("updated {path}\n\n{}\n", unified_diff(&old, &new)));
                 if let Some(dest) = move_to {
-                    let dest_abs = ctx.resolve(dest)?;
+                    let dest_abs = io.resolve(std::path::Path::new(dest), true)?;
                     if dest_abs != abs {
                         {
-                            let dst = load_state(&mut state, &mut order, &dest_abs).await?;
+                            let dst = load_state(&io, &mut state, &mut order, &dest_abs).await?;
                             if dst.current.is_some() {
                                 return Err(ToolError::Args(format!(
                                     "Move to {dest}: destination already exists"
@@ -217,24 +219,24 @@ async fn exec<C: WorkspaceCtx>(args: Args, ctx: Arc<C>) -> Result<ToolResult, To
     }
 
     // Emit one staged write per touched path, in first-touch order.
-    let mut writes: Vec<FileWrite> = Vec::new();
+    let mut writes: Vec<FileWrite<C>> = Vec::new();
     for abs in order {
-        let st = &state[&abs];
+        let st = state.remove(&abs).expect("loaded");
         match (&st.original, &st.current) {
             (Some(o), Some(c)) if o != c => writes.push(FileWrite {
-                path: abs,
+                target: st.target,
                 content: c.clone().into_bytes(),
                 op: WriteOp::Write,
                 auto_mkdir: true,
             }),
             (None, Some(c)) => writes.push(FileWrite {
-                path: abs,
+                target: st.target,
                 content: c.clone().into_bytes(),
                 op: WriteOp::Write,
                 auto_mkdir: true,
             }),
             (Some(_), None) => writes.push(FileWrite {
-                path: abs,
+                target: st.target,
                 content: Vec::new(),
                 op: WriteOp::Delete,
                 auto_mkdir: false,
@@ -256,25 +258,25 @@ async fn exec<C: WorkspaceCtx>(args: Args, ctx: Arc<C>) -> Result<ToolResult, To
 }
 
 /// Load a path into the virtual fs on first touch (disk → FileState).
-async fn load_state<'a>(
-    state: &'a mut std::collections::HashMap<std::path::PathBuf, FileState>,
+async fn load_state<'a, C: WorkspaceCtx>(
+    io: &agent_capabilities::WorkspaceIo<C>,
+    state: &'a mut std::collections::HashMap<std::path::PathBuf, FileState<C>>,
     order: &mut Vec<std::path::PathBuf>,
     abs: &std::path::Path,
-) -> Result<&'a mut FileState, ToolError> {
+) -> Result<&'a mut FileState<C>, ToolError> {
     if !state.contains_key(abs) {
         // Missing vs unreadable: read_to_string maps binary bytes AND io
         // errors to the same None, which `Add File` then treats as "no
         // file" — silently clobbering an existing binary. Read raw bytes
         // first so existence is honest, then gate on UTF-8.
-        let disk = match tokio::fs::read(abs).await {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => {
-                return Err(ToolError::Failed(format!(
-                    "{}: cannot read — {e}",
-                    abs.display()
-                )))
-            }
-            Ok(bytes) => Some(String::from_utf8(bytes).map_err(|_| {
+        let view = io.clone();
+        let path = abs.to_path_buf();
+        let target = tokio::task::spawn_blocking(move || view.stage_write(&path))
+            .await
+            .map_err(|e| ToolError::Failed(format!("patch read task: {e}")))??;
+        let disk = match target.before() {
+            None => None,
+            Some(bytes) => Some(String::from_utf8(bytes.to_vec()).map_err(|_| {
                 ToolError::Failed(format!(
                     "{}: not UTF-8 text — apply_patch edits text files only",
                     abs.display()
@@ -284,6 +286,7 @@ async fn load_state<'a>(
         state.insert(
             abs.to_path_buf(),
             FileState {
+                target,
                 original: disk.clone(),
                 current: disk,
             },

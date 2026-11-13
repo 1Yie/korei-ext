@@ -77,6 +77,28 @@ fn open_at(
     descriptor: *mut core::ffi::c_void,
     sharing: u32,
 ) -> io::Result<File> {
+    open_at_inner(
+        parent,
+        name,
+        access,
+        disposition,
+        directory,
+        descriptor,
+        sharing,
+        false,
+    )
+}
+
+fn open_at_inner(
+    parent: &File,
+    name: &Path,
+    access: u32,
+    disposition: u32,
+    directory: bool,
+    descriptor: *mut core::ffi::c_void,
+    sharing: u32,
+    config_link: bool,
+) -> io::Result<File> {
     if name != Path::new(".") {
         relative(name)?;
     }
@@ -108,7 +130,7 @@ fn open_at(
         length: std::mem::size_of::<ObjectAttributes>() as u32,
         root: parent.as_raw_handle(),
         name: &mut name,
-        attributes: 0x40 | 0x1000, // OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE
+        attributes: 0x40 | if config_link { 0 } else { 0x1000 },
         descriptor,
         qos: std::ptr::null_mut(),
     };
@@ -127,13 +149,19 @@ fn open_at(
             FILE_ATTRIBUTE_NORMAL,
             sharing,
             disposition,
-            0x20 | if directory { 1 } else { 0x200000 },
+            0x20 | if directory && !config_link {
+                1
+            } else {
+                0x200000
+            },
             std::ptr::null(),
             0,
         )
     })?;
     let file = unsafe { File::from_raw_handle(handle) };
-    info(&file)?;
+    if !config_link {
+        info(&file)?;
+    }
     Ok(file)
 }
 
@@ -239,6 +267,92 @@ pub(crate) fn regular(file: &File) -> io::Result<()> {
 }
 
 impl Dir {
+    pub fn config_parent(&self) -> io::Result<Self> {
+        let mut ancestors = self.ancestors.clone();
+        let mut path = self.path.clone();
+        let file = match ancestors.pop() {
+            Some(file) => {
+                path.pop();
+                file
+            }
+            None => self.file.clone(),
+        };
+        Ok(Self {
+            file,
+            ancestors,
+            path,
+        })
+    }
+
+    pub fn symlink_target(&self, name: &Path) -> io::Result<Option<PathBuf>> {
+        use windows_sys::Win32::System::Ioctl::FSCTL_GET_REPARSE_POINT;
+
+        let file = open_at_inner(
+            &self.file,
+            name,
+            FILE_READ_ATTRIBUTES,
+            1,
+            false,
+            std::ptr::null_mut(),
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            true,
+        )?;
+        let mut attributes = BY_HANDLE_FILE_INFORMATION::default();
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut attributes) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if attributes.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+            return Ok(None);
+        }
+        let mut buffer = vec![0u8; 16 * 1024];
+        let mut returned = 0;
+        if unsafe {
+            DeviceIoControl(
+                file.as_raw_handle(),
+                FSCTL_GET_REPARSE_POINT,
+                std::ptr::null(),
+                0,
+                buffer.as_mut_ptr().cast(),
+                buffer.len() as u32,
+                &mut returned,
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        buffer.truncate(returned as usize);
+        let invalid =
+            || io::Error::new(io::ErrorKind::InvalidData, "invalid configuration reparse");
+        let tag = u32::from_le_bytes(buffer.get(..4).ok_or_else(invalid)?.try_into().unwrap());
+        let start = match tag {
+            0xA000000C => 20,
+            0xA0000003 => 16,
+            _ => return Err(invalid()),
+        };
+        let offset =
+            u16::from_le_bytes(buffer.get(8..10).ok_or_else(invalid)?.try_into().unwrap()) as usize;
+        let length = u16::from_le_bytes(buffer.get(10..12).ok_or_else(invalid)?.try_into().unwrap())
+            as usize;
+        if length % 2 != 0 || offset % 2 != 0 {
+            return Err(invalid());
+        }
+        let bytes = buffer
+            .get(start + offset..start + offset + length)
+            .ok_or_else(invalid)?;
+        let wide: Vec<_> = bytes
+            .chunks_exact(2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .collect();
+        let target = PathBuf::from(OsString::from_wide(&wide));
+        let text = target.as_os_str().to_string_lossy();
+        Ok(Some(if let Some(rest) = text.strip_prefix(r"\??\") {
+            PathBuf::from(format!(r"\\?\{rest}"))
+        } else {
+            target
+        }))
+    }
+
     pub fn open(path: &Path) -> io::Result<Self> {
         let mut parts = path.components();
         let Some(Component::Prefix(prefix)) = parts.next() else {

@@ -132,6 +132,18 @@ mod platform {
             let m = self.metadata()?;
             Ok((m.dev(), m.ino()))
         }
+        pub fn config_parent(&self) -> io::Result<Self> {
+            let file = opened(unsafe {
+                libc::openat(
+                    self.file.as_raw_fd(),
+                    c"..".as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            })?;
+            let mut path = self.path.clone();
+            path.pop();
+            Ok(Self { file, path })
+        }
         pub fn lineage(&self) -> io::Result<Vec<(u64, u64)>> {
             let mut file = self.file.try_clone()?;
             let mut identities = Vec::new();
@@ -170,7 +182,6 @@ mod platform {
                 path: self.path.join(name),
             })
         }
-        #[cfg(any(target_os = "linux", test))]
         pub fn symlink_target(&self, name: &Path) -> io::Result<Option<PathBuf>> {
             relative(name)?;
             if name.components().count() != 1 {

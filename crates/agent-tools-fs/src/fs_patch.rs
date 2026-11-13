@@ -69,8 +69,17 @@ pub fn spec<C: WorkspaceCtx>() -> ToolSpec<C> {
 async fn exec<C: WorkspaceCtx>(args: Args, ctx: Arc<C>) -> Result<ToolResult, ToolError> {
     let parsed: FuzzyPatchArgs = serde_json::from_value(args)
         .map_err(|e| ToolError::Args(format!("fuzzy_patch args: {e}")))?;
-    let path = ctx.resolve(&parsed.path)?;
-    let source = tokio::fs::read_to_string(&path).await?;
+    let io = ctx.workspace_io()?;
+    let path = parsed.path.clone();
+    let target = tokio::task::spawn_blocking(move || io.stage_write(std::path::Path::new(&path)))
+        .await
+        .map_err(|e| ToolError::Failed(format!("patch read task: {e}")))??;
+    let source = std::str::from_utf8(
+        target
+            .before()
+            .ok_or_else(|| ToolError::Failed("file does not exist".into()))?,
+    )
+    .map_err(|e| ToolError::Failed(format!("file is not UTF-8: {e}")))?;
 
     // Tier 5 first: drift check precedes any matching work.
     if let Some(expected) = &parsed.expected_hash {
@@ -106,7 +115,7 @@ async fn exec<C: WorkspaceCtx>(args: Args, ctx: Arc<C>) -> Result<ToolResult, To
         fuzzy: res.matched_fuzzily,
         commit: crate::commit::commit_writes(
             vec![crate::commit::FileWrite::write(
-                path,
+                target,
                 res.patched_content.into_bytes(),
             )],
             ctx.service::<crate::commit::WriteObserverSlot>()

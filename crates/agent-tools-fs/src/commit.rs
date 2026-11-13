@@ -11,6 +11,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use agent_capabilities::{WorkspaceCtx, WorkspaceWrite};
 use agent_tool::Commit;
 
 /// What to do with `path` when the commit applies.
@@ -23,10 +24,8 @@ pub enum WriteOp {
 }
 
 /// One staged file effect.
-#[derive(Debug, Clone)]
-pub struct FileWrite {
-    /// Canonical workspace path.
-    pub path: PathBuf,
+pub struct FileWrite<C> {
+    pub target: WorkspaceWrite<C>,
     /// The full new content (ignored for `Delete`).
     pub content: Vec<u8>,
     pub op: WriteOp,
@@ -34,11 +33,11 @@ pub struct FileWrite {
     pub auto_mkdir: bool,
 }
 
-impl FileWrite {
+impl<C: WorkspaceCtx> FileWrite<C> {
     /// The common overwrite case.
-    pub fn write(path: PathBuf, content: Vec<u8>) -> Self {
+    pub fn write(target: WorkspaceWrite<C>, content: Vec<u8>) -> Self {
         Self {
-            path,
+            target,
             content,
             op: WriteOp::Write,
             auto_mkdir: false,
@@ -65,63 +64,79 @@ pub trait WriteObserver: Send + Sync {
 /// as it was *then*, so `verify` re-reads every path and abandons the whole
 /// commit if any moved while the approval card was open — a multi-file patch
 /// is never left half-applied.
-pub fn commit_writes(
-    writes: Vec<FileWrite>,
+pub fn commit_writes<C: WorkspaceCtx>(
+    writes: Vec<FileWrite<C>>,
     observer: Option<Arc<dyn WriteObserver>>,
 ) -> Option<Commit> {
     if writes.is_empty() {
         return None;
     }
-    let pre: Vec<Option<Vec<u8>>> = writes.iter().map(|w| std::fs::read(&w.path).ok()).collect();
-    let paths: Vec<PathBuf> = writes.iter().map(|w| w.path.clone()).collect();
-    let verify = move || {
-        for (path, expected) in paths.iter().zip(pre.iter()) {
-            if *expected != std::fs::read(path).ok() {
-                return Err(format!(
-                    "{} changed after the preview was generated; \
-                     nothing was written — re-read the file and retry",
-                    path.display()
-                ));
-            }
-        }
-        Ok(())
-    };
+    let writes = Arc::new(writes);
+    let checking = writes.clone();
+    let verify = move || verify_writes(&checking);
     let apply = async move {
-        for w in writes {
-            let old = std::fs::read(&w.path).ok();
-            match w.op {
-                WriteOp::Delete => {
-                    tokio::fs::remove_file(&w.path)
-                        .await
-                        .map_err(|e| format!("delete failed for {}: {e}", w.path.display()))?;
-                    if let Some(o) = &observer {
-                        o.on_write(w.path, old, Vec::new());
-                    }
-                }
-                WriteOp::Write => {
-                    if w.auto_mkdir {
-                        if let Some(parent) = w.path.parent() {
-                            let _ = tokio::fs::create_dir_all(parent).await;
-                        }
-                    }
-                    tokio::fs::write(&w.path, &w.content)
-                        .await
-                        .map_err(|e| format!("write failed for {}: {e}", w.path.display()))?;
-                    if let Some(o) = &observer {
-                        o.on_write(w.path, old, w.content);
-                    }
+        tokio::task::spawn_blocking(move || {
+            verify_writes(&writes)?;
+            for w in writes.iter() {
+                let content = match w.op {
+                    WriteOp::Write => Some(w.content.as_slice()),
+                    WriteOp::Delete => None,
+                };
+                w.target
+                    .apply(content, w.auto_mkdir)
+                    .map_err(|e| format!("write failed for {}: {e}", w.target.path().display()))?;
+                if let Some(observer) = &observer {
+                    observer.on_write(
+                        w.target.path().to_path_buf(),
+                        w.target.before().map(<[u8]>::to_vec),
+                        content.map_or_else(Vec::new, <[u8]>::to_vec),
+                    );
                 }
             }
-        }
-        Ok(())
+            Ok(())
+        })
+        .await
+        .map_err(|e| format!("file commit task: {e}"))?
     };
     Some(Commit::new(apply).verified(verify))
+}
+
+fn verify_writes<C: WorkspaceCtx>(writes: &[FileWrite<C>]) -> Result<(), String> {
+    for write in writes {
+        write.target.verify().map_err(|e| format!(
+            "{} changed after the preview was generated; nothing was written — re-read the file and retry: {e}",
+            write.target.path().display()
+        ))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct Ctx(agent_tool::Extensions);
+    impl agent_tool::ToolContext for Ctx {
+        fn extensions(&self) -> &agent_tool::Extensions {
+            &self.0
+        }
+        fn extensions_mut(&mut self) -> &mut agent_tool::Extensions {
+            &mut self.0
+        }
+    }
+    fn target(path: &std::path::Path) -> WorkspaceWrite<Ctx> {
+        let mut root = path.parent().unwrap();
+        while !root.exists() {
+            root = root.parent().unwrap();
+        }
+        Arc::new(Ctx::default().with_workspace(root))
+            .workspace_io()
+            .unwrap()
+            .stage_write(path)
+            .unwrap()
+    }
 
     #[derive(Default)]
     struct Seen(Mutex<Vec<(PathBuf, Option<Vec<u8>>, Vec<u8>)>>);
@@ -136,16 +151,17 @@ mod tests {
     #[tokio::test]
     async fn apply_writes_and_reports_each_change() {
         let dir = tempfile::tempdir().unwrap();
-        let a = dir.path().join("a.txt");
-        let b = dir.path().join("sub/b.txt");
+        let root = dir.path().canonicalize().unwrap();
+        let a = root.join("a.txt");
+        let b = root.join("sub/b.txt");
         std::fs::write(&a, "old").unwrap();
         let seen = Arc::new(Seen::default());
         let obs: Arc<dyn WriteObserver> = seen.clone();
         let commit = commit_writes(
             vec![
-                FileWrite::write(a.clone(), b"new".to_vec()),
+                FileWrite::write(target(&a), b"new".to_vec()),
                 FileWrite {
-                    path: b.clone(),
+                    target: target(&b),
                     content: b"fresh".to_vec(),
                     op: WriteOp::Write,
                     auto_mkdir: true,
@@ -169,14 +185,15 @@ mod tests {
     #[tokio::test]
     async fn verify_refuses_when_a_file_moved_after_the_preview() {
         let dir = tempfile::tempdir().unwrap();
-        let a = dir.path().join("a.txt");
-        let b = dir.path().join("b.txt");
+        let root = dir.path().canonicalize().unwrap();
+        let a = root.join("a.txt");
+        let b = root.join("b.txt");
         std::fs::write(&a, "a0").unwrap();
         std::fs::write(&b, "b0").unwrap();
         let commit = commit_writes(
             vec![
-                FileWrite::write(a.clone(), b"a1".to_vec()),
-                FileWrite::write(b.clone(), b"b1".to_vec()),
+                FileWrite::write(target(&a), b"a1".to_vec()),
+                FileWrite::write(target(&b), b"b1".to_vec()),
             ],
             None,
         )
@@ -198,14 +215,14 @@ mod tests {
     #[tokio::test]
     async fn delete_removes_the_file_and_reports_an_empty_new() {
         let dir = tempfile::tempdir().unwrap();
-        let a = dir.path().join("a.txt");
+        let a = dir.path().canonicalize().unwrap().join("a.txt");
         std::fs::write(&a, "gone").unwrap();
         let seen = Arc::new(Seen::default());
         let obs: Arc<dyn WriteObserver> = seen.clone();
         let commit = commit_writes(
             vec![FileWrite {
-                path: a.clone(),
-                content: Vec::new(),
+                target: target(&a),
+                content: b"ignored for delete".to_vec(),
                 op: WriteOp::Delete,
                 auto_mkdir: false,
             }],
@@ -222,6 +239,6 @@ mod tests {
 
     #[test]
     fn no_writes_means_no_commit() {
-        assert!(commit_writes(Vec::new(), None).is_none());
+        assert!(commit_writes::<Ctx>(Vec::new(), None).is_none());
     }
 }
