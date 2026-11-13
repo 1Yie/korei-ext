@@ -11,14 +11,16 @@
 //! and the composer attachments already use. A text-only model just keeps
 //! the path text, same degradation contract.
 
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures::FutureExt;
 use serde::Deserialize;
 
 use crate::net;
-use agent_capabilities::WorkspaceCtx;
-use agent_capabilities::WorkspacePaths;
+use agent_capabilities::{WorkspaceCtx, WorkspaceIo, WorkspacePaths};
 use agent_tool::{schema_for, ToolError, ToolResult, ToolSpec};
 
 /// Refuse to attach images larger than this — bigger payloads mostly break
@@ -330,6 +332,272 @@ fn parse_bing_hits(html: &str, count: u32) -> Vec<Hit> {
 mod tests {
     use super::*;
 
+    #[derive(Default)]
+    struct Ctx(agent_tool::Extensions);
+
+    impl agent_tool::ToolContext for Ctx {
+        fn extensions(&self) -> &agent_tool::Extensions {
+            &self.0
+        }
+        fn extensions_mut(&mut self) -> &mut agent_tool::Extensions {
+            &mut self.0
+        }
+    }
+
+    #[tokio::test]
+    async fn native_download_and_view_keep_workspace_image_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let ctx = Arc::new(Ctx::default().with_workspace(&root));
+        let downloaded = save_download(
+            &ctx,
+            &ctx.workspace_io().unwrap(),
+            Path::new("nested/image.PNG"),
+            b"native",
+            "image/png",
+        )
+        .unwrap();
+        let path = root.join("nested/image.PNG");
+        assert_eq!(std::fs::read(&path).unwrap(), b"native");
+        assert_eq!(downloaded.images[0].path, path);
+        let viewed = (view_image::<Ctx>().exec)(
+            serde_json::json!({"file": "nested/image.PNG"}),
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(viewed.images, downloaded.images);
+        assert_eq!(
+            viewed.images[0].data_url().unwrap(),
+            "data:image/png;base64,bmF0aXZl"
+        );
+        assert!(!root.join(".agent/attachments").exists());
+        let error = (web_download::<Ctx>().exec)(
+            serde_json::json!({"url":"invalid://download","path":"../outside"}),
+            ctx,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ToolError::OutOfScope { .. }), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn view_rejects_non_files_unsupported_extensions_and_oversize_images() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir(root.join("directory.png")).unwrap();
+        std::fs::write(root.join("unsupported.txt"), b"image").unwrap();
+        std::fs::File::create(root.join("large.png"))
+            .unwrap()
+            .set_len(MAX_IMAGE_BYTES + 1)
+            .unwrap();
+        let ctx = Arc::new(Ctx::default().with_workspace(root));
+        for (file, expected) in [
+            ("directory.png", "not a regular file"),
+            ("unsupported.txt", "not a viewable image type"),
+            ("large.png", "(> 8 MB)"),
+        ] {
+            let error = (view_image::<Ctx>().exec)(serde_json::json!({"file": file}), ctx.clone())
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "{error}");
+        }
+        assert!(!root.join(".agent/attachments").exists());
+    }
+
+    #[cfg(all(feature = "sandbox", unix))]
+    mod leased {
+        use super::*;
+        use agent_capabilities::{LinkedRoot, LinkedRoots, RootAccess};
+        use agent_sandbox::snapshot::{SnapshotBudget, SnapshotPreference, WorkspaceSnapshot};
+        use std::os::unix::fs::PermissionsExt;
+
+        struct Fixture {
+            _temp: tempfile::TempDir,
+            source: PathBuf,
+            linked: PathBuf,
+            snapshot: WorkspaceSnapshot,
+        }
+
+        fn fixture() -> Fixture {
+            let temp = tempfile::tempdir().unwrap();
+            let base = temp.path().canonicalize().unwrap();
+            let source = base.join("source");
+            let linked = base.join("linked");
+            let storage = base.join("storage");
+            for dir in [&source, &linked, &storage] {
+                std::fs::create_dir(dir).unwrap();
+            }
+            std::fs::set_permissions(&storage, std::fs::Permissions::from_mode(0o700)).unwrap();
+            for root in [&source, &linked] {
+                std::fs::write(root.join("image.png"), b"source").unwrap();
+            }
+            let snapshot = WorkspaceSnapshot::prepare(
+                &[source.clone(), linked.clone()],
+                &storage,
+                SnapshotBudget {
+                    max_bytes: 1024,
+                    max_entries: 32,
+                    max_depth: 8,
+                },
+                SnapshotPreference::PrivateCopy,
+            )
+            .unwrap();
+            Fixture {
+                _temp: temp,
+                source,
+                linked,
+                snapshot,
+            }
+        }
+
+        fn context(f: &Fixture, root: &Path) -> (Arc<Ctx>, Arc<LinkedRoots>) {
+            let roots = Arc::new(LinkedRoots::default());
+            roots.set(vec![LinkedRoot {
+                path: f.linked.clone(),
+                access: RootAccess::ReadWrite,
+            }]);
+            let mut ctx = Ctx::default().with_workspace(root);
+            let mut paths = ctx.app_paths().unwrap();
+            paths.workspace_dir_name = ".host-state".into();
+            ctx.install_paths(paths);
+            ctx.install_linked_roots(roots.clone());
+            ctx.install_workspace_lease(f.snapshot.lease().unwrap())
+                .unwrap();
+            (Arc::new(ctx), roots)
+        }
+
+        #[test]
+        fn download_writes_private_view_and_keeps_image_bonus_after_cleanup() {
+            let mut f = fixture();
+            let lease = f.snapshot.lease().unwrap();
+            let primary = lease.roots().next().unwrap();
+            let private = lease.working_root(primary).unwrap().to_path_buf();
+            let (ctx, _) = context(&f, &f.source);
+            let text = save_download(
+                &ctx,
+                &ctx.workspace_io().unwrap(),
+                Path::new("new/nested/file.txt"),
+                b"download",
+                "",
+            )
+            .unwrap();
+            assert!(text.images.is_empty());
+            assert_eq!(
+                std::fs::read(private.join("new/nested/file.txt")).unwrap(),
+                b"download"
+            );
+            assert!(!f.source.join("new").exists());
+            let image = save_download(
+                &ctx,
+                &ctx.workspace_io().unwrap(),
+                Path::new("image.png"),
+                b"private",
+                "image/png",
+            )
+            .unwrap();
+            assert_eq!(
+                std::fs::read(private.join("image.png")).unwrap(),
+                b"private"
+            );
+            assert_eq!(
+                std::fs::read(f.source.join("image.png")).unwrap(),
+                b"source"
+            );
+            assert!(image.images[0]
+                .path
+                .starts_with(f.source.join(".host-state/attachments")));
+            drop(ctx);
+            drop(lease);
+            f.snapshot.seal().unwrap();
+            drop(f.snapshot);
+            assert!(!private.exists());
+            assert_eq!(
+                image.images[0].data_url().unwrap(),
+                "data:image/png;base64,cHJpdmF0ZQ=="
+            );
+        }
+
+        #[tokio::test]
+        async fn view_uses_private_bytes_and_replays_after_snapshot_cleanup() {
+            let mut f = fixture();
+            let lease = f.snapshot.lease().unwrap();
+            let primary = lease.roots().next().unwrap();
+            let private = lease.working_root(primary).unwrap().to_path_buf();
+            lease
+                .write_file(primary, Path::new("image.png"), b"private")
+                .unwrap();
+            std::fs::rename(f.source.join("image.png"), f.source.join("renamed.png")).unwrap();
+            std::fs::write(f.source.join("image.png"), b"ambient").unwrap();
+            let (ctx, _) = context(&f, &private);
+            let result = (view_image::<Ctx>().exec)(
+                serde_json::json!({"file": f.source.join("image.png")}),
+                ctx.clone(),
+            )
+            .await
+            .unwrap();
+            assert!(result.content.contains("image: image.png"));
+            assert!(!result.content.contains(&private.display().to_string()));
+            assert_eq!(std::fs::read(&result.images[0].path).unwrap(), b"private");
+            assert_eq!(
+                std::fs::read(f.source.join("image.png")).unwrap(),
+                b"ambient"
+            );
+            assert!(result.images[0]
+                .path
+                .starts_with(f.source.join(".host-state/attachments")));
+            let saved = serde_json::to_string(&result.images[0]).unwrap();
+            drop(result);
+            drop(ctx);
+            drop(lease);
+            f.snapshot.seal().unwrap();
+            drop(f.snapshot);
+            assert!(!private.exists());
+            let replayed: agent_llm_core::types::ImageRef = serde_json::from_str(&saved).unwrap();
+            assert_eq!(
+                replayed.data_url().unwrap(),
+                "data:image/png;base64,cHJpdmF0ZQ=="
+            );
+        }
+
+        #[tokio::test]
+        async fn revoked_linked_root_refuses_view_and_download_without_attachments() {
+            let f = fixture();
+            let (ctx, roots) = context(&f, &f.source);
+            roots.set(Vec::new());
+            let error = (view_image::<Ctx>().exec)(
+                serde_json::json!({"file": f.linked.join("image.png")}),
+                ctx.clone(),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("no live authorization"), "{error}");
+            let error = save_download(
+                &ctx,
+                &ctx.workspace_io().unwrap(),
+                &f.linked.join("image.png"),
+                b"leak",
+                "image/png",
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("no live authorization"), "{error}");
+            assert!(!f.source.join(".host-state").exists());
+            assert!(!f.linked.join(".host-state").exists());
+            let lease = f.snapshot.lease().unwrap();
+            let linked = lease.roots().nth(1).unwrap();
+            let mut bytes = Vec::new();
+            lease
+                .read_file(linked, Path::new("image.png"))
+                .unwrap()
+                .read_to_end(&mut bytes)
+                .unwrap();
+            assert_eq!(bytes, b"source");
+        }
+    }
+
     /// `m="` attrs that don't start with `{` and malformed JSON are skipped;
     /// valid entries decode into hits with turl as the primary URL.
     #[test]
@@ -386,6 +654,8 @@ fn web_download<C: WorkspaceCtx>() -> ToolSpec<C> {
             async move {
                 let a: WebDownloadArgs = serde_json::from_value(args)
                     .map_err(|e| ToolError::Args(format!("web_download args: {e}")))?;
+                let io = ctx.workspace_io()?;
+                let dest = io.resolve(Path::new(&a.path), true)?;
                 let ua = net::user_agent(ctx.app_paths()?.app_name());
                 let resp = net::fetch(&a.url, "*/*", ctx.cancel_flag(), &ua).await?;
                 if !resp.status.is_success() {
@@ -403,35 +673,78 @@ fn web_download<C: WorkspaceCtx>() -> ToolSpec<C> {
                         a.url
                     )));
                 }
-                let dest = ctx.resolve(&a.path)?;
-                if let Some(parent) = dest.parent() {
-                    std::fs::create_dir_all(parent)
-                        .map_err(|e| ToolError::Failed(format!("mkdir {parent:?}: {e}")))?;
-                }
-                std::fs::write(&dest, &resp.body)
-                    .map_err(|e| ToolError::Failed(format!("write {dest:?}: {e}")))?;
-                let shown = dest.strip_prefix(ctx.root()?).unwrap_or(&dest).display();
-                let mut res = ToolResult::text(format!(
-                    "downloaded: {shown}  ({} bytes, {})",
-                    resp.body.len(),
-                    if resp.content_type.is_empty() {
-                        "unknown type".to_string()
-                    } else {
-                        resp.content_type.clone()
-                    },
-                ));
-                // Vision bonus: attach the image so the model sees exactly
-                // what it downloaded (engine drops it for text-only models).
-                if resp.content_type.starts_with("image/") {
-                    if let Some(img) = agent_llm_core::types::ImageRef::for_path(dest) {
-                        res.images.push(img);
-                    }
-                }
-                Ok(res)
+                save_download(&ctx, &io, &dest, &resp.body, &resp.content_type)
             }
             .boxed()
         }),
     }
+}
+
+fn save_download<C: WorkspaceCtx>(
+    ctx: &Arc<C>,
+    io: &WorkspaceIo<C>,
+    path: &Path,
+    bytes: &[u8],
+    content_type: &str,
+) -> Result<ToolResult, ToolError> {
+    let dest = io.resolve(path, true)?;
+    io.stage_write(&dest)?.apply(Some(bytes), true)?;
+    let source = io.source_path(&dest)?;
+    let root = io.source_path(Path::new("."))?;
+    let shown = source.strip_prefix(&root).unwrap_or(&source).display();
+    let mut res = ToolResult::text(format!(
+        "downloaded: {shown}  ({} bytes, {})",
+        bytes.len(),
+        if content_type.is_empty() {
+            "unknown type"
+        } else {
+            content_type
+        },
+    ));
+    if content_type.starts_with("image/") {
+        if let Some(mut img) = agent_llm_core::types::ImageRef::for_path(dest.clone()) {
+            if io.is_leased() {
+                img.path = persist_image(ctx, io, &dest, bytes)?;
+            }
+            res.images.push(img);
+        }
+    }
+    Ok(res)
+}
+
+fn persist_image<C: WorkspaceCtx>(
+    ctx: &Arc<C>,
+    io: &WorkspaceIo<C>,
+    path: &Path,
+    bytes: &[u8],
+) -> Result<PathBuf, ToolError> {
+    io.resolve(path, false)?;
+    // Host attachments outlive the private execution, including contexts rooted in it.
+    let root = io.source_path(Path::new("."))?;
+    let dir = ctx.app_paths()?.workspace_dir(&root).join("attachments");
+    std::fs::create_dir_all(&dir)?;
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| ToolError::Failed(format!("attachment timestamp: {e}")))?
+        .as_nanos();
+    let mut dest = dir.join(format!("image-{stamp}"));
+    if let Some(extension) = path.extension() {
+        dest.set_extension(extension);
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&dest)
+        .map_err(|e| ToolError::Failed(format!("create image attachment: {e}")))?;
+    let written = file.write_all(bytes).and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(error) = written {
+        let _ = std::fs::remove_file(&dest);
+        return Err(ToolError::Failed(format!(
+            "write image attachment: {error}"
+        )));
+    }
+    Ok(dest)
 }
 
 fn view_image<C: WorkspaceCtx>() -> ToolSpec<C> {
@@ -453,9 +766,21 @@ fn view_image<C: WorkspaceCtx>() -> ToolSpec<C> {
             async move {
                 let a: ViewImageArgs = serde_json::from_value(args)
                     .map_err(|e| ToolError::Args(format!("view_image args: {e}")))?;
-                let path = ctx.resolve(&a.file)?;
-                let meta = std::fs::metadata(&path)
-                    .map_err(|e| ToolError::Failed(format!("cannot stat {}: {e}", a.file)))?;
+                let io = ctx.workspace_io()?;
+                let path = io.resolve(Path::new(&a.file), !io.is_leased())?;
+                let file = if io.is_leased() {
+                    Some(io.open(&path)?)
+                } else {
+                    None
+                };
+                let meta = match &file {
+                    Some(file) => file.metadata().map_err(ToolError::from),
+                    None => io.metadata(&path),
+                }
+                .map_err(|e| ToolError::Failed(format!("cannot stat {}: {e}", a.file)))?;
+                if !meta.is_file() {
+                    return Err(ToolError::Failed(format!("not a regular file: {}", a.file)));
+                }
                 if meta.len() > MAX_IMAGE_BYTES {
                     return Err(ToolError::Failed(format!(
                         "image is {:.1} MB (> 8 MB) — downscale it first \
@@ -463,18 +788,32 @@ fn view_image<C: WorkspaceCtx>() -> ToolSpec<C> {
                         meta.len() as f64 / (1024.0 * 1024.0)
                     )));
                 }
-                let img =
+                let mut img =
                     agent_llm_core::types::ImageRef::for_path(path.clone()).ok_or_else(|| {
                         ToolError::Args(format!(
                             "not a viewable image type: {} (want png/jpg/jpeg/gif/webp/bmp)",
                             a.file
                         ))
                     })?;
-                let shown = path.strip_prefix(ctx.root()?).unwrap_or(&path).display();
+                let source = io.source_path(&path)?;
+                let root = io.source_path(Path::new("."))?;
+                let shown = source.strip_prefix(&root).unwrap_or(&source).display();
+                let size = if let Some(file) = file {
+                    let mut bytes = Vec::new();
+                    file.take(MAX_IMAGE_BYTES + 1).read_to_end(&mut bytes)?;
+                    if bytes.len() as u64 > MAX_IMAGE_BYTES {
+                        return Err(ToolError::Failed(
+                            "image exceeds the 8 MB limit — downscale it first".into(),
+                        ));
+                    }
+                    img.path = persist_image(&ctx, &io, &path, &bytes)?;
+                    bytes.len() as u64
+                } else {
+                    meta.len()
+                };
                 let mut res = ToolResult::text(format!(
                     "image: {shown}  ({} bytes, {})",
-                    meta.len(),
-                    img.media_type,
+                    size, img.media_type,
                 ));
                 res.images.push(img);
                 Ok(res)
