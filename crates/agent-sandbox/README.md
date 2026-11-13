@@ -113,6 +113,14 @@ clones. Close every derived file before sealing. `SnapshotFile` provides
 controlled I/O, metadata and synchronization without exposing the underlying
 file or its OS handle.
 
+Ignore configuration uses the same live workspace authorization for prepared
+source paths, private paths and Host aliases. Host configuration outside the
+prepared roots is read through pinned directory handles. The immutable
+configuration baseline lets callers validate references to Host files; private
+configuration changes can select prepared files, but cannot grant access to
+new Host targets. See `WorkspaceIo` in `agent-capabilities` for the caller
+binding and the FS leased tests for native ignore comparisons.
+
 Publication checks source identities and preimages. Multiple files and
 volumes are published incrementally. Consume the complete `PublishReport`,
 including applied changes, conflicts, recovery requirements and retained

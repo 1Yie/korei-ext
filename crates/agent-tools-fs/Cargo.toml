@@ -29,6 +29,7 @@ tree-sitter-typescript = { version = "0.23.2", optional = true }
 tree-sitter-javascript = { version = "0.25.0", optional = true }
 
 [features]
+sandbox = ["agent-capabilities/sandbox"]
 tree-sitter = [
     "dep:tree-sitter",
     "dep:tree-sitter-rust",
@@ -39,3 +40,4 @@ tree-sitter = [
 
 [dev-dependencies]
 tempfile = "3"
+agent-sandbox = { path = "../agent-sandbox" }

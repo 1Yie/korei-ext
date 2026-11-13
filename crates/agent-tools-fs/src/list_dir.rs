@@ -51,9 +51,19 @@ pub fn spec<C: WorkspaceCtx>() -> ToolSpec<C> {
 async fn exec<C: WorkspaceCtx>(args: Args, ctx: Arc<C>) -> Result<ToolResult, ToolError> {
     let parsed: ListDirArgs =
         serde_json::from_value(args).map_err(|e| ToolError::Args(format!("list_dir args: {e}")))?;
+    let io = ctx.workspace_io()?;
+    tokio::task::spawn_blocking(move || list_sync(parsed, io))
+        .await
+        .map_err(|e| ToolError::Failed(format!("list task: {e}")))?
+}
+
+fn list_sync<C: WorkspaceCtx>(
+    parsed: ListDirArgs,
+    io: agent_capabilities::WorkspaceIo<C>,
+) -> Result<ToolResult, ToolError> {
     let rel = parsed.path.as_deref().unwrap_or(".");
-    let root = ctx.resolve_read(rel)?;
-    if !root.is_dir() {
+    let root = io.resolve(std::path::Path::new(rel), false)?;
+    if !io.metadata(&root)?.is_dir() {
         return Err(ToolError::Failed(format!("not a directory: {rel}")));
     }
     let depth = parsed.depth.unwrap_or(1).clamp(1, 4); // deep listings waste tokens
@@ -76,19 +86,8 @@ async fn exec<C: WorkspaceCtx>(args: Args, ctx: Arc<C>) -> Result<ToolResult, To
     let mut errors = 0usize;
     let mut truncated = false;
 
-    let mut builder = ignore::WalkBuilder::new(&root);
-    builder
-        // Symlinks are NOT followed (ignore's default) — a symlinked dir is
-        // listed as a leaf, never descended into, so workspace containment
-        // can't be escaped through it.
-        .hidden(!include_hidden)
-        .git_ignore(true)
-        .git_exclude(true)
-        .require_git(false)
-        .max_depth(Some(depth))
-        .sort_by_file_name(|a, b| a.cmp(b));
-
-    for result in builder.build() {
+    let leased = io.is_leased();
+    for result in crate::walk::walk(io, &root, include_hidden, Some(depth))? {
         scanned += 1;
         if scanned > MAX_SCAN_ENTRIES {
             truncated = true;
@@ -98,7 +97,10 @@ async fn exec<C: WorkspaceCtx>(args: Args, ctx: Arc<C>) -> Result<ToolResult, To
             Ok(e) => e,
             // Count unreadable entries instead of swallowing them — a
             // listing that hides failures reads as "complete" when it isn't.
-            Err(_) => {
+            Err(error) => {
+                if leased {
+                    return Err(error);
+                }
                 errors += 1;
                 continue;
             }

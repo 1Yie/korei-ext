@@ -1,15 +1,16 @@
 //! Per-execution private workspaces. Hosts quiesce every tool before sealing.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::ffi::OsString;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 
-use crate::snapshot_fs::{clone_into, Dir};
+use crate::snapshot_fs::{clone_into, regular, Dir};
 
 static NEXT: AtomicU64 = AtomicU64::new(1);
 
@@ -145,6 +146,101 @@ pub struct SnapshotFile {
     lease: SnapshotLease,
 }
 
+/// A pinned preimage and destination in a private workspace.
+pub struct SnapshotWrite {
+    lease: SnapshotLease,
+    root: RootId,
+    relative: PathBuf,
+    ancestor: PathBuf,
+    identity: (u64, u64),
+    file: Option<File>,
+    before: Option<Vec<u8>>,
+}
+
+impl SnapshotWrite {
+    pub fn before(&self) -> Option<&[u8]> {
+        self.before.as_deref()
+    }
+
+    pub fn verify(&self) -> Result<()> {
+        let root = self.lease.dir(self.root)?;
+        let ancestor = if self.ancestor.as_os_str().is_empty() {
+            root.identity()?
+        } else {
+            root.child(&self.ancestor)?.identity()?
+        };
+        if ancestor != self.identity {
+            bail!("staged parent directory changed");
+        }
+        let current = match root.read(&self.relative) {
+            Ok(file) => Some(file),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        match (&self.file, current) {
+            (None, None) => Ok(()),
+            (Some(original), Some(mut current)) => {
+                regular(original)?;
+                if file_identity(original)? != file_identity(&current)? {
+                    bail!("staged file identity changed");
+                }
+                let mut bytes = Vec::new();
+                current.read_to_end(&mut bytes)?;
+                if Some(bytes.as_slice()) != self.before() {
+                    bail!("staged preimage changed");
+                }
+                Ok(())
+            }
+            _ => bail!("staged target changed"),
+        }
+    }
+
+    /// Apply bytes, or delete with `None`, after checking the pinned preimage.
+    pub fn apply(&self, content: Option<&[u8]>, auto_mkdir: bool) -> Result<()> {
+        self.verify()?;
+        let root = self.lease.dir(self.root)?;
+        if auto_mkdir {
+            if let Some(parent) = self.relative.parent() {
+                let mut prefix = PathBuf::new();
+                for component in parent.components() {
+                    prefix.push(component);
+                    match root.child(&prefix) {
+                        Ok(_) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            root.mkdir(&prefix)?;
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+            }
+        }
+        match content {
+            None => {
+                self.verify()?;
+                root.unlink(&self.relative, false)?;
+            }
+            Some(bytes) => {
+                let mut file = match &self.file {
+                    Some(original) => {
+                        let file = root.write(&self.relative)?;
+                        if file_identity(&file)? != file_identity(original)? {
+                            bail!("staged file identity changed");
+                        }
+                        self.verify()?;
+                        file
+                    }
+                    None => root.create(&self.relative)?,
+                };
+                regular(&file)?;
+                file.set_len(0)?;
+                file.write_all(bytes)?;
+                file.sync_all()?;
+            }
+        }
+        Ok(())
+    }
+}
+
 impl SnapshotFile {
     pub fn try_clone(&self) -> std::io::Result<Self> {
         Ok(Self {
@@ -223,6 +319,85 @@ impl Drop for SnapshotLease {
 }
 
 impl SnapshotLease {
+    fn dir(&self, root: RootId) -> Result<&Dir> {
+        let working = &self.root(root)?.working;
+        let container = self
+            .private
+            .container
+            .as_ref()
+            .context("snapshot container is unavailable")?;
+        let current = container.child(Path::new(&format!("working-{}", root.0)))?;
+        if current.identity()? != working.identity()? {
+            bail!("private execution root identity changed");
+        }
+        Ok(working)
+    }
+
+    /// Check a prepared execution root through its retained container handle.
+    pub fn validate_root(&self, root: RootId) -> Result<()> {
+        self.dir(root)?;
+        Ok(())
+    }
+
+    /// Metadata obtained through the prepared root's no-follow handles.
+    pub fn metadata(&self, root: RootId, relative: &Path) -> Result<std::fs::Metadata> {
+        let dir = self.dir(root)?;
+        if relative.as_os_str().is_empty() {
+            return Ok(dir.metadata()?);
+        }
+        if dir.is_dir(relative)? {
+            Ok(dir.child(relative)?.metadata()?)
+        } else {
+            Ok(dir.read(relative)?.metadata()?)
+        }
+    }
+
+    /// Enumerate one directory through its pinned root.
+    pub fn read_dir(&self, root: RootId, relative: &Path) -> Result<Vec<std::ffi::OsString>> {
+        let dir = self.dir(root)?;
+        if relative.as_os_str().is_empty() {
+            Ok(dir.names()?)
+        } else {
+            Ok(dir.child(relative)?.names()?)
+        }
+    }
+
+    /// Capture a write destination without changing its contents.
+    pub fn stage_write(&self, root: RootId, relative: &Path) -> Result<SnapshotWrite> {
+        crate::snapshot_fs::relative(relative)?;
+        let dir = self.dir(root)?;
+        let mut ancestor = relative.parent().unwrap_or(Path::new("")).to_path_buf();
+        let identity = loop {
+            if ancestor.as_os_str().is_empty() {
+                break dir.identity()?;
+            }
+            match dir.child(&ancestor) {
+                Ok(parent) => break parent.identity()?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    ancestor.pop();
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
+        let (file, before) = match dir.read(relative) {
+            Ok(mut file) => {
+                let mut before = Vec::new();
+                file.read_to_end(&mut before)?;
+                (Some(file), Some(before))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (None, None),
+            Err(error) => return Err(error.into()),
+        };
+        Ok(SnapshotWrite {
+            lease: self.retain(),
+            root,
+            relative: relative.to_path_buf(),
+            ancestor,
+            identity,
+            file,
+            before,
+        })
+    }
     fn retain(&self) -> Self {
         self.private.active.fetch_add(1, Ordering::AcqRel);
         Self {
@@ -257,9 +432,199 @@ impl SnapshotLease {
 
     pub fn read_file(&self, root: RootId, path: &Path) -> Result<SnapshotFile> {
         Ok(SnapshotFile {
-            file: self.root(root)?.working.read(path)?,
+            file: self.dir(root)?.read(path)?,
             lease: self.retain(),
         })
+    }
+
+    /// Read ignore configuration through current grants; missing paths and directories yield None.
+    pub fn read_ignore_config<F>(&self, path: &Path, classify: F) -> Result<Option<Vec<u8>>>
+    where
+        F: FnMut(&Path) -> io::Result<Option<(RootId, PathBuf)>>,
+    {
+        self.read_ignore_config_view(path, classify, false)
+    }
+
+    /// Read prepared configuration from its immutable baseline.
+    pub fn read_ignore_config_baseline<F>(
+        &self,
+        path: &Path,
+        classify: F,
+    ) -> Result<Option<Vec<u8>>>
+    where
+        F: FnMut(&Path) -> io::Result<Option<(RootId, PathBuf)>>,
+    {
+        self.read_ignore_config_view(path, classify, true)
+    }
+
+    fn read_ignore_config_view<F>(
+        &self,
+        path: &Path,
+        mut classify: F,
+        baseline: bool,
+    ) -> Result<Option<Vec<u8>>>
+    where
+        F: FnMut(&Path) -> io::Result<Option<(RootId, PathBuf)>>,
+    {
+        if let Some(target) = classify(path)? {
+            return self.read_prepared_ignore(path, target, &mut classify, baseline);
+        }
+        let (anchor, mut pending) = ignore_components(path)?;
+        let mut directory = Dir::open(&anchor)?;
+        let mut links = 0;
+        loop {
+            let remaining: PathBuf = pending.iter().collect();
+            let coordinate = directory.path.join(&remaining);
+            if let Some(target) = classify(&coordinate)? {
+                return self.read_prepared_ignore(&coordinate, target, &mut classify, baseline);
+            }
+            if let Some(alias) = self.ignore_directory_alias(&directory)? {
+                let path = alias.join(&remaining);
+                let target =
+                    classify(&path)?.context("prepared configuration alias lost its root")?;
+                return self.read_prepared_ignore(&path, target, &mut classify, baseline);
+            }
+            let name = pending
+                .pop_front()
+                .context("configuration path is a directory")?;
+            if name == ".." {
+                directory = directory.config_parent()?;
+                continue;
+            }
+            match directory.symlink_target(Path::new(&name)) {
+                Ok(Some(target)) => {
+                    links += 1;
+                    if links > 40 {
+                        bail!("too many configuration symlinks");
+                    }
+                    if target.has_root() {
+                        let absolute = directory.path.join(&target);
+                        let (anchor, mut components) = ignore_components(&absolute)?;
+                        components.append(&mut pending);
+                        pending = components;
+                        directory = Dir::open(&anchor)?;
+                    } else {
+                        let mut components = ignore_relative_components(&target)?;
+                        components.append(&mut pending);
+                        pending = components;
+                    }
+                    continue;
+                }
+                Ok(None) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error.into()),
+            }
+            if !pending.is_empty() {
+                directory = match directory.child(Path::new(&name)) {
+                    Ok(directory) => directory,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                    Err(error) => return Err(error.into()),
+                };
+                continue;
+            }
+            if directory.is_dir(Path::new(&name))? {
+                return Ok(None);
+            }
+            let mut file = match directory.read(Path::new(&name)) {
+                Ok(file) => file,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error.into()),
+            };
+            if let Some(alias) = self.ignore_directory_alias(&directory)? {
+                let path = alias.join(&name);
+                let target =
+                    classify(&path)?.context("prepared configuration alias lost its root")?;
+                return self.read_prepared_ignore(&path, target, &mut classify, baseline);
+            }
+            let identity = file_identity(&file)?;
+            for root in &self.private.roots {
+                if let Some((relative, _)) = root
+                    .original
+                    .iter()
+                    .find(|(_, entry)| !entry.directory && entry.identity == identity)
+                {
+                    let path = root.source.path.join(relative);
+                    let target =
+                        classify(&path)?.context("prepared configuration alias lost its root")?;
+                    return self.read_prepared_ignore(&path, target, &mut classify, baseline);
+                }
+            }
+            if let Some(target) = classify(&coordinate)? {
+                return self.read_prepared_ignore(&coordinate, target, &mut classify, baseline);
+            }
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            if self.ignore_directory_alias(&directory)?.is_some() {
+                bail!("Host configuration directory entered a prepared root");
+            }
+            if classify(&coordinate)?.is_some() {
+                bail!("Host configuration authorization changed");
+            }
+            return Ok(Some(bytes));
+        }
+    }
+
+    fn read_prepared_ignore<F>(
+        &self,
+        path: &Path,
+        (root, relative): (RootId, PathBuf),
+        classify: &mut F,
+        baseline: bool,
+    ) -> Result<Option<Vec<u8>>>
+    where
+        F: FnMut(&Path) -> io::Result<Option<(RootId, PathBuf)>>,
+    {
+        let directory = if baseline {
+            &self.root(root)?.baseline
+        } else {
+            self.dir(root)?
+        };
+        let file = match directory.is_dir(&relative) {
+            Ok(true) => return Ok(None),
+            Ok(false) => directory.read(&relative),
+            Err(error) => Err(error),
+        };
+        let bytes = match file {
+            Ok(mut file) => {
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes)?;
+                Some(bytes)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        if classify(path)? != Some((root, relative)) {
+            bail!("prepared configuration authorization changed");
+        }
+        Ok(bytes)
+    }
+
+    fn ignore_directory_alias(&self, directory: &Dir) -> Result<Option<PathBuf>> {
+        let identity = directory.identity()?;
+        for root in &self.private.roots {
+            if identity == root.identity || identity == root.working.identity()? {
+                return Ok(Some(root.source.path.clone()));
+            }
+            if let Some((relative, _)) = root
+                .original
+                .iter()
+                .find(|(_, entry)| entry.directory && entry.identity == identity)
+            {
+                return Ok(Some(root.source.path.join(relative)));
+            }
+        }
+        let lineage = directory.lineage()?;
+        for root in &self.private.roots {
+            if lineage.contains(&root.identity) || lineage.contains(&root.working.identity()?) {
+                bail!("Host configuration directory entered a prepared root");
+            }
+        }
+        if let Some(container) = &self.private.container {
+            if identity == container.identity()? || lineage.contains(&container.identity()?) {
+                bail!("private snapshot storage is not Host configuration");
+            }
+        }
+        Ok(None)
     }
 
     /// Creates a new regular file using O_EXCL/handle-relative traversal.
@@ -299,6 +664,38 @@ impl SnapshotLease {
         }
         Ok(())
     }
+}
+
+fn ignore_components(path: &Path) -> Result<(PathBuf, VecDeque<OsString>)> {
+    if !path.is_absolute() {
+        bail!("configuration path must be absolute");
+    }
+    let mut anchor = PathBuf::new();
+    let mut pending = VecDeque::new();
+    for part in path.components() {
+        match part {
+            Component::Prefix(_) | Component::RootDir => anchor.push(part.as_os_str()),
+            Component::Normal(_) | Component::ParentDir => {
+                pending.push_back(part.as_os_str().to_owned())
+            }
+            Component::CurDir => {}
+        }
+    }
+    Ok((anchor, pending))
+}
+
+fn ignore_relative_components(path: &Path) -> Result<VecDeque<OsString>> {
+    let mut pending = VecDeque::new();
+    for part in path.components() {
+        match part {
+            Component::Normal(_) | Component::ParentDir => {
+                pending.push_back(part.as_os_str().to_owned())
+            }
+            Component::CurDir => {}
+            _ => bail!("unsupported drive-relative configuration symlink"),
+        }
+    }
+    Ok(pending)
 }
 
 pub struct WorkspaceSnapshot {
@@ -1004,6 +1401,82 @@ fn remove_contents(dir: &Dir) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod ignore_config_tests {
+    use super::*;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    #[test]
+    fn host_config_link_resolution_uses_physical_parent_components() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let source = base.join("source");
+        let storage = base.join("storage");
+        let host = base.join("host");
+        let actual = base.join("actual");
+        for path in [&source, &storage, &host, &actual] {
+            std::fs::create_dir(path).unwrap();
+        }
+        std::fs::set_permissions(&storage, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::create_dir(actual.join("child")).unwrap();
+        std::fs::write(actual.join("config"), b"physical-parent").unwrap();
+        std::fs::write(host.join("config"), b"lexical-parent").unwrap();
+        symlink(actual.join("child"), host.join("dir")).unwrap();
+        symlink("dir/../config", host.join("link")).unwrap();
+        let snapshot = WorkspaceSnapshot::prepare(
+            &[source],
+            &storage,
+            SnapshotBudget {
+                max_bytes: 1024,
+                max_entries: 32,
+                max_depth: 8,
+            },
+            SnapshotPreference::PrivateCopy,
+        )
+        .unwrap();
+        let lease = snapshot.lease().unwrap();
+        assert_eq!(
+            lease
+                .read_ignore_config(&host.join("link"), |_| Ok(None))
+                .unwrap()
+                .unwrap(),
+            b"physical-parent"
+        );
+        symlink("cycle", host.join("cycle")).unwrap();
+        assert!(lease
+            .read_ignore_config(&host.join("cycle"), |_| Ok(None))
+            .is_err());
+        assert!(lease
+            .read_ignore_config(&host.join("missing/config"), |_| Ok(None))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn host_config_link_resolution_rejects_replacement_after_probe() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        std::fs::write(base.join("config"), b"first").unwrap();
+        std::fs::write(base.join("outside"), b"second").unwrap();
+        let directory = Dir::open(&base).unwrap();
+        assert!(directory
+            .symlink_target(Path::new("config"))
+            .unwrap()
+            .is_none());
+        std::fs::rename(base.join("config"), base.join("saved")).unwrap();
+        symlink("outside", base.join("config")).unwrap();
+        assert!(directory.read(Path::new("config")).is_err());
+        std::fs::create_dir(base.join("child")).unwrap();
+        assert!(directory
+            .symlink_target(Path::new("child"))
+            .unwrap()
+            .is_none());
+        std::fs::rename(base.join("child"), base.join("saved-child")).unwrap();
+        symlink(&base, base.join("child")).unwrap();
+        assert!(directory.child(Path::new("child")).is_err());
+    }
 }
 
 #[cfg(unix)]
