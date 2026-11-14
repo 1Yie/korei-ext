@@ -18,6 +18,7 @@ pub mod linux_landlock;
 pub mod mac_sandbox_exec;
 pub mod netpolicy;
 pub mod none;
+mod process_control;
 #[cfg(unix)]
 pub mod proxy;
 #[cfg(unix)]

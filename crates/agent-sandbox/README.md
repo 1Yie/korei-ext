@@ -45,6 +45,12 @@ lease through their synchronous file appends; a completed process remains
 cancellation and reports success after process and log cleanup. Registry teardown
 requests process cancellation without retaining a context/registry reference cycle.
 
+`ManagedChild::control` retains a pause capability tied to its actual owner.
+Native process control is synchronized with reaping. Linux isolated control uses
+pinned `cgroup.freeze` and `cgroup.events` descriptors; macOS confirms the single
+process's BSD stop state. Cleanup invalidates the capability before releasing
+process identity. Windows pause/resume remains unsupported.
+
 Use `WorkerScope::prepare` for a private empty working directory without
 workspace authorization. Tool execution requires a live `SnapshotLease` and
 the original `SandboxConfig`; its protected paths and read-only mounts are

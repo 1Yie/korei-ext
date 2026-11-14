@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 
+pub use crate::process_control::ProcessControl;
 use crate::spawn::SandboxedChild;
 
 pub const MAX_CAPTURE_BYTES: usize = 1024 * 1024;
@@ -21,6 +22,7 @@ pub struct ManagedChild {
     pub stderr: Option<ProcessOutput>,
     // The group guard must drop before its unreaped child owner.
     group: Option<crate::group_kill::GroupGuard>,
+    control: ProcessControl,
     owner: Owner,
 }
 
@@ -31,6 +33,7 @@ enum Owner {
 
 impl From<tokio::process::Child> for ManagedChild {
     fn from(mut child: tokio::process::Child) -> Self {
+        let control = ProcessControl::native(child.id(), false);
         Self {
             stdin: child
                 .stdin
@@ -45,6 +48,7 @@ impl From<tokio::process::Child> for ManagedChild {
                 .take()
                 .map(|pipe| Box::new(pipe) as ProcessOutput),
             group: None,
+            control,
             owner: Owner::Native(child),
         }
     }
@@ -52,6 +56,7 @@ impl From<tokio::process::Child> for ManagedChild {
 
 impl From<SandboxedChild> for ManagedChild {
     fn from(mut child: SandboxedChild) -> Self {
+        let control = child.control();
         Self {
             stdin: child
                 .stdin
@@ -66,6 +71,7 @@ impl From<SandboxedChild> for ManagedChild {
                 .take()
                 .map(|pipe| Box::new(pipe) as ProcessOutput),
             group: None,
+            control,
             owner: Owner::Isolated(child),
         }
     }
@@ -76,7 +82,12 @@ impl ManagedChild {
     pub fn from_process_group(child: tokio::process::Child) -> Self {
         let mut process = Self::from(child);
         process.group = Some(crate::group_kill::GroupGuard::new(process.id()));
+        process.control = ProcessControl::native(process.id(), true);
         process
+    }
+
+    pub fn control(&self) -> ProcessControl {
+        self.control.clone()
     }
 
     pub fn is_isolated(&self) -> bool {
@@ -94,19 +105,20 @@ impl ManagedChild {
     pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
         match &mut self.owner {
             Owner::Native(child) => {
-                let status = child.try_wait()?;
-                if status.is_some() {
+                let status = self.control.observe_exit(|| child.try_wait());
+                if !matches!(status, Ok(None)) {
                     if let Some(group) = &mut self.group {
                         group.disarm();
                     }
                 }
-                Ok(status)
+                status
             }
             Owner::Isolated(child) => child.try_wait(),
         }
     }
 
     pub fn start_kill(&mut self) -> io::Result<()> {
+        self.control.close();
         drop(self.group.take());
         match &mut self.owner {
             Owner::Native(child) => child.start_kill(),
@@ -118,11 +130,16 @@ impl ManagedChild {
     pub async fn wait(&mut self) -> io::Result<ExitStatus> {
         match &mut self.owner {
             Owner::Native(child) => {
-                let status = child.wait().await?;
+                use std::future::Future;
+                let wait = child.wait();
+                tokio::pin!(wait);
+                let status =
+                    std::future::poll_fn(|cx| self.control.poll_exit(|| wait.as_mut().poll(cx)))
+                        .await;
                 if let Some(group) = &mut self.group {
                     group.disarm();
                 }
-                Ok(status)
+                status
             }
             Owner::Isolated(child) => child.wait().await,
         }
@@ -169,6 +186,12 @@ impl ManagedChild {
             peak_memory_mb: None,
             elapsed_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
         })
+    }
+}
+
+impl Drop for ManagedChild {
+    fn drop(&mut self) {
+        self.control.close();
     }
 }
 
@@ -275,5 +298,17 @@ mod tests {
         let error = child.output(Duration::from_secs(5)).await.unwrap_err();
         assert!(error.to_string().contains("exceeds capture budget"));
         assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn native_control_is_invalidated_by_reaping() {
+        let mut child = shell("while :; do :; done");
+        let control = child.control();
+        control.set_paused(true).unwrap();
+        assert!(child.try_wait().unwrap().is_none());
+        control.set_paused(false).unwrap();
+        assert!(!child.kill().await.unwrap().success());
+        assert!(control.set_paused(true).is_err());
     }
 }
