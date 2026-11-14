@@ -5,18 +5,16 @@
 //! cleanup and log draining both complete before a service reports its exit.
 
 use std::collections::BTreeMap;
-use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 
 use futures::FutureExt;
-use tokio::io::AsyncReadExt;
 use tokio::sync::Mutex;
 
-use crate::log::{create_log, log_dir, read_tail, DEFAULT_TAIL_LINES};
+use crate::log::{create_log, log_dir, pump, read_tail, DEFAULT_TAIL_LINES};
 use agent_capabilities::{SandboxCtx, WorkspaceCtx};
-use agent_sandbox::process::{ManagedChild, ProcessOutput};
+use agent_sandbox::process::ManagedChild;
 use agent_tool::{schema_for, Args, ToolError, ToolResult, ToolSpec};
 
 /// The set of live background services one owner can see and stop. A host
@@ -94,11 +92,7 @@ pub async fn spawn_persistent<C: SandboxCtx>(
     let mut readers = Vec::new();
     for (pipe, log) in [(child.stdout.take(), log), (child.stderr.take(), log_err)] {
         if let Some(pipe) = pipe {
-            let lease = ctx.workspace_lease();
-            readers.push(tokio::spawn(async move {
-                let _lease = lease;
-                append_output(pipe, log).await
-            }));
+            readers.push(pump(pipe, log, ctx.workspace_lease()));
         }
     }
 
@@ -121,18 +115,6 @@ pub async fn spawn_persistent<C: SandboxCtx>(
         pid,
         log_path.display()
     )))
-}
-
-async fn append_output(mut pipe: ProcessOutput, mut log: std::fs::File) -> std::io::Result<()> {
-    let mut buffer = [0; 8192];
-    loop {
-        let read = pipe.read(&mut buffer).await?;
-        if read == 0 {
-            return log.flush();
-        }
-        // A synchronous append cannot outlive the I/O task's lease on cancellation.
-        log.write_all(&buffer[..read])?;
-    }
 }
 
 fn record_log_result(
