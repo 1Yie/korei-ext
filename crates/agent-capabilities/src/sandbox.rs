@@ -14,6 +14,47 @@ pub struct SandboxLimitsProviderSlot(
 );
 
 pub trait SandboxCtx: ToolContext + Sized {
+    /// Run a command using this context's workspace view and bounded capture.
+    fn run_command<'a>(
+        &'a self,
+        cmd: &'a str,
+        args: &'a [&'a str],
+        cfg: &'a agent_sandbox::SandboxConfig,
+    ) -> impl std::future::Future<Output = Result<agent_sandbox::CommandOutput, ToolError>> + Send + 'a
+    where
+        Self: crate::WorkspaceCtx,
+    {
+        async move {
+            if self
+                .extensions()
+                .get_ref::<super::workspace_io::WorkspaceLease>()
+                .is_none()
+            {
+                return self
+                    .sandbox()?
+                    .run_command(cmd, args, cfg)
+                    .await
+                    .map_err(|error| ToolError::Failed(error.to_string()));
+            }
+            let child = if args.is_empty() {
+                #[cfg(windows)]
+                {
+                    self.spawn_process(cfg, "cmd.exe", &["/C", cmd])?
+                }
+                #[cfg(not(windows))]
+                {
+                    self.spawn_process(cfg, "/bin/sh", &["-c", cmd])?
+                }
+            } else {
+                self.spawn_process(cfg, cmd, args)?
+            };
+            child
+                .output(std::time::Duration::from_secs(cfg.timeout_secs))
+                .await
+                .map_err(ToolError::from)
+        }
+    }
+
     /// Start a piped process through the context's actual execution view.
     fn spawn_process(
         &self,

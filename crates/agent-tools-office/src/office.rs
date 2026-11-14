@@ -52,12 +52,7 @@ async fn run<C: WorkspaceCtx + SandboxCtx>(
     // the file itself, so a reported success always means on-disk truth.
     let cmd = format!("OFFICECLI_NO_AUTO_RESIDENT=1 {}", shell_join(&argv));
     let (_verdict, cfg) = prepare(&*ctx, &cmd, timeout)?;
-    let sandbox = ctx.sandbox()?;
-
-    let output = sandbox
-        .run_command(&cmd, &[], &cfg)
-        .await
-        .map_err(|e| ToolError::Failed(e.to_string()))?;
+    let output = ctx.run_command(&cmd, &[], &cfg).await?;
 
     if output.is_timeout {
         return Err(ToolError::Failed(format!(

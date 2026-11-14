@@ -4,11 +4,8 @@
 //! drop `passed`/progress noise, keep only failed test names + assertion
 //! locations + panic backtrace frames. 20k-line log → ≤300 tok diagnostic.
 //!
-//! Spawning goes through `ctx.sandbox()` exactly like `bash`
-//! (`sandbox_cfg::sandbox_config` + `SandboxBackend::run_command`), so a test
-//! run gets the same audit-derived network/fs policy, env sanitization and
-//! timeout tree-kill instead of a bare `sh -c` with a discarded child. The
-//! tool's contract is the *filter*, not the spawn.
+//! Commands use the context's workspace view and audit-derived sandbox policy,
+//! shared with `bash`. The tool's contract is the failure filter.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -66,12 +63,7 @@ async fn exec<C: WorkspaceCtx + SandboxCtx>(
     // Same dispatch as `bash`: audit first, derive the config, run through the
     // backend (which owns env sanitization, limits and timeout tree-kill).
     let (verdict, cfg) = prepare(&*ctx, &parsed.command, TIMEOUT)?;
-    let sandbox = ctx.sandbox()?;
-
-    let out = sandbox
-        .run_command(&parsed.command, &[], &cfg)
-        .await
-        .map_err(|e| ToolError::Failed(e.to_string()))?;
+    let out = ctx.run_command(&parsed.command, &[], &cfg).await?;
 
     let mut raw = String::new();
     raw.push_str(&out.stdout);
