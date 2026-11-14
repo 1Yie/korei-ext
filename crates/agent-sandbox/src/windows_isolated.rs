@@ -666,7 +666,34 @@ mod tests {
             if cancel {
                 request.env.push(("KOREI_PROBE_WAIT".into(), "1".into()));
             }
-            let mut process = crate::spawn::spawn_isolated(scope, &request).unwrap();
+            let mut process = match crate::spawn::spawn_isolated(scope, &request) {
+                Ok(process) => process,
+                Err(error) => {
+                    let keys = ["USERPROFILE", "LOCALAPPDATA", "APPDATA", "TEMP", "TMP"];
+                    for group in keys
+                        .iter()
+                        .map(std::slice::from_ref)
+                        .chain([keys.as_slice()])
+                    {
+                        let mut probe = request.clone();
+                        for key in group {
+                            if let Ok(value) = std::env::var(key) {
+                                probe.env.push(((*key).into(), value));
+                            }
+                        }
+                        let scope = WorkerScope::prepare(&storage).unwrap();
+                        match crate::spawn::spawn_isolated(scope, &probe) {
+                            Ok(mut process) => {
+                                eprintln!("[DEBUG-win-env] {group:?}: launched");
+                                process.start_kill().unwrap();
+                                process.wait().await.unwrap();
+                            }
+                            Err(error) => eprintln!("[DEBUG-win-env] {group:?}: {error:#}"),
+                        }
+                    }
+                    panic!("{error:#}");
+                }
+            };
             process
                 .stdin
                 .take()
