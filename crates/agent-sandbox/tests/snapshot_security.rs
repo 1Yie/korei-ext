@@ -359,9 +359,11 @@ fn derived_files_keep_the_snapshot_unsealable_until_closed() {
         snapshot.seal().is_err(),
         "derived writer and reader outlive lease"
     );
+    assert!(snapshot.try_seal().unwrap().is_none());
     drop(writer);
     assert!(snapshot.seal().is_err(), "derived reader outlives lease");
     drop(reader);
+    assert!(snapshot.try_seal().unwrap().is_none());
     assert!(
         snapshot.seal().is_err(),
         "controlled clone outlives original handles"
@@ -371,8 +373,9 @@ fn derived_files_keep_the_snapshot_unsealable_until_closed() {
     clone.sync_all().unwrap();
     assert_eq!(clone.metadata().unwrap().len(), 7);
     drop(clone);
-    snapshot.seal().unwrap();
+    assert!(snapshot.try_seal().unwrap().is_some());
     snapshot.publish(|| false).unwrap();
+    assert!(snapshot.try_seal().is_err());
     assert_eq!(fs::read(source.join("new")).unwrap(), b"changed");
 }
 

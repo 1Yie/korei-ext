@@ -147,6 +147,8 @@ actual mode. Preparation budgets cover logical bytes, entries and traversal
 depth. They apply to preparation rather than execution-time disk growth.
 See [snapshot.rs](src/snapshot.rs).
 
+`WorkspaceSnapshot::try_seal` returns pending while capability leases remain
+and preserves errors for invalid state or failed snapshot validation.
 Stop tool admission and quiesce every writer before sealing. Live leases and
 execution owners prevent early sealing. Inspect the sealed diff before
 publishing; cancellation before publication leaves source files unchanged.
