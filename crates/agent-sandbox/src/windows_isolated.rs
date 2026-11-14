@@ -693,13 +693,13 @@ mod tests {
                 request.env.push(("KOREI_PROBE_WAIT".into(), "1".into()));
             }
             let mut process = crate::spawn::spawn_isolated(scope, &request).unwrap();
-            process
-                .stdin
-                .take()
-                .unwrap()
-                .write_all(b"ping")
-                .await
-                .unwrap();
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                process.stdin.take().unwrap().write_all(b"ping"),
+            )
+            .await
+            .expect("probe stdin write timed out")
+            .unwrap();
             let mut stdout = process.stdout.take().unwrap();
             let mut stderr = process.stderr.take().unwrap();
             let output = tokio::spawn(async move {
@@ -716,25 +716,30 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(250)).await;
                 process.start_kill().unwrap();
             }
-            let status = match tokio::time::timeout(Duration::from_secs(10), process.wait()).await {
-                Ok(status) => status.unwrap(),
-                Err(_) => {
-                    process.start_kill().unwrap();
-                    tokio::time::timeout(Duration::from_secs(5), process.wait())
-                        .await
-                        .expect("timed-out probe did not terminate")
-                        .unwrap();
-                    let out = output.await.unwrap();
-                    let errors = errors.await.unwrap();
+            let status = tokio::time::timeout(Duration::from_secs(10), process.wait()).await;
+            if status.is_err() {
+                process.start_kill().unwrap();
+                tokio::time::timeout(Duration::from_secs(5), process.wait())
+                    .await
+                    .expect("timed-out probe did not terminate")
+                    .unwrap();
+            }
+            let (out, errors) = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(output, errors)
+            })
+            .await
+            .expect("probe output remained open after process cleanup");
+            let out = out.unwrap();
+            let errors = errors.unwrap();
+            let status = status
+                .unwrap_or_else(|_| {
                     panic!(
                         "probe timed out (cancel={cancel}); stdout: {}; stderr: {}",
                         String::from_utf8_lossy(&out),
                         String::from_utf8_lossy(&errors),
-                    );
-                }
-            };
-            let out = output.await.unwrap();
-            let errors = errors.await.unwrap();
+                    )
+                })
+                .unwrap();
             if !cancel {
                 assert!(status.success(), "{}", String::from_utf8_lossy(&errors));
                 assert!(out.windows(4).any(|bytes| bytes == b"pong"));
