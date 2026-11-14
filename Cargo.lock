@@ -201,6 +201,8 @@ dependencies = [
  "agent-sandbox",
  "agent-tool",
  "agent-tools-shell",
+ "anyhow",
+ "async-trait",
  "dirs",
  "futures",
  "schemars",
