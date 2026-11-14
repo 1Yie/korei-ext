@@ -193,6 +193,7 @@ mod tests {
     /// future: `smart_test_runner`/`bash` rely on this to avoid leaving an
     /// orphaned `cargo test` behind. The child here backgrounds a grandchild
     /// so a shallow kill would leave it running.
+    #[cfg(unix)]
     #[tokio::test]
     async fn timeout_kills_the_process_tree() {
         let dir = tempfile::tempdir().unwrap();

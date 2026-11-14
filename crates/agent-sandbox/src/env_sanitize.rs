@@ -457,6 +457,7 @@ mod tests {
         assert!(!is_safe_env("API_KEY", "x")); // name denied
     }
 
+    #[cfg(unix)]
     #[test]
     fn prune_path_filters_by_roots() {
         use std::path::PathBuf;
@@ -473,6 +474,7 @@ mod tests {
         assert_eq!(parts, ["/usr/bin", "/home/u/.bun/bin", "/etc/evil"]);
     }
 
+    #[cfg(unix)]
     #[test]
     fn path_gains_dev_bin_dirs() {
         // A GUI-launched app's PATH is minimal — discovered dev dirs are
@@ -526,6 +528,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn minimal_policy_skips_dev_bins() {
         // `Minimal` must not grow PATH or inject toolchain vars — the

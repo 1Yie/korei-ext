@@ -84,7 +84,9 @@ pub(crate) fn private_descriptor() -> io::Result<Local> {
     }
     let text = String::from_utf16(unsafe { std::slice::from_raw_parts(text, length) })
         .map_err(io::Error::other)?;
-    let sddl: Vec<u16> = format!("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;{text})")
+    // An elevated runner otherwise owns the directory as Administrators, and
+    // the private-storage check then rejects it.
+    let sddl: Vec<u16> = format!("O:{text}G:{text}D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;{text})")
         .encode_utf16()
         .chain(Some(0))
         .collect();

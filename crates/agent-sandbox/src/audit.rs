@@ -226,7 +226,10 @@ fn simple_writes(
     // Modelled verbs (and the two in-place editors, whose flag is the only
     // difference between reading and rewriting a file).
     let in_place_editor = matches!(cmd.program.as_str(), "sed" | "perl" | "ruby")
-        && cmd.args.iter().any(|a| a == "-i" || a.starts_with("-i") || a.starts_with("-pi"));
+        && cmd
+            .args
+            .iter()
+            .any(|a| a == "-i" || a.starts_with("-i") || a.starts_with("-pi"));
     if WRITE_VERBS.contains(&cmd.program.as_str()) || in_place_editor {
         for a in &cmd.args {
             if a.starts_with('-') || a.contains("://") {
@@ -324,7 +327,12 @@ fn collect_named(node: &Node, cwd: &mut Option<PathBuf>, out: &mut Vec<PathBuf>)
 /// A word may be a path, carry one (`--target=/x/y`), or embed one inside a
 /// quoted payload (`python -c 'open("/w/x","w")'`). All three count: the point
 /// is to notice the place, not to understand the program.
-fn push_path_word(word: &str, cwd: &std::path::Path, base: Option<&std::path::Path>, out: &mut Vec<PathBuf>) {
+fn push_path_word(
+    word: &str,
+    cwd: &std::path::Path,
+    base: Option<&std::path::Path>,
+    out: &mut Vec<PathBuf>,
+) {
     let place = |p: PathBuf| match base {
         Some(_) => resolve_against(&p.to_string_lossy(), cwd),
         None => p,
@@ -341,8 +349,7 @@ fn push_path_word(word: &str, cwd: &std::path::Path, base: Option<&std::path::Pa
     // Embedded in a payload: take every `/…` or `~/…` run out of it.
     for (i, _) in word.match_indices('/') {
         let head = &word[..i];
-        let boundary = head.is_empty()
-            || head.ends_with(['\'', '"', '(', ',', ';', '=', '|', ' ']);
+        let boundary = head.is_empty() || head.ends_with(['\'', '"', '(', ',', ';', '=', '|', ' ']);
         let root_ish = i > 0 && word[..i].ends_with('~');
         if !(boundary || root_ish) {
             continue;
@@ -442,6 +449,28 @@ pub fn is_scratch(path: &std::path::Path) -> bool {
 /// Is `path` outside `workspace` and every `granted` root? Resolves a relative
 /// path against the workspace root and normalizes `.`/`..` components so
 /// `../../etc/shadow` can't sneak through as "relative".
+fn is_sensitive_path(path: &std::path::Path) -> bool {
+    use std::path::Component;
+    let names: Vec<_> = path
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(name) => Some(name.to_string_lossy()),
+            _ => None,
+        })
+        .collect();
+    let Some(first) = names.first() else {
+        return false;
+    };
+    const ROOTS: &[&str] = &[
+        "etc", "usr", "bin", "sbin", "boot", "sys", "proc", "dev", "root", "var", "lib",
+    ];
+    ROOTS.iter().any(|name| first.eq_ignore_ascii_case(name))
+        || names.iter().any(|name| {
+            let name = name.as_ref();
+            name == ".ssh" || name == ".gnupg" || name == ".aws"
+        })
+}
+
 fn is_out_of_scope<'a>(
     path: &std::path::Path,
     workspace: &std::path::Path,
@@ -470,18 +499,9 @@ fn is_out_of_scope<'a>(
     if is_scratch(&normalized) {
         return false;
     }
-    let s = normalized.to_string_lossy();
-    // Sensitive system + secret dirs are always out of scope.
-    let sensitive = [
-        "/etc", "/usr", "/bin", "/sbin", "/boot", "/sys", "/proc", "/dev", "/root", "/var", "/lib",
-    ];
-    if sensitive
-        .iter()
-        .any(|d| s == *d || s.starts_with(&format!("{d}/")))
-        || s.contains("/.ssh")
-        || s.contains("/.gnupg")
-        || s.contains("/.aws")
-    {
+    // Compare components, not display text: Windows joins a leading-slash
+    // path into `\etc\passwd`, which a forward-slash prefix never matches.
+    if is_sensitive_path(&normalized) {
         return true;
     }
     // Component-wise prefix check (not string prefix — `/proj_evil` must not
@@ -594,7 +614,10 @@ mod tests {
         assert!(!scoped("cat /home/u/kernel/a.rs"));
         assert!(!scoped("echo x > /home/u/kernel/a.rs"));
         assert!(!scoped("cat /home/u/docs/a.md"));
-        assert!(scoped("echo x > /home/u/docs/a.md"), "read-only root takes no writes");
+        assert!(
+            scoped("echo x > /home/u/docs/a.md"),
+            "read-only root takes no writes"
+        );
         assert!(scoped("cat /home/u/other/a"));
         // `/kernel_evil` is not `/kernel`.
         assert!(scoped("cat /home/u/kernel_evil/a"));
