@@ -9,6 +9,7 @@ use agent_sandbox::{
     spawn::{spawn_isolated, ExecutionKind, IsolatedSpawn, MemoryEnforcement, SandboxedChild},
     CommandOutput, SandboxBackend, SandboxCapabilities, SandboxConfig, SandboxTier,
 };
+use agent_tool::ToolContext;
 
 #[derive(Default)]
 struct Ctx(agent_tool::Extensions);
@@ -195,4 +196,158 @@ async fn command_timeout_waits_for_the_real_owner_to_release_its_lease() {
     assert!(output.is_timeout);
     drop(ctx);
     assert!(snapshot.seal().unwrap().is_empty());
+}
+
+fn service_control(ctx: &Ctx) -> Arc<Ctx> {
+    let mut control = Ctx::default().with_workspace(ctx.root().unwrap());
+    control.extensions_mut().insert_shared(
+        ctx.service::<agent_tools_shell::services::ServiceRegistrySlot>()
+            .unwrap(),
+    );
+    Arc::new(control)
+}
+
+async fn service(ctx: &Arc<Ctx>, action: &str, id: &str) -> agent_tool::ToolResult {
+    (agent_tools_shell::services::spec::<Ctx>().exec)(
+        serde_json::json!({"action": action, "id": id}),
+        ctx.clone(),
+    )
+    .await
+    .unwrap()
+}
+
+async fn start_service(ctx: &Arc<Ctx>, command: &str) -> String {
+    let started = (agent_tools_shell::bash::spec::<Ctx>().exec)(
+        serde_json::json!({"command": command, "persistent": true}),
+        ctx.clone(),
+    )
+    .await
+    .unwrap();
+    started
+        .content
+        .split_whitespace()
+        .find_map(|part| part.strip_prefix("id="))
+        .unwrap()
+        .to_owned()
+}
+
+async fn wait_for_log(ctx: &Arc<Ctx>, id: &str, marker: &str) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if service(ctx, "logs", id).await.content.contains(marker) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn persistent_service_survives_the_invocation_and_stops_before_publication() {
+    let (_temp, mut snapshot, mut ctx) = fixture(Arc::new(LeasedBackend));
+    agent_tools_shell::services::install_registry(Arc::get_mut(&mut ctx).unwrap());
+    let control = service_control(&ctx);
+    let source = ctx.root().unwrap().to_path_buf();
+    let id = start_service(
+        &ctx,
+        "printf service > file; while :; do printf 'SERVICE_READY\\n'; done",
+    )
+    .await;
+    drop(ctx);
+    wait_for_log(&control, &id, "SERVICE_READY").await;
+    assert!(service(&control, "list", &id)
+        .await
+        .content
+        .contains("running"));
+    assert!(snapshot.seal().is_err());
+    assert_eq!(
+        std::fs::read_to_string(source.join("file")).unwrap(),
+        "original"
+    );
+    assert!(service(&control, "stop", &id)
+        .await
+        .content
+        .contains("stopped"));
+    assert_eq!(snapshot.seal().unwrap().len(), 1);
+    assert!(!service(&control, "list", &id).await.content.contains(&id));
+    snapshot.rollback().unwrap();
+}
+
+#[tokio::test]
+async fn natural_service_exit_includes_both_drained_log_streams() {
+    let (_temp, mut snapshot, mut ctx) = fixture(Arc::new(LeasedBackend));
+    agent_tools_shell::services::install_registry(Arc::get_mut(&mut ctx).unwrap());
+    let control = service_control(&ctx);
+    let id = start_service(&ctx, "printf 'STDOUT_END\\n'; printf 'STDERR_END\\n' >&2").await;
+    drop(ctx);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if service(&control, "list", &id)
+                .await
+                .content
+                .contains("exited(0)")
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let output = service(&control, "logs", &id).await.content;
+    assert!(output.contains("STDOUT_END"));
+    assert!(output.contains("STDERR_END"));
+    assert!(snapshot.seal().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn dropping_the_session_registry_cleans_services_without_a_reference_cycle() {
+    let (_temp, mut snapshot, mut ctx) = fixture(Arc::new(LeasedBackend));
+    agent_tools_shell::services::install_registry(Arc::get_mut(&mut ctx).unwrap());
+    let control = service_control(&ctx);
+    let id = start_service(&ctx, "printf 'DROP_READY\\n'; while :; do :; done").await;
+    drop(ctx);
+    wait_for_log(&control, &id, "DROP_READY").await;
+    assert!(snapshot.seal().is_err());
+    drop(control);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while snapshot.seal().is_err() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn prepared_services_require_a_session_registry_before_launch() {
+    let (_temp, mut snapshot, ctx) = fixture(Arc::new(LeasedBackend));
+    let error = (agent_tools_shell::bash::spec::<Ctx>().exec)(
+        serde_json::json!({"command": "printf escaped > file", "persistent": true}),
+        ctx.clone(),
+    )
+    .await
+    .err()
+    .expect("prepared service must not use the process-wide default");
+    assert!(error
+        .to_string()
+        .contains("require a session service registry"));
+    drop(ctx);
+    assert!(snapshot.seal().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn ordinary_persistent_service_keeps_its_process_group_cleanup() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut ctx = Ctx::default().with_workspace(temp.path());
+    ctx.install_sandbox(Arc::new(agent_sandbox::NoneBackend));
+    agent_tools_shell::services::install_registry(&mut ctx);
+    let ctx = Arc::new(ctx);
+    let id = start_service(&ctx, "printf 'NATIVE_READY\\n'; sleep 30").await;
+    wait_for_log(&ctx, &id, "NATIVE_READY").await;
+    let stopped = service(&ctx, "stop", &id).await;
+    assert!(stopped.content.contains("stopped"));
+    assert!(!service(&ctx, "list", &id).await.content.contains(&id));
 }

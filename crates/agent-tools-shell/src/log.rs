@@ -29,9 +29,7 @@ static DIRS: LazyLock<Mutex<BTreeMap<String, PathBuf>>> =
 /// The name mixes the pid with the clock so a different local user cannot
 /// predict it and plant a file or a symlink inside — the pid alone is public.
 pub(crate) fn log_dir(prefix: &str) -> Result<PathBuf, ToolError> {
-    let mut dirs = DIRS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut dirs = DIRS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(dir) = dirs.get(prefix) {
         return Ok(dir.clone());
     }
@@ -39,10 +37,7 @@ pub(crate) fn log_dir(prefix: &str) -> Result<PathBuf, ToolError> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let dir = std::env::temp_dir().join(format!(
-        "{prefix}-{}-{nanos:032x}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("{prefix}-{}-{nanos:032x}", std::process::id()));
     make_private_dir(&dir)?;
     dirs.insert(prefix.to_string(), dir.clone());
     Ok(dir)
@@ -101,11 +96,16 @@ fn open_private(path: &Path) -> std::io::Result<std::fs::File> {
 pub(crate) fn read_tail(path: &Path, lines: usize) -> Result<String, ToolError> {
     let mut f = std::fs::File::open(path)
         .map_err(|e| ToolError::Failed(format!("log {}: {e}", path.display())))?;
-    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let len = f
+        .metadata()
+        .map_err(|error| ToolError::Failed(format!("log {}: {error}", path.display())))?
+        .len();
     let off = len.saturating_sub(MAX_LOG_BYTES);
-    f.seek(SeekFrom::Start(off)).ok();
+    f.seek(SeekFrom::Start(off))
+        .map_err(|error| ToolError::Failed(format!("log {}: {error}", path.display())))?;
     let mut bytes = Vec::new();
-    f.read_to_end(&mut bytes)
+    f.take(MAX_LOG_BYTES)
+        .read_to_end(&mut bytes)
         .map_err(|e| ToolError::Failed(format!("log {}: {e}", path.display())))?;
     let mut buf = String::from_utf8_lossy(&bytes).into_owned();
     // If we cut mid-line, drop the partial first line.

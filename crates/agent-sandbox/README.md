@@ -38,6 +38,13 @@ unprepared contexts. Prepared contexts use the owned launcher and
 [process.rs](src/process.rs). Timeout and capture failures kill and await the
 actual owner before returning. Bash, the test runner and Office use this path.
 
+Persistent Bash services retain the process handle in a session registry.
+Prepared contexts require that registry explicitly. Log readers hold the view's
+lease through their synchronous file appends; a completed process remains
+`draining` until those readers finish. Service stop retains its owner during
+cancellation and reports success after process and log cleanup. Registry teardown
+requests process cancellation without retaining a context/registry reference cycle.
+
 Use `WorkerScope::prepare` for a private empty working directory without
 workspace authorization. Tool execution requires a live `SnapshotLease` and
 the original `SandboxConfig`; its protected paths and read-only mounts are
