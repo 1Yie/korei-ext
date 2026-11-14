@@ -591,8 +591,9 @@ mod tests {
         )
         .unwrap()
         .content;
+        let shown_root = root.to_string_lossy().replace('\\', "/");
         assert!(
-            out.starts_with(&format!("{}/src/b.rs:1 │ line2\n", root.display())),
+            out.starts_with(&format!("{shown_root}/src/b.rs:1 │ line2\n")),
             "{out}"
         );
         assert!(out.contains("── 1 matches"), "{out}");
