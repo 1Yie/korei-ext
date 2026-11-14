@@ -413,6 +413,10 @@ pub(crate) struct WorkspaceLease {
 
 #[cfg(feature = "sandbox")]
 impl WorkspaceLease {
+    pub(crate) fn lease(&self) -> Arc<SnapshotLease> {
+        self.lease.clone()
+    }
+
     pub(crate) fn new(workspace: &Path, lease: SnapshotLease) -> Result<Self, ToolError> {
         let mut primary = None;
         for id in lease.roots() {
@@ -632,6 +636,33 @@ mod tests {
         ctx.install_workspace_lease(f.snapshot.lease().unwrap())
             .unwrap();
         (ctx, roots)
+    }
+
+    #[test]
+    fn process_launch_never_falls_back_from_a_prepared_view() {
+        use crate::SandboxCtx;
+
+        let f = fixture();
+        let (mut ctx, roots) = context(&f);
+        ctx.install_sandbox(Arc::new(agent_sandbox::NoneBackend));
+        let cfg = agent_sandbox::SandboxConfig {
+            workspace_dir: f.source.clone(),
+            ..Default::default()
+        };
+        let error = ctx
+            .spawn_process(&cfg, "must-not-execute", &[])
+            .err()
+            .expect("ordinary launcher must not receive a leased process");
+        assert!(error
+            .to_string()
+            .contains("no lease-bound process launcher"));
+
+        roots.set(Vec::new());
+        let error = ctx
+            .spawn_process(&cfg, "must-not-execute", &[])
+            .err()
+            .expect("revoked root must be rejected before launch");
+        assert!(error.to_string().contains("has no live authorization"));
     }
 
     #[test]

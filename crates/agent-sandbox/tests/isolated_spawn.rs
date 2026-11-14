@@ -9,7 +9,9 @@ use agent_sandbox::snapshot::*;
 use agent_sandbox::spawn::*;
 use tokio::io::AsyncReadExt;
 
-async fn collect_output(mut process: SandboxedChild) -> std::process::Output {
+async fn collect_output(process: SandboxedChild) -> std::process::Output {
+    let mut process = agent_sandbox::process::ManagedChild::from(process);
+    assert!(process.is_isolated());
     let mut stdout = process.stdout.take().unwrap();
     let mut stderr = process.stderr.take().unwrap();
     process.stdin.take();
@@ -774,18 +776,29 @@ async fn running_owner_keeps_its_view_when_disjoint_roots_are_appended() {
 #[tokio::test]
 #[cfg(target_os = "macos")]
 async fn running_process_cannot_release_its_scope() {
-    let (_temp, mut snapshot, source) = snapshot();
-    let lease = snapshot.lease().unwrap();
-    let mut request = request(&lease, "while :; do :; done".into(), ExecutionKind::Tool);
-    request.tool_policy = Some(agent_sandbox::SandboxConfig {
-        workspace_dir: source,
-        ..Default::default()
-    });
-    let mut process = spawn_isolated(lease, &request).unwrap();
-    let premature_seal = snapshot.seal().is_ok();
-    process.kill().await.unwrap();
-    assert!(!premature_seal, "running tool released its scope");
-    snapshot.seal().unwrap();
+    for retain_context in [false, true] {
+        let (_temp, mut snapshot, source) = snapshot();
+        let lease = std::sync::Arc::new(snapshot.lease().unwrap());
+        let mut request = request(&lease, "while :; do :; done".into(), ExecutionKind::Tool);
+        request.tool_policy = Some(agent_sandbox::SandboxConfig {
+            workspace_dir: source,
+            ..Default::default()
+        });
+        let mut process = agent_sandbox::process::ManagedChild::from(
+            spawn_isolated(lease.clone(), &request).unwrap(),
+        );
+        let context = retain_context.then_some(lease);
+        assert!(process.try_wait().unwrap().is_none());
+        assert!(snapshot.seal().is_err());
+        assert!(!process.kill().await.unwrap().success());
+        assert!(process.try_wait().unwrap().is_some());
+        assert!(process.id().is_none());
+        if retain_context {
+            assert!(snapshot.seal().is_err(), "context still holds its lease");
+        }
+        drop(context);
+        snapshot.seal().unwrap();
+    }
 }
 
 #[test]

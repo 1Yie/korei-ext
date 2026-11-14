@@ -14,6 +14,64 @@ pub struct SandboxLimitsProviderSlot(
 );
 
 pub trait SandboxCtx: ToolContext + Sized {
+    /// Start a piped process through the context's actual execution view.
+    fn spawn_process(
+        &self,
+        cfg: &agent_sandbox::SandboxConfig,
+        cmd: &str,
+        args: &[&str],
+    ) -> Result<agent_sandbox::process::ManagedChild, ToolError>
+    where
+        Self: crate::WorkspaceCtx,
+    {
+        let sandbox = self.sandbox()?;
+        if let Some(view) = self
+            .extensions()
+            .get_ref::<super::workspace_io::WorkspaceLease>()
+        {
+            let lease = view.lease();
+            let mut cfg = cfg.clone();
+            for root in lease.roots() {
+                let source = lease
+                    .source_root(root)
+                    .map_err(|error| ToolError::Failed(error.to_string()))?;
+                if let crate::PathScope::Linked {
+                    access: crate::RootAccess::Read,
+                    ..
+                } = view.scope(self, source)?
+                {
+                    if !cfg.deny_write.iter().any(|path| path == source) {
+                        cfg.deny_write.push(source.to_path_buf());
+                    }
+                }
+            }
+            return sandbox
+                .spawn_leased(lease, &cfg, cmd, args)
+                .map(Into::into)
+                .map_err(|error| ToolError::Failed(error.to_string()));
+        }
+        sandbox
+            .validate_config(cfg)
+            .map_err(|error| ToolError::Failed(error.to_string()))?;
+        let mut command = sandbox.wrap_spawn(cfg, cmd, args).ok_or_else(|| {
+            ToolError::Failed(format!(
+                "sandbox backend `{}` cannot wrap this process",
+                sandbox.id()
+            ))
+        })?;
+        command
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        #[cfg(unix)]
+        command.process_group(0);
+        command
+            .spawn()
+            .map(Into::into)
+            .map_err(|error| ToolError::Failed(format!("process spawn: {error}")))
+    }
+
     fn sandbox(&self) -> Result<Arc<dyn agent_sandbox::SandboxBackend>, ToolError> {
         self.service::<SandboxSlot>()
             .map(|s| s.0.clone())
