@@ -1,8 +1,8 @@
 //! Bridge ownership.
 //!
 //! An unprepared workspace has one Serena server, keyed by its root. Prepared
-//! execution installs a session registry and keeps one server per live snapshot
-//! lease and linked-root authorization. That server's `--project` is the
+//! execution installs a session registry and keeps one server per private project
+//! and linked-root authorization. That server's `--project` is the
 //! lease's private working root. A changed authorization starts a new server
 //! and drops the previous one; dropping the registry drops its servers.
 
@@ -155,7 +155,7 @@ where
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct ViewKey {
-    lease: usize,
+    project: PathBuf,
     auth: Vec<(PathBuf, RootAccess)>,
 }
 
@@ -240,7 +240,7 @@ impl SerenaRegistry {
         Ok(entry.catalog.render(detail))
     }
 
-    /// Drop the bridge for the context's current lease and authorization.
+    /// Drop the bridge for the context's current private project and authorization.
     pub async fn invalidate<C: WorkspaceCtx>(&self, ctx: &C) -> Result<(), ToolError> {
         let key = view_key(ctx)?;
         let slot = self
@@ -271,7 +271,7 @@ impl SerenaRegistry {
         let mut slots = self.slots.lock().unwrap_or_else(|error| error.into_inner());
         let stale: Vec<ViewKey> = slots
             .keys()
-            .filter(|key| key.lease == current.lease && *key != current)
+            .filter(|key| key.project == current.project && *key != current)
             .cloned()
             .collect();
         stale
@@ -321,13 +321,8 @@ fn authorization<C: WorkspaceCtx>(ctx: &C) -> Vec<(PathBuf, RootAccess)> {
 }
 
 fn view_key<C: WorkspaceCtx>(ctx: &C) -> Result<ViewKey, ToolError> {
-    let lease = ctx
-        .workspace_lease()
-        .ok_or_else(|| ToolError::Failed("prepared serena has no execution lease".into()))?;
     Ok(ViewKey {
-        // The context or the retained bridge keeps this allocation alive while
-        // the cache entry exists, so the address cannot be reused early.
-        lease: Arc::as_ptr(&lease) as usize,
+        project: project_path(ctx)?,
         auth: authorization(ctx),
     })
 }
@@ -711,7 +706,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn separate_leases_use_private_projects_and_do_not_share_a_server() {
+        async fn separate_views_use_private_projects_and_do_not_share_a_server() {
             let seen = Arc::new(StdMutex::new(Vec::<PathBuf>::new()));
             let record = seen.clone();
             let registry = Arc::new(SerenaRegistry::hooked(Arc::new(move |project, _| {
@@ -721,13 +716,20 @@ mod tests {
                     .push(project.to_path_buf());
                 Ok(Arc::new(Probe::healthy()))
             })));
-            let (_first_dir, _first_snapshot, mut first) = prepared_ctx();
+            let (_first_dir, first_snapshot, mut first) = prepared_ctx();
             let (_second_dir, _second_snapshot, mut second) = prepared_ctx();
             bind(&mut first, registry.clone());
             bind(&mut second, registry.clone());
             let first_bridge = registry.bridge(&first).await.unwrap();
             let again = registry.bridge(&first).await.unwrap();
             assert!(Arc::ptr_eq(&first_bridge, &again));
+            let mut next_turn = Ctx::default().with_workspace(first.root().unwrap().to_owned());
+            next_turn
+                .install_workspace_lease(first_snapshot.lease().unwrap())
+                .unwrap();
+            bind(&mut next_turn, registry.clone());
+            let next_bridge = registry.bridge(&next_turn).await.unwrap();
+            assert!(Arc::ptr_eq(&first_bridge, &next_bridge));
             let second_bridge = registry.bridge(&second).await.unwrap();
             assert!(!Arc::ptr_eq(&first_bridge, &second_bridge));
             assert_eq!(registry.spawn_count(), 2);
@@ -935,8 +937,18 @@ mod tests {
                 bridge.call("find_symbol", json!({})).await.unwrap(),
                 "stub-ok"
             );
-            let again = registry.bridge(&*ctx).await.unwrap();
+            let mut next_turn = Ctx::default().with_workspace(source.clone());
+            next_turn.install_sandbox(Arc::new(LeasedBackend));
+            next_turn
+                .install_workspace_lease(snapshot.lease().unwrap())
+                .unwrap();
+            bind(&mut next_turn, registry.clone());
+            let again = registry.bridge(&next_turn).await.unwrap();
             assert!(Arc::ptr_eq(&bridge, &again));
+            assert_eq!(
+                again.call("find_symbol", json!({})).await.unwrap(),
+                "stub-ok"
+            );
             assert_eq!(registry.spawn_count(), 1);
             assert!(
                 snapshot.seal().is_err(),
@@ -944,6 +956,7 @@ mod tests {
             );
             drop(bridge);
             drop(again);
+            drop(next_turn);
             drop(ctx);
             drop(registry);
             tokio::time::timeout(Duration::from_secs(10), async {
