@@ -48,6 +48,13 @@ impl From<WorkerScope> for ExecutionScope {
 }
 
 impl ExecutionScope {
+    fn register_owner(&self, grants: &Arc<crate::EffectiveOsGrants>) {
+        match self {
+            Self::Snapshot(lease) => lease.register_owner(grants),
+            Self::Worker(scope) => scope.register_owner(grants),
+        }
+    }
+
     fn validate(&self) -> Result<()> {
         match self {
             Self::Snapshot(lease) => lease.validate(),
@@ -121,6 +128,7 @@ pub struct SandboxedChild {
     #[cfg(windows)]
     pub stderr: Option<tokio::net::windows::named_pipe::NamedPipeServer>,
     pid: u32,
+    effective_grants: Arc<crate::EffectiveOsGrants>,
     cancel: Arc<AtomicBool>,
     rss_exceeded: Arc<AtomicBool>,
     control: ProcessControl,
@@ -135,6 +143,10 @@ impl Drop for SandboxedChild {
 }
 
 impl SandboxedChild {
+    pub fn effective_grants(&self) -> Option<Arc<crate::EffectiveOsGrants>> {
+        Some(Arc::clone(&self.effective_grants))
+    }
+
     pub fn control(&self) -> ProcessControl {
         self.control.clone()
     }
@@ -191,6 +203,7 @@ impl SandboxedChild {
 type Child = crate::windows_isolated::WindowsIsolatedChild;
 
 struct ExecutionOwner {
+    effective_grants: Arc<crate::EffectiveOsGrants>,
     scope: Option<ExecutionScope>,
     child: Option<Child>,
     control: ProcessControl,
@@ -236,6 +249,7 @@ impl ExecutionOwner {
         self.control.close();
         drop(self.child.take());
         drop(self.scope.take());
+        self.effective_grants.released();
     }
 
     fn supervise(
@@ -327,11 +341,14 @@ fn start_owner(
     let rss_exceeded = Arc::new(AtomicBool::new(false));
     let owner_cancel = Arc::clone(&cancel);
     let owner_rss = Arc::clone(&rss_exceeded);
+    let effective_grants = Arc::new(crate::EffectiveOsGrants::default());
+    scope.register_owner(&effective_grants);
     std::thread::Builder::new()
         .name("sandbox-execution".into())
         .spawn(move || {
             // Only proved quiescence may drop capabilities, including during unwinding.
             let mut owner = std::mem::ManuallyDrop::new(ExecutionOwner {
+                effective_grants,
                 scope: Some(scope),
                 child: None,
                 control: ProcessControl::closed(),
@@ -392,6 +409,7 @@ fn start_owner(
                         #[cfg(windows)]
                         stderr: child.stderr.take(),
                         pid,
+                        effective_grants: Arc::clone(&owner.effective_grants),
                         cancel,
                         rss_exceeded,
                         control,
@@ -498,7 +516,7 @@ mod owner_tests {
     #[tokio::test]
     async fn lost_reaping_proof_keeps_the_actual_lease_after_owner_failure() {
         let (_temp, mut snapshot) = snapshot();
-        let result = start_owner(snapshot.lease().unwrap().into(), u64::MAX, |owner| {
+        fn lose_reaping_proof(owner: &mut ExecutionOwner) -> Result<Child> {
             let child = Command::new("/usr/bin/true").spawn()?;
             let pid = child.id();
             owner.child = Some(child);
@@ -508,9 +526,37 @@ mod owner_tests {
                 pid as i32
             );
             panic!("injected owner panic after loss of exclusive reaping");
-        });
+        }
+        let result = start_owner(
+            snapshot.lease().unwrap().into(),
+            u64::MAX,
+            lose_reaping_proof,
+        );
         assert!(result.is_err());
+        let grants = snapshot.effective_grants();
+        assert_eq!(grants.len(), 1);
+        assert!(!grants[0].is_quiescent());
+        let candidate = _temp.path().canonicalize().unwrap().join("candidate");
+        std::fs::create_dir(&candidate).unwrap();
+        assert!(snapshot
+            .append_roots_checked(&[candidate], |source, working| {
+                grants[0].check_root_addition(source, working)
+            })
+            .is_err());
         assert!(snapshot.seal().is_err());
+        let worker =
+            WorkerScope::prepare(&_temp.path().canonicalize().unwrap().join("storage")).unwrap();
+        let observer = worker.clone();
+        assert!(start_owner(worker.into(), u64::MAX, lose_reaping_proof).is_err());
+        let worker_grants = observer.effective_grants();
+        assert_eq!(worker_grants.len(), 1);
+        assert!(!worker_grants[0].is_quiescent());
+        assert!(worker_grants[0]
+            .check_root_addition(
+                &_temp.path().canonicalize().unwrap(),
+                &_temp.path().canonicalize().unwrap()
+            )
+            .is_err());
     }
 
     #[cfg(target_os = "linux")]
@@ -988,55 +1034,63 @@ pub fn spawn_isolated(
     {
         let request = request.clone();
         return start_owner(scope, request.max_memory_bytes, move |owner| {
-            crate::windows_isolated::spawn(owner.scope.as_ref().unwrap(), &request)
+            crate::windows_isolated::spawn(
+                owner.scope.as_ref().unwrap(),
+                &request,
+                &owner.effective_grants,
+            )
         });
     }
     #[cfg(unix)]
     {
-        #[cfg(target_os = "linux")]
-        let mut command = unix_command(&scope, request, &runtime_bindings)?;
-        #[cfg(not(target_os = "linux"))]
-        let mut command = unix_command(&scope, request)?;
-        command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .env_clear()
-            .envs(request.env.iter().cloned())
-            .process_group(0);
+        let request = request.clone();
         let memory = request.max_memory_bytes;
-        unsafe {
-            command.pre_exec(move || {
-                #[cfg(target_os = "linux")]
-                let memory = libc::rlimit {
-                    rlim_cur: memory as libc::rlim_t,
-                    rlim_max: memory as libc::rlim_t,
-                };
-                #[cfg(target_os = "linux")]
-                if libc::setrlimit(libc::RLIMIT_AS, &memory) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                #[cfg(target_os = "linux")]
-                {
-                    if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                }
-                #[cfg(target_os = "macos")]
-                let _ = memory;
-                Ok(())
-            });
-        }
         #[cfg(target_os = "linux")]
         let parent = request.linux_cgroup_parent.clone()
             .context("Linux isolated execution requires linux_cgroup_parent in a delegated cgroup v2 subtree")?;
-        start_owner(scope, memory, move |_owner| {
+        start_owner(scope, memory, move |owner| {
+            let scope = owner.scope.as_ref().unwrap();
+            #[cfg(target_os = "linux")]
+            let mut command =
+                unix_command(scope, &request, &runtime_bindings, &owner.effective_grants)?;
+            #[cfg(not(target_os = "linux"))]
+            let mut command = unix_command(scope, &request, &owner.effective_grants)?;
+            command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .env_clear()
+                .envs(request.env.iter().cloned())
+                .process_group(0);
+            unsafe {
+                command.pre_exec(move || {
+                    #[cfg(target_os = "linux")]
+                    let memory = libc::rlimit {
+                        rlim_cur: memory as libc::rlim_t,
+                        rlim_max: memory as libc::rlim_t,
+                    };
+                    #[cfg(target_os = "linux")]
+                    if libc::setrlimit(libc::RLIMIT_AS, &memory) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    #[cfg(target_os = "linux")]
+                    {
+                        if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    }
+                    #[cfg(target_os = "macos")]
+                    let _ = memory;
+                    Ok(())
+                });
+            }
             #[cfg(target_os = "linux")]
             {
-                _owner.cgroup = Some(crate::linux_cgroup::Cgroup::create(&parent)?);
-                let join = _owner.cgroup.as_ref().unwrap().join_file()?;
+                owner.cgroup = Some(crate::linux_cgroup::Cgroup::create(&parent)?);
+                let join = owner.cgroup.as_ref().unwrap().join_file()?;
                 crate::linux_cgroup::attach(&mut command, join);
             }
+            owner.effective_grants.ready();
             command.spawn().context("start isolated process")
         })
     }
@@ -1286,7 +1340,11 @@ fn validate_linux_runtime_binding(
 }
 
 #[cfg(target_os = "macos")]
-fn unix_command(scope: &ExecutionScope, request: &IsolatedSpawn) -> Result<Command> {
+fn unix_command(
+    scope: &ExecutionScope,
+    request: &IsolatedSpawn,
+    grants: &crate::EffectiveOsGrants,
+) -> Result<Command> {
     if !crate::mac_sandbox_exec::sandbox_exec_on_path() {
         bail!("sandbox-exec is required; no unconfined fallback");
     }
@@ -1310,16 +1368,19 @@ fn unix_command(scope: &ExecutionScope, request: &IsolatedSpawn) -> Result<Comma
     let mut profile = String::from("(version 1)(deny default)(allow process-exec)(deny process-fork)(allow signal (target self))(allow sysctl-read)(allow file-read-metadata)(allow file-read-data (literal \"/dev/urandom\") (literal \"/dev/random\"))(allow file-read* file-write-data (literal \"/dev/null\"))");
     // dyld inspects the root directory while locating its shared cache.
     profile.push_str("(allow file-read-data (literal \"/\"))");
+    grants.seatbelt_implicit()?;
     profile.push_str(&format!(
         "(allow file-read* (literal {}))",
         quote(&request.executable)?
     ));
+    grants.allow(&request.executable, None, "Seatbelt literal read")?;
     for path in &request.read_only {
         profile.push_str(&format!(
             "(allow file-read* ({} {}))",
             if path.is_dir() { "subpath" } else { "literal" },
             quote(path)?
         ));
+        grants.allow(path, None, "Seatbelt runtime read")?;
     }
     let cwd = scope.cwd(request)?;
     if request.kind == ExecutionKind::Tool {
@@ -1328,13 +1389,16 @@ fn unix_command(scope: &ExecutionScope, request: &IsolatedSpawn) -> Result<Comma
                 "(allow file-read* file-write* (subpath {}))",
                 quote(&root)?
             ));
+            grants.allow(&root, None, "Seatbelt private read/write")?;
         }
     }
     for path in &request.deny_read {
         profile.push_str(&format!("(deny file-read* (subpath {}))", quote(path)?));
+        grants.deny(path, "Seatbelt read deny");
     }
     for path in &request.deny_write {
         profile.push_str(&format!("(deny file-write* (subpath {}))", quote(path)?));
+        grants.deny(path, "Seatbelt write deny");
     }
     let mut command = Command::new("/usr/bin/sandbox-exec");
     command
@@ -1351,6 +1415,7 @@ fn unix_command(
     scope: &ExecutionScope,
     request: &IsolatedSpawn,
     runtime: &[(PathBuf, PathBuf)],
+    grants: &crate::EffectiveOsGrants,
 ) -> Result<Command> {
     let backend = crate::LinuxBwrap;
     use crate::SandboxBackend;
@@ -1374,15 +1439,22 @@ fn unix_command(
     ]);
     for (source, destination) in runtime {
         command.arg("--ro-bind").arg(source).arg(destination);
+        grants.allow(source, Some(destination), "bwrap runtime ro-bind")?;
     }
     command
         .arg("--ro-bind")
         .arg(&request.executable)
         .arg(&request.executable);
+    grants.allow(
+        &request.executable,
+        Some(&request.executable),
+        "bwrap executable ro-bind",
+    )?;
     let cwd = scope.cwd(request)?;
     if request.kind == ExecutionKind::Tool {
         for path in scope.writable_roots()? {
             command.arg("--bind").arg(&path).arg(&path);
+            grants.allow(&path, Some(&path), "bwrap private read/write bind")?;
         }
     } else {
         command.arg("--dir").arg(cwd);
@@ -1394,11 +1466,14 @@ fn unix_command(
             } else {
                 command.arg("--ro-bind").arg("/dev/null").arg(path);
             }
+            grants.deny(path, "bwrap masked read deny");
         }
     }
     for path in &request.deny_write {
         if path.exists() {
             command.arg("--ro-bind").arg(path).arg(path);
+            grants.allow(path, Some(path), "bwrap write-deny ro-bind")?;
+            grants.deny(path, "bwrap write deny");
         }
     }
     command

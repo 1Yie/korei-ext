@@ -6,7 +6,7 @@ use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use anyhow::{bail, Context, Result};
 
@@ -155,6 +155,27 @@ struct Private {
     container: Option<Dir>,
     roots: RootBatch,
     active: AtomicUsize,
+    owners: Mutex<Vec<Weak<crate::EffectiveOsGrants>>>,
+}
+
+impl Private {
+    fn register_owner(&self, grants: &Arc<crate::EffectiveOsGrants>) {
+        self.owners
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Arc::downgrade(grants));
+    }
+
+    fn effective_grants(&self) -> Vec<Arc<crate::EffectiveOsGrants>> {
+        let mut owners = self.owners.lock().unwrap_or_else(|e| e.into_inner());
+        let live: Vec<_> = owners
+            .iter()
+            .filter_map(Weak::upgrade)
+            .filter(|grants| !grants.is_quiescent())
+            .collect();
+        owners.retain(|owner| owner.upgrade().is_some_and(|grants| !grants.is_quiescent()));
+        live
+    }
 }
 
 impl Drop for Private {
@@ -326,11 +347,17 @@ impl Seek for SnapshotFile {
 }
 
 /// Empty private launch directory with no workspace read/write capability.
+#[derive(Clone)]
 pub struct WorkerScope {
     private: Arc<Private>,
 }
 
 impl WorkerScope {
+    /// All retained, non-quiescent owners of this shared private scope.
+    pub fn effective_grants(&self) -> Vec<Arc<crate::EffectiveOsGrants>> {
+        self.private.effective_grants()
+    }
+
     pub fn prepare(storage_root: &Path) -> Result<Self> {
         let storage = Dir::open(storage_root)?;
         check_private(&storage)?;
@@ -340,6 +367,7 @@ impl WorkerScope {
                 container: Some(container),
                 roots: RootBatch::default(),
                 active: AtomicUsize::new(0),
+                owners: Mutex::new(Vec::new()),
             }),
         })
     }
@@ -355,6 +383,10 @@ impl WorkerScope {
         }
         Ok(&dir.path)
     }
+
+    pub(crate) fn register_owner(&self, grants: &Arc<crate::EffectiveOsGrants>) {
+        self.private.register_owner(grants);
+    }
 }
 
 impl Drop for SnapshotLease {
@@ -364,6 +396,10 @@ impl Drop for SnapshotLease {
 }
 
 impl SnapshotLease {
+    pub(crate) fn register_owner(&self, grants: &Arc<crate::EffectiveOsGrants>) {
+        self.private.register_owner(grants);
+    }
+
     fn dir(&self, root: RootId) -> Result<&Dir> {
         let working = &self.root(root)?.working;
         let container = self
@@ -773,6 +809,7 @@ fn prepare_batch(
         container: Some(container),
         roots: RootBatch::default(),
         active: AtomicUsize::new(0),
+        owners: Mutex::new(Vec::new()),
     };
     for (offset, source) in sources.into_iter().enumerate() {
         let index = first_index
@@ -853,6 +890,16 @@ impl WorkspaceSnapshot {
     /// Append disjoint roots without widening existing leases. The Host must
     /// exclude overlap with every running owner's fixed OS read grants first.
     pub fn append_roots(&mut self, source_roots: &[PathBuf]) -> Result<Vec<RootId>> {
+        self.append_roots_checked(source_roots, |_, _| Ok(()))
+    }
+
+    /// Check each pinned candidate pair before committing the entire root batch.
+    /// The Host serializes owner startup and root admission around this call.
+    pub fn append_roots_checked(
+        &mut self,
+        source_roots: &[PathBuf],
+        mut check: impl FnMut(&Path, &Path) -> Result<()>,
+    ) -> Result<Vec<RootId>> {
         if self.state != SnapshotState::Prepared || source_roots.is_empty() {
             bail!("appending roots requires a prepared snapshot and nonempty roots");
         }
@@ -900,6 +947,19 @@ impl WorkspaceSnapshot {
             self.preference,
             &mut stats,
         )?;
+        for root in prepared.roots.iter() {
+            if Dir::open(&root.source.path)?.identity()? != root.identity
+                || Dir::open(&root.working.path)?.identity()? != root.working.identity()?
+            {
+                bail!("candidate root identity changed before admission");
+            }
+            check(&root.source.path, &root.working.path)?;
+            if Dir::open(&root.source.path)?.identity()? != root.identity
+                || Dir::open(&root.working.path)?.identity()? != root.working.identity()?
+            {
+                bail!("candidate root identity changed during admission");
+            }
+        }
         let mut tail = &self.private.roots;
         while let Some(next) = tail.next.get() {
             tail = next;
@@ -918,6 +978,11 @@ impl WorkspaceSnapshot {
     }
     pub fn stats(&self) -> SnapshotStats {
         self.stats
+    }
+
+    /// All retained, non-quiescent owners, including failed startup owners.
+    pub fn effective_grants(&self) -> Vec<Arc<crate::EffectiveOsGrants>> {
+        self.private.effective_grants()
     }
 
     pub fn lease(&self) -> Result<SnapshotLease> {
@@ -1628,7 +1693,7 @@ mod ignore_config_tests {
 }
 
 #[cfg(unix)]
-fn file_identity(f: &File) -> Result<(u64, u64)> {
+pub(crate) fn file_identity(f: &File) -> Result<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;
     let m = f.metadata()?;
     Ok((m.dev(), m.ino()))
@@ -1655,7 +1720,7 @@ fn check_private(dir: &Dir) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn file_identity(f: &File) -> Result<(u64, u64)> {
+pub(crate) fn file_identity(f: &File) -> Result<(u64, u64)> {
     Ok(crate::snapshot_fs::file_identity(f)?)
 }
 #[cfg(windows)]

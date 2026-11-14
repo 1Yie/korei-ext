@@ -166,35 +166,59 @@ impl BgRegistry {
         self.jobs_matching(|job| job.workspace_view.as_deref() == Some(workspace_view))
     }
 
+    /// Job display data and the actual owner facts, including failed cleanup.
+    pub fn jobs_with_grants_for_view(
+        &self,
+        workspace_view: &Path,
+    ) -> Vec<(BgJobInfo, Option<Arc<agent_sandbox::EffectiveOsGrants>>)> {
+        self.jobs_matching_with_grants(|job| job.workspace_view.as_deref() == Some(workspace_view))
+    }
+
     fn jobs_matching(&self, matches: impl Fn(&Job) -> bool) -> Vec<BgJobInfo> {
-        let mut jobs: Vec<BgJobInfo> = lock(&self.map)
+        self.jobs_matching_with_grants(matches)
+            .into_iter()
+            .map(|(info, _)| info)
+            .collect()
+    }
+
+    fn jobs_matching_with_grants(
+        &self,
+        matches: impl Fn(&Job) -> bool,
+    ) -> Vec<(BgJobInfo, Option<Arc<agent_sandbox::EffectiveOsGrants>>)> {
+        let mut jobs: Vec<_> = lock(&self.map)
             .iter()
             .filter(|(_, job)| matches(job))
-            .map(|(id, job)| BgJobInfo {
-                id: id.clone(),
-                command: job.command.clone(),
-                state: match &job.state {
-                    JobState::Running => BgJobState::Running,
-                    JobState::Paused => BgJobState::Paused,
-                    JobState::Done(label, reason) => BgJobState::Done {
-                        label: label.clone(),
-                        code: exit_code(label),
-                        reason: *reason,
+            .map(|(id, job)| {
+                (
+                    BgJobInfo {
+                        id: id.clone(),
+                        command: job.command.clone(),
+                        state: match &job.state {
+                            JobState::Running => BgJobState::Running,
+                            JobState::Paused => BgJobState::Paused,
+                            JobState::Done(label, reason) => BgJobState::Done {
+                                label: label.clone(),
+                                code: exit_code(label),
+                                reason: *reason,
+                            },
+                        },
+                        started_at_ms: job
+                            .started_wall
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0),
+                        elapsed_ms: elapsed_of(job).as_millis() as u64,
+                        notify: job.notify,
+                        has_own_sink: job.notifier.is_some(),
                     },
-                },
-                started_at_ms: job
-                    .started_wall
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0),
-                elapsed_ms: elapsed_of(job).as_millis() as u64,
-                notify: job.notify,
-                has_own_sink: job.notifier.is_some(),
+                    job.effective_grants.clone(),
+                )
             })
             .collect();
         // `bg-10` after `bg-9`: the map's string order would not say so.
         jobs.sort_by_key(|j| {
-            j.id.trim_start_matches("bg-")
+            j.0.id
+                .trim_start_matches("bg-")
                 .parse::<u64>()
                 .unwrap_or(u64::MAX)
         });
@@ -297,6 +321,7 @@ enum Ctl {
 struct Job {
     command: String,
     workspace_view: Option<PathBuf>,
+    effective_grants: Option<Arc<agent_sandbox::EffectiveOsGrants>>,
     /// `None` once the job was reaped — or removed. Never signal a stale pid.
     pid: Option<u32>,
     control: Option<ProcessControl>,
@@ -321,6 +346,14 @@ struct Job {
     ctl: mpsc::UnboundedSender<Ctl>,
     /// The notifier of the context that started the job (`None` = silent).
     notifier: Option<Notifier>,
+}
+
+impl Job {
+    fn cleanup_pending(&self) -> bool {
+        self.effective_grants
+            .as_ref()
+            .is_some_and(|grants| !grants.is_quiescent())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -741,6 +774,7 @@ where
     let job = Job {
         command: command.to_string(),
         workspace_view,
+        effective_grants: child.effective_grants(),
         pid,
         control: Some(control),
         log_path: log_path.clone(),
@@ -942,6 +976,11 @@ async fn kill(reg: &BgRegistry, parsed: &BgArgs, by: Requester) -> Result<ToolRe
         let mut map = lock(&reg.map);
         let job = map.get_mut(&id).ok_or_else(|| no_job(&id))?;
         if job.state.is_done() {
+            if job.cleanup_pending() {
+                return Err(ToolError::Failed(format!(
+                    "{id} owner cleanup is unconfirmed; its OS grants remain active"
+                )));
+            }
             return Ok(ToolResult::text(format!(
                 "{id} already finished: {}",
                 job.state.label()
@@ -1032,6 +1071,9 @@ fn remove(reg: &BgRegistry, parsed: &BgArgs) -> Result<ToolResult, ToolError> {
             "{id} is still {} — kill it first",
             job.state.label()
         )));
+    }
+    if job.cleanup_pending() {
+        return Err(ToolError::Failed(format!("{id} owner cleanup is unconfirmed; keep this job visible until its OS grants are quiescent")));
     }
     let log_path = job.log_path.clone();
     if let Some(job) = map.remove(&id) {
@@ -1943,6 +1985,7 @@ mod tests {
         let job = Job {
             command: "cargo test".into(),
             workspace_view: None,
+            effective_grants: None,
             pid: None,
             control: None,
             log_path: PathBuf::from("/tmp/x.log"),
@@ -1960,6 +2003,120 @@ mod tests {
             notifier: None,
         };
         assert_eq!(elapsed_of(&job), Duration::from_secs(6));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn done_error_retains_live_grants_and_rejected_append_preserves_edits() {
+        use agent_sandbox::snapshot::{SnapshotBudget, SnapshotPreference, WorkspaceSnapshot};
+        use agent_sandbox::spawn::{
+            spawn_isolated, ExecutionKind, IsolatedSpawn, MemoryEnforcement,
+        };
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let source = base.join("source");
+        let added = base.join("added");
+        let storage = base.join("storage");
+        for path in [&source, &added, &storage] {
+            std::fs::create_dir(path).unwrap();
+        }
+        std::fs::set_permissions(&storage, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(source.join("file"), b"original").unwrap();
+        let mut view = WorkspaceSnapshot::prepare(
+            &[source.clone()],
+            &storage,
+            SnapshotBudget {
+                max_bytes: 4096,
+                max_entries: 32,
+                max_depth: 4,
+            },
+            SnapshotPreference::PrivateCopy,
+        )
+        .unwrap();
+        let lease = view.lease().unwrap();
+        let root = lease.roots().next().unwrap();
+        let working = lease.working_root(root).unwrap().to_owned();
+        std::fs::write(working.join("file"), b"private edit").unwrap();
+        let mut child = spawn_isolated(
+            view.lease().unwrap(),
+            &IsolatedSpawn {
+                executable: "/bin/sh".into(),
+                linux_launcher: None,
+                linux_cgroup_parent: None,
+                args: vec!["-c".into(), "read value".into()],
+                root: Some(root),
+                kind: ExecutionKind::Tool,
+                read_only: vec!["/usr/lib".into(), "/System/Library".into(), added.clone()],
+                deny_read: vec![],
+                deny_write: vec![],
+                env: vec![],
+                max_memory_bytes: 512 * 1024 * 1024,
+                max_processes: 1,
+                memory_enforcement: MemoryEnforcement::MonitoredRss,
+                tool_policy: Some(agent_sandbox::SandboxConfig {
+                    workspace_dir: source.clone(),
+                    ..Default::default()
+                }),
+            },
+        )
+        .unwrap();
+        let grants = child.effective_grants().unwrap();
+        let (ctl, _rx) = mpsc::unbounded_channel();
+        let (done, _) = watch::channel(true);
+        let reg = BgRegistry::default();
+        lock(&reg.map).insert(
+            "bg-1".into(),
+            Job {
+                command: "read value".into(),
+                workspace_view: Some(working.clone()),
+                effective_grants: Some(grants.clone()),
+                pid: None,
+                control: None,
+                log_path: base.join("job.log"),
+                state: JobState::Done("wait failed".into(), BgEndReason::Error),
+                started: Instant::now(),
+                started_wall: SystemTime::now(),
+                paused_at: None,
+                paused_total: Duration::ZERO,
+                finished: Some(Instant::now()),
+                notify: false,
+                killed_by_user: false,
+                waiters: 0,
+                done,
+                ctl,
+                notifier: None,
+            },
+        );
+        let args: BgArgs =
+            serde_json::from_value(serde_json::json!({"action":"remove","id":"bg-1"})).unwrap();
+        assert!(remove(&reg, &args).is_err());
+        let retained = reg.jobs_with_grants_for_view(&working);
+        assert_eq!(retained.len(), 1);
+        assert!(Arc::ptr_eq(retained[0].1.as_ref().unwrap(), &grants));
+        assert!(!grants.is_quiescent());
+        let stats = view.stats();
+        let error = view
+            .append_roots_checked(&[added.clone()], |source, working| {
+                grants.check_root_addition(source, working)
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("conflicts"));
+        assert_eq!(view.stats(), stats);
+        assert_eq!(view.lease().unwrap().roots().count(), 1);
+        assert_eq!(
+            std::fs::read(working.join("file")).unwrap(),
+            b"private edit"
+        );
+        child.kill().await.unwrap();
+        assert!(grants.is_quiescent());
+        remove(&reg, &args).unwrap();
+        let new = view
+            .append_roots_checked(&[added], |source, working| {
+                grants.check_root_addition(source, working)
+            })
+            .unwrap();
+        assert!(lease.working_root(new[0]).is_err());
     }
 
     #[test]

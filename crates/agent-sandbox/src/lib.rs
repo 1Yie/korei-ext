@@ -115,6 +115,8 @@ pub mod shell_ast;
 /// Capability IR + extractor — `shell_ast` → `Vec<Capability>` + `RiskLevel`.
 pub mod capability;
 
+mod effective_grants;
 /// SandboxPlan — the OS-portable restriction set policy hands to a backend.
 pub mod plan;
 pub mod process;
+pub use effective_grants::EffectiveOsGrants;
