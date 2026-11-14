@@ -121,6 +121,8 @@ impl Drop for PendingRequest<'_> {
 /// network, and without a Python environment.
 #[async_trait::async_trait]
 pub trait McpBridge: Send + Sync {
+    /// Stop request admission and confirm process and stdio cleanup.
+    async fn shutdown(&self) -> Result<(), ToolError>;
     /// `tools/call` — flattened text content.
     async fn call(&self, tool: &str, arguments: Value) -> Result<String, ToolError>;
     /// `tools/list`.
@@ -576,6 +578,10 @@ impl Drop for SerenaBridge {
 
 #[async_trait::async_trait]
 impl McpBridge for SerenaBridge {
+    async fn shutdown(&self) -> Result<(), ToolError> {
+        SerenaBridge::shutdown(self).await
+    }
+
     async fn call(&self, tool: &str, arguments: Value) -> Result<String, ToolError> {
         let id = self.req_id.fetch_add(1, Ordering::Relaxed);
         let body = json!({

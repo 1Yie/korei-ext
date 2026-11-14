@@ -11,7 +11,7 @@ use futures::FutureExt;
 use serde_json::json;
 
 use super::catalog::DETAIL_ACTION;
-use super::manager::{manager_for, registry, SerenaRegistry};
+use super::manager::{manager_for, registry, SerenaRegistry, SerenaStatus};
 use agent_capabilities::{SandboxCtx, WorkspaceCtx};
 use agent_tool::{schema_for, ExecFn, ToolClass, ToolError, ToolResult, ToolSpec};
 
@@ -20,7 +20,8 @@ use agent_tool::{schema_for, ExecFn, ToolClass, ToolError, ToolResult, ToolSpec}
 struct SerenaCallArgs {
     /// The Serena tool name (e.g. `find_symbol`, `read_file`,
     /// `replace_symbol_body`, `search_for_pattern`, `list_dir`), or
-    /// `serena_list_tools` to discover them.
+    /// `serena_list_tools` to discover them, `serena_status` to inspect the
+    /// server without starting it, or `serena_stop` to stop it and wait for cleanup.
     tool: String,
     /// The tool's arguments as a JSON object. For `serena_list_tools`, pass
     /// `{"name": "<tool>"}` to print that tool's full JSON Schema.
@@ -33,10 +34,9 @@ async fn drop_bridge<C: WorkspaceCtx>(
     session: Option<&Arc<SerenaRegistry>>,
 ) -> Result<(), ToolError> {
     if let Some(session) = session {
-        session.invalidate(ctx).await
+        session.stop(ctx).await
     } else {
-        manager_for(root).invalidate(root).await;
-        Ok(())
+        manager_for(root).stop(root).await
     }
 }
 
@@ -52,7 +52,7 @@ where
             }
         };
         // Unprepared calls share one server per workspace root. Prepared calls
-        // use that session's registry, keyed by its lease and authorization.
+        // use that session's registry, keyed by its private project and authorization.
         async move {
             let root = ctx.root()?.to_path_buf();
             let prepared = ctx.workspace_lease().is_some();
@@ -61,6 +61,30 @@ where
             } else {
                 None
             };
+
+            if a.tool == "serena_status" {
+                let status = if let Some(session) = &session {
+                    session.status(&*ctx).await?
+                } else {
+                    manager_for(&root).status(&root).await
+                };
+                let status = match status {
+                    SerenaStatus::Stopped => "stopped",
+                    SerenaStatus::Running => "running",
+                    SerenaStatus::CleanupPending => "cleanup pending; use serena_stop",
+                };
+                return Ok(ToolResult::text(format!("serena: {status}")));
+            }
+            if a.tool == "serena_stop" {
+                if let Some(session) = &session {
+                    session.stop(&*ctx).await?;
+                } else {
+                    manager_for(&root).stop(&root).await?;
+                }
+                return Ok(ToolResult::text(
+                    "serena stopped; process and stdio cleanup confirmed",
+                ));
+            }
 
             // Discovery is a bridge concern, not a Serena tool.
             if a.tool == DETAIL_ACTION || a.tool == "list_tools" {
@@ -130,7 +154,10 @@ where
              name and `arguments` = its JSON args. Call with\n\
              `tool: \"serena_list_tools\"` to discover the tools with their\n\
              argument names (add `arguments: {\"name\": \"<tool>\"}` for one\n\
-             tool's full JSON Schema).",
+             tool's full JSON Schema). Use `tool: \"serena_status\"` to inspect\n\
+             the server without starting it, or `tool: \"serena_stop\"` to stop\n\
+             it and wait for process and stdio cleanup. A later semantic call\n\
+             starts a new server.",
         ),
         // Serena's suite writes files — keep the permission gate on it.
         readonly: false,

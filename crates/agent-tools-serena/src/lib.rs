@@ -7,12 +7,12 @@
 //! The meta-tool is generic over the tool context, so this crate names no
 //! kernel type: the kernel depends on it, not the other way round. Unprepared
 //! calls share one server per workspace root. Prepared calls require
-//! [`manager::install_registry`] and keep one server per live lease and
+//! [`manager::install_registry`] and keep one server per private project and
 //! authorization.
 //!
 //! ```text
 //! unprepared workspace → SerenaManager (one slot per root)
-//! prepared session     → SerenaRegistry (one slot per lease and authorization)
+//! prepared session     → SerenaRegistry (one slot per private project and authorization)
 //!                          └── SerenaBridge       — child process + JSON-RPC plumbing
 //!                          └── SerenaToolCatalog  — cached `tools/list`
 //! ```
@@ -20,6 +20,8 @@
 //! A missing `uvx`/serena or a failed start fails only that call and carries the
 //! child's stderr tail; a dead child is replaced on the next call. Bootstrap
 //! (`uvx --from git+…`) needs network — `network: false` describes execution.
+//! `serena_status` inspects without starting a server; `serena_stop` waits for
+//! process and stdio cleanup.
 
 pub mod bridge;
 pub mod catalog;
@@ -30,7 +32,7 @@ pub use bridge::{BridgeFactory, McpBridge, SerenaBridge, SerenaLaunch, SerenaToo
 pub use catalog::SerenaToolCatalog;
 pub use manager::{
     install_registry, manager_for, registry, shutdown, SerenaManager, SerenaRegistry,
-    SerenaRegistrySlot,
+    SerenaRegistrySlot, SerenaStatus,
 };
 
 use agent_capabilities::{SandboxCtx, WorkspaceCtx};
