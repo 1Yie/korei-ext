@@ -931,6 +931,18 @@ impl WorkspaceSnapshot {
         })
     }
 
+    /// Return `None` while capability leases remain; validate and seal otherwise.
+    /// The Host must stop admission before attempting publication.
+    pub fn try_seal(&mut self) -> Result<Option<&[SnapshotChange]>> {
+        if self.state != SnapshotState::Prepared {
+            bail!("snapshot is not prepared");
+        }
+        if self.private.active.load(Ordering::Acquire) != 0 {
+            return Ok(None);
+        }
+        self.seal().map(Some)
+    }
+
     /// Host must first stop admission and quiesce all capability users. Active
     /// process guards and leases make an early seal fail closed.
     pub fn seal(&mut self) -> Result<&[SnapshotChange]> {
