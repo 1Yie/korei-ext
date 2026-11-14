@@ -99,9 +99,7 @@ fn open_at_inner(
     sharing: u32,
     config_link: bool,
 ) -> io::Result<File> {
-    if name != Path::new(".") {
-        relative(name)?;
-    }
+    relative(name)?;
     if name.components().count() != 1 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -466,15 +464,18 @@ impl Dir {
                     FILE_SHARE_READ | FILE_SHARE_WRITE,
                 )
             }
-            None => open_at(
-                &self.file,
-                Path::new("."),
-                READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES,
-                1,
-                true,
-                std::ptr::null_mut(),
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-            ),
+            None => {
+                // Ancestor handles pin this path against rename and replacement.
+                let file = OpenOptions::new()
+                    .access_mode(READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES)
+                    .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                    .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+                    .open(&self.path)?;
+                if file_identity(&file)? != self.identity()? {
+                    return Err(io::Error::other("ACL directory identity changed"));
+                }
+                Ok(file)
+            }
         }
     }
     pub fn write(&self, path: &Path) -> io::Result<File> {
@@ -862,6 +863,23 @@ mod tests {
         let _ = pinned.create(Path::new("must-not-escape"));
         assert!(!outside.join("must-not-escape").exists());
         assert_eq!(std::fs::read(outside.join("host-file")).unwrap(), b"host");
+    }
+
+    #[test]
+    fn directory_acl_handle_preserves_pinned_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("private");
+        crate::windows_acl::create_private_directory(&source).unwrap();
+        let root = Dir::open(&source).unwrap();
+        let child = root.mkdir(Path::new("child")).unwrap();
+        for directory in [&root, &child] {
+            let handle = directory.acl_handle(None).unwrap();
+            assert_eq!(
+                file_identity(&handle).unwrap(),
+                directory.identity().unwrap()
+            );
+            crate::windows_acl::check_private(&handle).unwrap();
+        }
     }
 
     #[test]

@@ -378,32 +378,14 @@ pub(crate) fn spawn(
     }
     let profile = Profile::create()?;
     let mut grants = Vec::new();
-    // The private parent DACL does not include the AppContainer. Without
-    // traverse there, CreateProcessW reports the working directory as an
-    // invalid name. Traverse does not include write or create.
-    if let Some(parent) = cwd.parent() {
-        grants.push(AclGrant::entry(
-            acl_file(parent)?,
-            profile.sid,
-            FILE_GENERIC_EXECUTE,
-            GRANT_ACCESS,
-            true,
-        )?);
-    }
-    grants.push(AclGrant::entry(
-        acl_file(&cwd)?,
-        profile.sid,
-        FILE_GENERIC_EXECUTE,
-        GRANT_ACCESS,
-        true,
-    )?);
     grant_tree(
         &directory.path,
         profile.sid,
         FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
         GRANT_ACCESS,
         &mut grants,
-    )?;
+    )
+    .context("grant AppContainer runtime access")?;
     if request.kind == ExecutionKind::Tool {
         for root in scope.writable_roots()? {
             grant_tree(
