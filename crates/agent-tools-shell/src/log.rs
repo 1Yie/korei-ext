@@ -10,11 +10,31 @@
 //! a symlink planted at its path.
 
 use std::collections::BTreeMap;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 
 use agent_tool::ToolError;
+use tokio::io::AsyncReadExt;
+
+pub(crate) fn pump(
+    mut pipe: agent_sandbox::process::ProcessOutput,
+    mut log: std::fs::File,
+    lease: Option<std::sync::Arc<agent_sandbox::snapshot::SnapshotLease>>,
+) -> tokio::task::JoinHandle<std::io::Result<()>> {
+    tokio::spawn(async move {
+        let _lease = lease;
+        let mut buffer = [0; 8192];
+        loop {
+            let read = pipe.read(&mut buffer).await?;
+            if read == 0 {
+                return log.flush();
+            }
+            // A synchronous append cannot outlive this task's lease on cancellation.
+            log.write_all(&buffer[..read])?;
+        }
+    })
+}
 
 /// Cap on one tail read — a job can write unbounded output.
 pub(crate) const MAX_LOG_BYTES: u64 = 256 * 1024;

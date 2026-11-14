@@ -45,6 +45,12 @@ lease through their synchronous file appends; a completed process remains
 cancellation and reports success after process and log cleanup. Registry teardown
 requests process cancellation without retaining a context/registry reference cycle.
 
+Background jobs use the same owner and lease-retaining log pump. Their session
+registry carries a pause control capability rather than issuing signals from
+cached PIDs. Completion notifications follow owner completion and log draining;
+unconfirmed cleanup is reported as an error. A prepared job requires its
+session's job registry.
+
 `ManagedChild::control` retains a pause capability tied to its actual owner.
 Native process control is synchronized with reaping. Linux isolated control uses
 pinned `cgroup.freeze` and `cgroup.events` descriptors; macOS confirms the single

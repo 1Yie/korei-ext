@@ -7,8 +7,8 @@
 //! exposes one tool with actions
 //! `run | list | status | logs | wait | kill | pause | resume | remove`.
 //!
-//! Containment matches `bash`/`service`: the spawn goes through the sandbox's
-//! `wrap_spawn`, so fs/network/env limits and die-with-parent are unchanged.
+//! Containment matches `bash`/`service`: the context supplies the native or
+//! lease-bound process owner, which remains live through cleanup and log draining.
 //! The completion notice goes only to the context that started the job — a
 //! delegated child shares the registry (so the parent can see and stop its
 //! jobs) but inherits no notifier, so a child's job never reports into the
@@ -16,7 +16,6 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -26,6 +25,7 @@ use tokio::sync::{mpsc, watch};
 
 use crate::log::{create_log, log_dir, read_tail, DEFAULT_TAIL_LINES};
 use agent_capabilities::{SandboxCtx, WorkspaceCtx};
+use agent_sandbox::process::{ManagedChild, ProcessControl};
 use agent_tool::{
     schema_for, Args, CallRisk, Review, ToolContext, ToolError, ToolResult, ToolSpec,
 };
@@ -241,13 +241,8 @@ impl Drop for BgRegistry {
             .get_mut()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         for job in map.values_mut() {
-            // The ctl channel makes the monitor kill and reap its own child.
-            // Only a live job has a pid: a reaped pid may already belong to an
-            // unrelated process by now, and signalling it would be murder.
+            // The monitor retains its actual child through kill and cleanup.
             let _ = job.ctl.send(Ctl::Kill);
-            if let Some(pid) = job.pid {
-                signal_tree(pid, SIGKILL);
-            }
             // The job is gone with the session; its output should not linger
             // in /tmp until the system prunes it.
             let _ = std::fs::remove_file(&job.log_path);
@@ -293,6 +288,7 @@ struct Job {
     command: String,
     /// `None` once the job was reaped — or removed. Never signal a stale pid.
     pid: Option<u32>,
+    control: Option<ProcessControl>,
     log_path: PathBuf,
     state: JobState,
     started: Instant,
@@ -498,9 +494,9 @@ fn with_job<T>(reg: &BgRegistry, id: &str, f: impl FnOnce(&Job) -> T) -> Result<
 fn spawn_monitor(
     reg: Weak<BgRegistry>,
     id: String,
-    mut child: tokio::process::Child,
+    mut child: ManagedChild,
     mut ctl: mpsc::UnboundedReceiver<Ctl>,
-    pid: Option<u32>,
+    mut readers: Vec<tokio::task::JoinHandle<std::io::Result<()>>>,
     log_path: PathBuf,
     mut deadline: Option<Instant>,
 ) {
@@ -523,30 +519,58 @@ fn spawn_monitor(
                 Step::Exited(Err(e)) => break (format!("status error: {e}"), None),
                 Step::Ctl(Some(Ctl::Kill)) => {
                     kill_asked = true;
-                    kill_now(pid, &mut child);
+                    kill_now(&mut child);
                 }
                 // The registry is going away; make sure the child follows it.
                 Step::Ctl(None) => {
                     ctl_closed = true;
                     kill_asked = true;
-                    kill_now(pid, &mut child);
+                    kill_now(&mut child);
                 }
                 Step::Deadline => {
                     deadline = None;
                     timed_out = true;
-                    kill_now(pid, &mut child);
+                    kill_now(&mut child);
                 }
                 Step::LogTick => {
                     if !log_capped && log_size(&log_path) > MAX_LOG_ON_DISK {
                         log_capped = true;
-                        kill_now(pid, &mut child);
+                        kill_now(&mut child);
                     }
                 }
             }
         };
+        if let Some(reg) = reg.upgrade() {
+            if let Some(job) = lock(&reg.map).get_mut(&id) {
+                job.pid = None;
+                job.control = None;
+            }
+        }
+        let drain = if signaled.is_some() {
+            tokio::time::timeout(KILL_WAIT, async {
+                let mut first_error = None;
+                while let Some(reader) = readers.last_mut() {
+                    let result = reader.await;
+                    readers.pop();
+                    if let Err(error) = result
+                        .map_err(|error| format!("log task: {error}"))
+                        .and_then(|result| result.map_err(|error| format!("log write: {error}")))
+                    {
+                        first_error.get_or_insert(error);
+                    }
+                }
+                first_error.map_or(Ok(()), Err)
+            })
+            .await
+            .unwrap_or_else(|_| Err("log cleanup is still pending".into()))
+        } else {
+            Err(label.clone())
+        };
         // Our own kills first: the child of a killed job usually reports a
         // signal, and that signal is ours, not a crash.
-        let (label, reason) = if log_capped {
+        let (label, reason) = if let Err(error) = drain {
+            (format!("cleanup error: {error}"), BgEndReason::Error)
+        } else if log_capped {
             (
                 format!("killed(log over {} MiB)", MAX_LOG_ON_DISK / (1024 * 1024)),
                 BgEndReason::LogCap,
@@ -587,10 +611,7 @@ async fn until(deadline: Option<Instant>) {
     }
 }
 
-fn kill_now(pid: Option<u32>, child: &mut tokio::process::Child) {
-    if let Some(pid) = pid {
-        signal_tree(pid, SIGKILL);
-    }
+fn kill_now(child: &mut ManagedChild) {
     let _ = child.start_kill();
 }
 
@@ -661,20 +682,9 @@ where
     // boundary applies before it is spawned.
     crate::sandbox_cfg::refuse_unconfined_write(&**ctx, command)?;
 
-    let sandbox = ctx.sandbox()?;
-    // `wrap_spawn` has no wall-clock timeout (only `run_command` honours the
-    // plan's), so the lifetime is enforced here by the monitor.
+    // The monitor owns this job's wall-clock deadline across tool calls.
     let (verdict, cfg) =
         crate::sandbox_cfg::prepare(&**ctx, command, Duration::from_secs(MAX_WAIT_SECS))?;
-    let mut cmd = sandbox
-        .wrap_spawn(&cfg, "/bin/sh", &["-c", command])
-        .ok_or_else(|| {
-            ToolError::Failed(format!(
-                "sandbox backend {:?} can't spawn background jobs",
-                sandbox.id()
-            ))
-        })?;
-
     let id = format!("bg-{}", NEXT_ID.fetch_add(1, Ordering::Relaxed));
     let dir = log_dir("agent-bg")?;
     let (log, log_path) = create_log(&dir, &id)?;
@@ -682,21 +692,23 @@ where
         .try_clone()
         .map_err(|e| ToolError::Failed(e.to_string()))?;
 
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::from(log))
-        .stderr(Stdio::from(log_err))
-        // The registry owns the lifetime; dropping the tool call must not
-        // kill a job that is supposed to outlive it.
-        .kill_on_drop(false);
-
     // The spawn must happen on a runtime thread that outlives the job: the
     // sandbox ties the child to its parent thread where the platform offers
     // it (Linux PR_SET_PDEATHSIG), so a short-lived worker would take the job
     // down with it.
-    let child = cmd
-        .spawn()
-        .map_err(|e| ToolError::Failed(format!("spawn background job: {e}")))?;
+    #[cfg(windows)]
+    let mut child = ctx.spawn_process(&cfg, "cmd.exe", &["/C", command])?;
+    #[cfg(not(windows))]
+    let mut child = ctx.spawn_process(&cfg, "/bin/sh", &["-c", command])?;
+    child.stdin.take();
     let pid = child.id();
+    let control = child.control();
+    let mut readers = Vec::new();
+    for (pipe, log) in [(child.stdout.take(), log), (child.stderr.take(), log_err)] {
+        if let Some(pipe) = pipe {
+            readers.push(crate::log::pump(pipe, log, ctx.workspace_lease()));
+        }
+    }
     let deadline =
         max_secs.map(|secs| Instant::now() + Duration::from_secs(secs.clamp(1, MAX_JOB_SECS)));
     let (done, _) = watch::channel(false);
@@ -704,6 +716,7 @@ where
     let job = Job {
         command: command.to_string(),
         pid,
+        control: Some(control),
         log_path: log_path.clone(),
         state: JobState::Running,
         started: Instant::now(),
@@ -725,7 +738,7 @@ where
         id.clone(),
         child,
         ctl_rx,
-        pid,
+        readers,
         log_path.clone(),
         deadline,
     );
@@ -941,56 +954,41 @@ fn pause(reg: &BgRegistry, parsed: &BgArgs, freeze: bool) -> Result<ToolResult, 
     #[cfg(unix)]
     {
         let id = need_id(parsed)?;
-        let (pid, state) = {
-            let map = lock(&reg.map);
-            let job = map.get(&id).ok_or_else(|| no_job(&id))?;
-            (job.pid, job.state.clone())
-        };
-        if state.is_done() {
+        let mut map = lock(&reg.map);
+        let job = map.get_mut(&id).ok_or_else(|| no_job(&id))?;
+        if job.state.is_done() {
             return Ok(ToolResult::text(format!(
                 "{id} already finished: {}",
-                state.label()
+                job.state.label()
             )));
         }
-        if freeze && state == JobState::Paused {
+        if freeze && job.state == JobState::Paused {
             return Ok(ToolResult::text(format!("{id} already paused")));
         }
-        if !freeze && state == JobState::Running {
+        if !freeze && job.state == JobState::Running {
             return Ok(ToolResult::text(format!("{id} is not paused")));
         }
-        let Some(pid) = pid else {
-            return Ok(ToolResult::text(format!("{id} already finished")));
-        };
-        if !signal_tree(pid, if freeze { SIGSTOP } else { SIGCONT }) {
-            return Err(ToolError::Failed(format!(
-                "could not {} {id}: process {pid} is gone",
-                if freeze { "pause" } else { "resume" }
-            )));
-        }
-        // SIGSTOP is asynchronous: report "paused" only once the tree leader
-        // is actually stopped, so the UI never lies about a job still running.
-        if freeze && !wait_stopped(pid) {
-            return Err(ToolError::Failed(format!(
-                "could not pause {id}: process {pid} did not stop"
-            )));
-        }
-        {
-            let mut map = lock(&reg.map);
-            if let Some(job) = map.get_mut(&id) {
-                if !job.state.is_done() {
-                    let now = Instant::now();
-                    job.state = if freeze {
-                        job.paused_at = Some(now);
-                        JobState::Paused
-                    } else {
-                        if let Some(paused_at) = job.paused_at.take() {
-                            job.paused_total += now.saturating_duration_since(paused_at);
-                        }
-                        JobState::Running
-                    };
-                }
+        let pid = job
+            .pid
+            .ok_or_else(|| ToolError::Failed(format!("{id} is completing cleanup")))?;
+        let control = job
+            .control
+            .as_ref()
+            .ok_or_else(|| ToolError::Failed(format!("{id} is completing cleanup")))?;
+        control
+            .set_paused(freeze)
+            .map_err(|error| ToolError::Failed(format!("{id}: {error}")))?;
+        let now = Instant::now();
+        job.state = if freeze {
+            job.paused_at = Some(now);
+            JobState::Paused
+        } else {
+            if let Some(paused_at) = job.paused_at.take() {
+                job.paused_total += now.saturating_duration_since(paused_at);
             }
-        }
+            JobState::Running
+        };
+        drop(map);
         reg.bump();
         Ok(ToolResult::text(format!(
             "{id} {} (pid {pid})",
@@ -1017,116 +1015,6 @@ fn remove(reg: &BgRegistry, parsed: &BgArgs) -> Result<ToolResult, ToolError> {
     reg.bump();
     let _ = std::fs::remove_file(&log_path);
     Ok(ToolResult::text(format!("{id} removed")))
-}
-
-#[cfg(unix)]
-const SIGKILL: i32 = libc::SIGKILL;
-#[cfg(unix)]
-const SIGSTOP: i32 = libc::SIGSTOP;
-#[cfg(unix)]
-const SIGCONT: i32 = libc::SIGCONT;
-#[cfg(not(unix))]
-const SIGKILL: i32 = 9;
-
-/// Signal every process in `pid`'s subtree.
-///
-/// Every backend spawns the child as its own process-group leader
-/// (`process_group(0)`), so a group signal is the first and cheapest sweep.
-/// Under bwrap the processes doing the work live in the sandbox's pid
-/// namespace, where their pgid is meaningless to us, so the `/proc` walk
-/// catches them; on a kernel without `CONFIG_PROC_CHILDREN` that walk finds
-/// nothing and the group signal degrades to the direct child.
-///
-/// Returns false when nothing was signalled.
-fn signal_tree(pid: u32, sig: i32) -> bool {
-    #[cfg(unix)]
-    {
-        let mut sent = false;
-        // Only reach the group when the child leads one; a negative id
-        // otherwise signals our own process group.
-        let pgid = unsafe { libc::getpgid(pid as libc::pid_t) };
-        if pgid == pid as libc::pid_t {
-            sent |= unsafe { libc::kill(-(pid as libc::pid_t), sig) == 0 };
-        }
-        #[cfg(target_os = "linux")]
-        {
-            // Detach first, so the tree is looked up before it starts dying
-            // (a dying parent re-parents its children to init).
-            for target in descendants(pid) {
-                sent |= unsafe { libc::kill(target as libc::pid_t, sig) == 0 };
-            }
-        }
-        sent |= unsafe { libc::kill(pid as libc::pid_t, sig) == 0 };
-        sent
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (pid, sig);
-        false
-    }
-}
-
-/// Breadth-first `/proc/<pid>/task/*/children` walk. The children file exists
-/// on Linux with `CONFIG_PROC_CHILDREN`; a missing entry just prunes that
-/// branch.
-#[cfg(target_os = "linux")]
-fn descendants(root: u32) -> Vec<u32> {
-    let mut out = Vec::new();
-    let mut queue = vec![root];
-    while let Some(pid) = queue.pop() {
-        let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
-            continue;
-        };
-        for task in tasks.flatten() {
-            let Ok(children) = std::fs::read_to_string(task.path().join("children")) else {
-                continue;
-            };
-            for token in children.split_whitespace() {
-                let Ok(child) = token.parse::<u32>() else {
-                    continue;
-                };
-                if child != root && !out.contains(&child) {
-                    out.push(child);
-                    queue.push(child);
-                }
-            }
-        }
-    }
-    out
-}
-
-/// Linux exposes the run state; other platforms cannot confirm a stop.
-#[cfg(target_os = "linux")]
-fn process_stopped(pid: u32) -> Option<bool> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let state = stat.rsplit_once(')')?.1.split_whitespace().next()?;
-    Some(state == "T" || state == "t")
-}
-
-#[cfg(not(target_os = "linux"))]
-fn process_stopped(_pid: u32) -> Option<bool> {
-    None
-}
-
-/// Give SIGSTOP a moment to land; `true` when the leader is stopped, or when
-/// the platform cannot tell (the signal was sent, which is all we promise).
-#[cfg(unix)]
-fn wait_stopped(pid: u32) -> bool {
-    for _ in 0..40 {
-        match process_stopped(pid) {
-            Some(true) => return true,
-            // The process is gone: the monitor is about to settle it.
-            Some(false) if !process_exists(pid) => return true,
-            Some(false) => std::thread::sleep(Duration::from_millis(5)),
-            None => return true,
-        }
-    }
-    false
-}
-
-#[cfg(unix)]
-fn process_exists(pid: u32) -> bool {
-    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
 }
 
 #[derive(
@@ -1259,6 +1147,11 @@ where
 {
     let parsed: BgArgs =
         serde_json::from_value(args).map_err(|e| ToolError::Args(format!("bg_run args: {e}")))?;
+    if ctx.workspace_lease().is_some() && ctx.service::<BgRegistrySlot>().is_none() {
+        return Err(ToolError::Failed(
+            "prepared background jobs require a session job registry".into(),
+        ));
+    }
     let action = parsed.action.unwrap_or(if parsed.command.is_some() {
         Action::Run
     } else {
@@ -2024,6 +1917,7 @@ mod tests {
         let job = Job {
             command: "cargo test".into(),
             pid: None,
+            control: None,
             log_path: PathBuf::from("/tmp/x.log"),
             state: JobState::Done("exited(0)".into(), BgEndReason::Exited),
             started: now - Duration::from_secs(10),

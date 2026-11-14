@@ -334,8 +334,153 @@ async fn prepared_services_require_a_session_registry_before_launch() {
     assert!(error
         .to_string()
         .contains("require a session service registry"));
+    let error = (agent_tools_shell::bg::spec::<Ctx>().exec)(
+        serde_json::json!({"command": "printf escaped > file"}),
+        ctx.clone(),
+    )
+    .await
+    .err()
+    .expect("prepared job must not use the process-wide default");
+    assert!(error.to_string().contains("require a session job registry"));
     drop(ctx);
     assert!(snapshot.seal().unwrap().is_empty());
+}
+
+async fn bg(ctx: &Arc<Ctx>, args: serde_json::Value) -> agent_tool::ToolResult {
+    (agent_tools_shell::bg::spec::<Ctx>().exec)(args, ctx.clone())
+        .await
+        .unwrap()
+}
+
+fn bg_id(output: &agent_tool::ToolResult) -> String {
+    output
+        .content
+        .split_whitespace()
+        .find_map(|part| part.strip_prefix("id="))
+        .unwrap()
+        .to_owned()
+}
+
+fn private_path(snapshot: &WorkspaceSnapshot, name: &str) -> std::path::PathBuf {
+    let lease = snapshot.lease().unwrap();
+    let root = lease.roots().next().unwrap();
+    lease.working_root(root).unwrap().join(name)
+}
+
+async fn wait_for_growth(path: &std::path::Path, minimum: u64) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) <= minimum {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn leased_bg_keeps_real_pause_resume_and_kill_across_calls() {
+    let (_temp, mut snapshot, mut ctx) = fixture(Arc::new(LeasedBackend));
+    let registry = agent_tools_shell::bg::install_registry(Arc::get_mut(&mut ctx).unwrap());
+    let source = ctx.root().unwrap().to_path_buf();
+    let mut control = Ctx::default().with_workspace(&source);
+    control.extensions_mut().insert_shared(
+        ctx.service::<agent_tools_shell::bg::BgRegistrySlot>()
+            .unwrap(),
+    );
+    let control = Arc::new(control);
+    let counter = private_path(&snapshot, "counter");
+    let started = bg(
+        &ctx,
+        serde_json::json!({
+            "command": "while :; do printf x >> counter; done",
+            "notify": false
+        }),
+    )
+    .await;
+    let id = bg_id(&started);
+    drop(ctx);
+    wait_for_growth(&counter, 100).await;
+    bg(&control, serde_json::json!({"action": "pause", "id": id})).await;
+    let frozen = std::fs::metadata(&counter).unwrap().len();
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    assert_eq!(std::fs::metadata(&counter).unwrap().len(), frozen);
+    assert!(snapshot.seal().is_err());
+    registry.set_paused(&id, false).unwrap();
+    wait_for_growth(&counter, frozen).await;
+    bg(&control, serde_json::json!({"action": "kill", "id": id})).await;
+    let jobs = registry.jobs();
+    assert!(matches!(
+        jobs[0].state,
+        agent_tools_shell::bg::BgJobState::Done {
+            reason: agent_tools_shell::bg::BgEndReason::Killed,
+            ..
+        }
+    ));
+    assert_eq!(snapshot.seal().unwrap().len(), 1);
+    assert!(!source.join("counter").exists());
+}
+
+#[tokio::test]
+async fn leased_bg_notifies_after_owner_and_log_cleanup() {
+    let (_temp, mut snapshot, mut ctx) = fixture(Arc::new(LeasedBackend));
+    let registry = agent_tools_shell::bg::install_registry(Arc::get_mut(&mut ctx).unwrap());
+    let (tx, mut notices) = tokio::sync::mpsc::unbounded_channel();
+    agent_tools_shell::bg::install_notifier(Arc::get_mut(&mut ctx).unwrap(), move |notice| {
+        let _ = tx.send(notice);
+    });
+    let started = bg(
+        &ctx,
+        serde_json::json!({
+            "command": "printf private > file; printf 'BG_STDOUT\\n'; printf 'BG_STDERR\\n' >&2"
+        }),
+    )
+    .await;
+    let id = bg_id(&started);
+    drop(ctx);
+    let notice = tokio::time::timeout(std::time::Duration::from_secs(5), notices.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(notice.contains(&id));
+    assert!(notices.try_recv().is_err());
+    let logs = registry.tail(&id, 80).unwrap();
+    assert!(logs.contains("BG_STDOUT"));
+    assert!(logs.contains("BG_STDERR"));
+    assert!(matches!(
+        registry.jobs()[0].state,
+        agent_tools_shell::bg::BgJobState::Done {
+            reason: agent_tools_shell::bg::BgEndReason::Exited,
+            code: Some(0),
+            ..
+        }
+    ));
+    assert_eq!(snapshot.seal().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn dropping_the_bg_registry_keeps_cleanup_owned_until_quiescence() {
+    let (_temp, mut snapshot, mut ctx) = fixture(Arc::new(LeasedBackend));
+    let registry = agent_tools_shell::bg::install_registry(Arc::get_mut(&mut ctx).unwrap());
+    let counter = private_path(&snapshot, "counter");
+    bg(
+        &ctx,
+        serde_json::json!({
+            "command": "while :; do printf x >> counter; done",
+            "notify": false
+        }),
+    )
+    .await;
+    drop(ctx);
+    wait_for_growth(&counter, 100).await;
+    assert!(snapshot.seal().is_err());
+    drop(registry);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while snapshot.seal().is_err() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
