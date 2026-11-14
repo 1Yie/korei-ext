@@ -1,20 +1,22 @@
-//! Bridge ownership: one Serena server per workspace, spawned lazily and
-//! replaced when it dies.
+//! Bridge ownership.
 //!
-//! Serena indexes the `--project` it was started with, so a bridge is valid only
-//! for its own workspace — handing it to another silently runs `find_symbol` /
-//! `replace_symbol_body` against the wrong tree. It is not per session either:
-//! sessions in one workspace share one server and one index.
+//! An unprepared workspace has one Serena server, keyed by its root. Prepared
+//! execution installs a session registry and keeps one server per live snapshot
+//! lease and linked-root authorization. That server's `--project` is the
+//! lease's private working root. A changed authorization starts a new server
+//! and drops the previous one; dropping the registry drops its servers.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
 use tokio::sync::Mutex;
 
-use super::bridge::{BridgeFactory, McpBridge, SerenaBridge, SerenaToolInfo};
+use super::bridge::{BridgeFactory, McpBridge, SerenaBridge, SerenaLaunch, SerenaToolInfo};
 use super::catalog::SerenaToolCatalog;
-use agent_tool::ToolError;
+use agent_capabilities::{RootAccess, SandboxCtx, WorkspaceCtx};
+use agent_tool::{ToolContext, ToolError};
 
 /// A bridge plus the catalog fetched from it — one unit, because a catalog
 /// only describes the server it came from.
@@ -110,26 +112,7 @@ impl SerenaManager {
         slot: &'a WorkspaceSlot,
         root: &Path,
     ) -> Result<tokio::sync::MutexGuard<'a, Option<Live>>, ToolError> {
-        let mut live = slot.live.lock().await;
-        if live
-            .as_ref()
-            .map(|l| !l.bridge.is_healthy())
-            .unwrap_or(false)
-        {
-            // The child died: drop the handle (kill_on_drop reaps it) so the
-            // next call starts a fresh server over a fresh index.
-            live.take();
-        }
-        if live.is_none() {
-            let bridge = self.factory.spawn(root).await?;
-            self.spawns
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            live.replace(Live {
-                bridge,
-                catalog: SerenaToolCatalog::default(),
-            });
-        }
-        Ok(live)
+        ensure_slot(slot, &self.spawns, || self.factory.spawn(root)).await
     }
 
     /// Forget this workspace's bridge. Called when a call failed in a way that
@@ -142,19 +125,255 @@ impl SerenaManager {
     }
 }
 
+async fn ensure_slot<'a, F, Fut>(
+    slot: &'a WorkspaceSlot,
+    spawns: &AtomicUsize,
+    spawn: F,
+) -> Result<tokio::sync::MutexGuard<'a, Option<Live>>, ToolError>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<Arc<dyn McpBridge>, ToolError>>,
+{
+    let mut live = slot.live.lock().await;
+    if live
+        .as_ref()
+        .map(|entry| !entry.bridge.is_healthy())
+        .unwrap_or(false)
+    {
+        // Drop the previous owner so its process and stdio cleanup can finish.
+        live.take();
+    }
+    if live.is_none() {
+        live.replace(Live {
+            bridge: spawn().await?,
+            catalog: SerenaToolCatalog::default(),
+        });
+        spawns.fetch_add(1, Ordering::Relaxed);
+    }
+    Ok(live)
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct ViewKey {
+    lease: usize,
+    auth: Vec<(PathBuf, RootAccess)>,
+}
+
+#[cfg(test)]
+type SpawnHook = Arc<
+    dyn Fn(&Path, &[(PathBuf, RootAccess)]) -> Result<Arc<dyn McpBridge>, ToolError> + Send + Sync,
+>;
+
+/// Servers for one prepared session. The host installs one registry per session;
+/// delegated children inherit the same slot.
+pub struct SerenaRegistry {
+    launch: SerenaLaunch,
+    child_env: Vec<(String, String)>,
+    slots: StdMutex<HashMap<ViewKey, Arc<WorkspaceSlot>>>,
+    spawns: AtomicUsize,
+    #[cfg(test)]
+    hook: Option<SpawnHook>,
+}
+
+/// Host-installed registry for this context and its delegated children.
+pub struct SerenaRegistrySlot(pub Arc<SerenaRegistry>);
+
+impl SerenaRegistry {
+    pub fn new(launch: SerenaLaunch) -> Self {
+        Self::with_env(launch, Vec::new())
+    }
+
+    pub fn with_env(launch: SerenaLaunch, child_env: Vec<(String, String)>) -> Self {
+        Self {
+            launch,
+            child_env,
+            slots: StdMutex::new(HashMap::new()),
+            spawns: AtomicUsize::new(0),
+            #[cfg(test)]
+            hook: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn hooked(hook: SpawnHook) -> Self {
+        let mut registry = Self::new(SerenaLaunch::from_env());
+        registry.hook = Some(hook);
+        registry
+    }
+
+    pub fn spawn_count(&self) -> usize {
+        self.spawns.load(Ordering::Relaxed)
+    }
+
+    pub async fn bridge<C>(&self, ctx: &C) -> Result<Arc<dyn McpBridge>, ToolError>
+    where
+        C: SandboxCtx + WorkspaceCtx,
+    {
+        let key = view_key(ctx)?;
+        for stale in self.take_stale(&key) {
+            stale.live.lock().await.take();
+        }
+        let slot = self.slot(&key);
+        let project = project_path(ctx)?;
+        let live = ensure_slot(&slot, &self.spawns, || self.open(ctx, &project)).await?;
+        Ok(live.as_ref().expect("ensure_slot").bridge.clone())
+    }
+
+    pub async fn render_catalog<C>(
+        &self,
+        ctx: &C,
+        detail: Option<&str>,
+    ) -> Result<String, ToolError>
+    where
+        C: SandboxCtx + WorkspaceCtx,
+    {
+        let key = view_key(ctx)?;
+        for stale in self.take_stale(&key) {
+            stale.live.lock().await.take();
+        }
+        let slot = self.slot(&key);
+        let project = project_path(ctx)?;
+        let mut live = ensure_slot(&slot, &self.spawns, || self.open(ctx, &project)).await?;
+        let entry = live.as_mut().expect("ensure_slot");
+        let bridge = entry.bridge.clone();
+        entry.catalog.tools(bridge.as_ref()).await?;
+        Ok(entry.catalog.render(detail))
+    }
+
+    /// Drop the bridge for the context's current lease and authorization.
+    pub async fn invalidate<C: WorkspaceCtx>(&self, ctx: &C) -> Result<(), ToolError> {
+        let key = view_key(ctx)?;
+        let slot = self
+            .slots
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&key)
+            .cloned();
+        if let Some(slot) = slot {
+            slot.live.lock().await.take();
+        }
+        Ok(())
+    }
+
+    fn slot(&self, key: &ViewKey) -> Arc<WorkspaceSlot> {
+        let mut slots = self.slots.lock().unwrap_or_else(|error| error.into_inner());
+        slots
+            .entry(key.clone())
+            .or_insert_with(|| {
+                Arc::new(WorkspaceSlot {
+                    live: Mutex::new(None),
+                })
+            })
+            .clone()
+    }
+
+    fn take_stale(&self, current: &ViewKey) -> Vec<Arc<WorkspaceSlot>> {
+        let mut slots = self.slots.lock().unwrap_or_else(|error| error.into_inner());
+        let stale: Vec<ViewKey> = slots
+            .keys()
+            .filter(|key| key.lease == current.lease && *key != current)
+            .cloned()
+            .collect();
+        stale
+            .into_iter()
+            .filter_map(|key| slots.remove(&key))
+            .collect()
+    }
+
+    async fn open<C>(&self, ctx: &C, project: &Path) -> Result<Arc<dyn McpBridge>, ToolError>
+    where
+        C: SandboxCtx + WorkspaceCtx,
+    {
+        #[cfg(test)]
+        if let Some(hook) = &self.hook {
+            return hook(project, &authorization(ctx));
+        }
+        let lease = ctx
+            .workspace_lease()
+            .ok_or_else(|| ToolError::Failed("prepared serena has no execution lease".into()))?;
+        let (program, args) = self.launch.resolve(project);
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let mut cfg = agent_sandbox::SandboxConfig {
+            workspace_dir: ctx.root()?.to_path_buf(),
+            allow_network: false,
+            ..agent_sandbox::SandboxConfig::default()
+        };
+        cfg.env_vars.extend(self.child_env.iter().cloned());
+        let child = ctx.spawn_process(&cfg, &program, &arg_refs)?;
+        let bridge = SerenaBridge::from_managed(project, program, child, Some(lease)).await?;
+        Ok(bridge)
+    }
+}
+
+fn authorization<C: WorkspaceCtx>(ctx: &C) -> Vec<(PathBuf, RootAccess)> {
+    let mut auth: Vec<_> = ctx
+        .linked_roots()
+        .iter()
+        .map(|root| (root.path.clone(), root.access))
+        .collect();
+    auth.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.as_str().cmp(right.1.as_str()))
+    });
+    auth.dedup();
+    auth
+}
+
+fn view_key<C: WorkspaceCtx>(ctx: &C) -> Result<ViewKey, ToolError> {
+    let lease = ctx
+        .workspace_lease()
+        .ok_or_else(|| ToolError::Failed("prepared serena has no execution lease".into()))?;
+    Ok(ViewKey {
+        // The context or the retained bridge keeps this allocation alive while
+        // the cache entry exists, so the address cannot be reused early.
+        lease: Arc::as_ptr(&lease) as usize,
+        auth: authorization(ctx),
+    })
+}
+
+fn project_path<C: WorkspaceCtx>(ctx: &C) -> Result<PathBuf, ToolError> {
+    let lease = ctx
+        .workspace_lease()
+        .ok_or_else(|| ToolError::Failed("prepared serena has no execution lease".into()))?;
+    let (id, relative) = lease
+        .map_source(ctx.root()?)
+        .map_err(|error| ToolError::Failed(error.to_string()))?;
+    Ok(lease
+        .working_root(id)
+        .map_err(|error| ToolError::Failed(error.to_string()))?
+        .join(relative))
+}
+
+/// The prepared session's registry. A missing slot refuses the call.
+pub fn registry<C: ToolContext>(ctx: &C) -> Result<Arc<SerenaRegistry>, ToolError> {
+    ctx.service::<SerenaRegistrySlot>()
+        .map(|slot| slot.0.clone())
+        .ok_or_else(|| {
+            ToolError::Failed("prepared serena requires a session serena registry".into())
+        })
+}
+
+/// Install a fresh per-session registry, shared with delegated children.
+pub fn install_registry<C: ToolContext>(ctx: &mut C) -> Arc<SerenaRegistry> {
+    let registry = Arc::new(SerenaRegistry::new(SerenaLaunch::from_env()));
+    ctx.extensions_mut()
+        .insert_shared(Arc::new(SerenaRegistrySlot(registry.clone())));
+    registry
+}
+
 /// Canonical key for the slot map: `ToolCtx` roots are already canonical, but
 /// a trailing-slash or symlinked duplicate must not get its own server.
 fn normalize_root(root: &Path) -> PathBuf {
     std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf())
 }
 
-/// One manager per workspace root, process-wide.
+/// One manager per unprepared workspace root, process-wide.
 ///
-/// Process-wide *because* the key is the workspace: a registry keyed by
-/// something weaker (a single slot, a session) is exactly the bug this module
-/// exists to prevent. Entries are tiny; the child processes they own are the
-/// intended cost of "a parked workspace keeps its turn" — `invalidate` and
-/// `shutdown` are the release valves.
+/// Prepared execution is not stored here. A session [`SerenaRegistry`] owns
+/// those servers and keys them by live lease and authorization, so two views
+/// of one workspace cannot share an index. `invalidate` and `shutdown` release
+/// an unprepared server when its workspace closes.
 pub fn manager_for(root: &Path) -> Arc<SerenaManager> {
     let managers = managers_map();
     let mut managers = managers.lock().unwrap_or_else(|e| e.into_inner());
@@ -394,5 +613,354 @@ mod tests {
             1,
             "thundering herd spawned extra servers"
         );
+    }
+
+    #[cfg(unix)]
+    mod prepared {
+        use super::{
+            registry, Arc, AtomicBool, McpBridge, Ordering, PathBuf, SerenaRegistry,
+            SerenaRegistrySlot, SerenaToolInfo, StdMutex, ToolError, Value,
+        };
+        use std::os::unix::fs::PermissionsExt;
+
+        use agent_capabilities::{LinkedRoot, LinkedRoots, RootAccess, WorkspaceCtx};
+        use agent_sandbox::snapshot::{SnapshotBudget, SnapshotPreference, WorkspaceSnapshot};
+        use agent_tool::ToolContext;
+
+        #[derive(Default)]
+        struct Ctx(agent_tool::Extensions);
+
+        impl ToolContext for Ctx {
+            fn extensions(&self) -> &agent_tool::Extensions {
+                &self.0
+            }
+
+            fn extensions_mut(&mut self) -> &mut agent_tool::Extensions {
+                &mut self.0
+            }
+        }
+
+        struct Probe {
+            healthy: Arc<AtomicBool>,
+            dropped: Arc<AtomicBool>,
+        }
+
+        impl Probe {
+            fn healthy() -> Self {
+                Self {
+                    healthy: Arc::new(AtomicBool::new(true)),
+                    dropped: Arc::new(AtomicBool::new(false)),
+                }
+            }
+        }
+
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                self.dropped.store(true, Ordering::Release);
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl McpBridge for Probe {
+            async fn call(&self, _tool: &str, _args: Value) -> Result<String, ToolError> {
+                Ok("ok".into())
+            }
+
+            async fn list_tools(&self) -> Result<Vec<SerenaToolInfo>, ToolError> {
+                Ok(Vec::new())
+            }
+
+            fn is_healthy(&self) -> bool {
+                self.healthy.load(Ordering::Acquire)
+            }
+
+            async fn diagnostics(&self) -> String {
+                String::new()
+            }
+        }
+
+        fn prepared_ctx() -> (tempfile::TempDir, WorkspaceSnapshot, Ctx) {
+            let temp = tempfile::tempdir().unwrap();
+            let base = temp.path().canonicalize().unwrap();
+            let source = base.join("source");
+            let storage = base.join("storage");
+            std::fs::create_dir(&source).unwrap();
+            std::fs::create_dir(&storage).unwrap();
+            std::fs::set_permissions(&storage, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::write(source.join("original"), "unchanged").unwrap();
+            let snapshot = WorkspaceSnapshot::prepare(
+                &[source.clone()],
+                &storage,
+                SnapshotBudget {
+                    max_bytes: 1024 * 1024,
+                    max_entries: 64,
+                    max_depth: 8,
+                },
+                SnapshotPreference::PrivateCopy,
+            )
+            .unwrap();
+            let mut ctx = Ctx::default().with_workspace(source);
+            ctx.install_workspace_lease(snapshot.lease().unwrap())
+                .unwrap();
+            (temp, snapshot, ctx)
+        }
+
+        fn bind(ctx: &mut Ctx, registry: Arc<SerenaRegistry>) {
+            ctx.extensions_mut()
+                .insert_shared(Arc::new(SerenaRegistrySlot(registry)));
+        }
+
+        #[tokio::test]
+        async fn separate_leases_use_private_projects_and_do_not_share_a_server() {
+            let seen = Arc::new(StdMutex::new(Vec::<PathBuf>::new()));
+            let record = seen.clone();
+            let registry = Arc::new(SerenaRegistry::hooked(Arc::new(move |project, _| {
+                record
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .push(project.to_path_buf());
+                Ok(Arc::new(Probe::healthy()))
+            })));
+            let (_first_dir, _first_snapshot, mut first) = prepared_ctx();
+            let (_second_dir, _second_snapshot, mut second) = prepared_ctx();
+            bind(&mut first, registry.clone());
+            bind(&mut second, registry.clone());
+            let first_bridge = registry.bridge(&first).await.unwrap();
+            let again = registry.bridge(&first).await.unwrap();
+            assert!(Arc::ptr_eq(&first_bridge, &again));
+            let second_bridge = registry.bridge(&second).await.unwrap();
+            assert!(!Arc::ptr_eq(&first_bridge, &second_bridge));
+            assert_eq!(registry.spawn_count(), 2);
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 2);
+            assert_ne!(seen[0], seen[1]);
+            for (ctx, project) in [(&first, &seen[0]), (&second, &seen[1])] {
+                let source = ctx.root().unwrap();
+                assert_ne!(project, source);
+                let lease = ctx.workspace_lease().unwrap();
+                let (id, relative) = lease.map_source(source).unwrap();
+                assert_eq!(project, &lease.working_root(id).unwrap().join(relative));
+            }
+        }
+
+        #[tokio::test]
+        async fn changed_authorization_drops_the_previous_server() {
+            let dropped = Arc::new(AtomicBool::new(false));
+            let flag = dropped.clone();
+            let registry = Arc::new(SerenaRegistry::hooked(Arc::new(move |_, _| {
+                Ok(Arc::new(Probe {
+                    healthy: Arc::new(AtomicBool::new(true)),
+                    dropped: flag.clone(),
+                }))
+            })));
+            let (_dir, _snapshot, mut ctx) = prepared_ctx();
+            let roots = Arc::new(LinkedRoots::default());
+            ctx.install_linked_roots(roots.clone());
+            bind(&mut ctx, registry.clone());
+            drop(registry.bridge(&ctx).await.unwrap());
+            roots.set(vec![LinkedRoot {
+                path: ctx.root().unwrap().join("linked"),
+                access: RootAccess::Read,
+            }]);
+            let _replacement = registry.bridge(&ctx).await.unwrap();
+            assert!(dropped.load(Ordering::Acquire));
+            assert_eq!(registry.spawn_count(), 2);
+        }
+
+        #[tokio::test]
+        async fn dead_view_bridge_is_replaced() {
+            let healthy = Arc::new(AtomicBool::new(true));
+            let dropped = Arc::new(AtomicBool::new(false));
+            let registry = Arc::new(SerenaRegistry::hooked({
+                let healthy = healthy.clone();
+                let dropped = dropped.clone();
+                Arc::new(move |_, _| {
+                    Ok(Arc::new(Probe {
+                        healthy: healthy.clone(),
+                        dropped: dropped.clone(),
+                    }))
+                })
+            }));
+            let (_dir, _snapshot, mut ctx) = prepared_ctx();
+            bind(&mut ctx, registry.clone());
+            drop(registry.bridge(&ctx).await.unwrap());
+            healthy.store(false, Ordering::Release);
+            let _replacement = registry.bridge(&ctx).await.unwrap();
+            assert!(dropped.load(Ordering::Acquire));
+            assert_eq!(registry.spawn_count(), 2);
+        }
+
+        #[tokio::test]
+        async fn concurrent_view_calls_share_one_spawn() {
+            let registry = Arc::new(SerenaRegistry::hooked(Arc::new(|_, _| {
+                Ok(Arc::new(Probe::healthy()))
+            })));
+            let (_dir, _snapshot, mut ctx) = prepared_ctx();
+            bind(&mut ctx, registry.clone());
+            let ctx = Arc::new(ctx);
+            let mut set = tokio::task::JoinSet::new();
+            for _ in 0..8 {
+                let registry = registry.clone();
+                let ctx = ctx.clone();
+                set.spawn(async move { registry.bridge(&*ctx).await.map(|_| ()) });
+            }
+            while let Some(result) = set.join_next().await {
+                result.unwrap().unwrap();
+            }
+            assert_eq!(registry.spawn_count(), 1);
+        }
+
+        #[tokio::test]
+        async fn prepared_context_without_a_registry_is_refused() {
+            let (_dir, _snapshot, ctx) = prepared_ctx();
+            let Err(error) = registry(&ctx) else {
+                panic!("prepared context must refuse without a registry");
+            };
+            assert!(
+                error.to_string().contains("session serena registry"),
+                "{error}"
+            );
+        }
+
+        #[cfg(target_os = "macos")]
+        #[tokio::test]
+        async fn isolated_registry_reuses_stdio_and_releases_the_lease() {
+            use std::time::Duration;
+
+            use super::{Path, SerenaLaunch};
+            use agent_capabilities::SandboxCtx;
+            use serde_json::json;
+
+            use agent_sandbox::spawn::{
+                spawn_isolated, ExecutionKind, IsolatedSpawn, MemoryEnforcement, SandboxedChild,
+            };
+            use agent_sandbox::{
+                CommandOutput, SandboxBackend, SandboxCapabilities, SandboxConfig, SandboxTier,
+            };
+
+            struct LeasedBackend;
+
+            #[async_trait::async_trait]
+            impl SandboxBackend for LeasedBackend {
+                fn id(&self) -> &'static str {
+                    "leased-test"
+                }
+
+                fn tier(&self) -> SandboxTier {
+                    SandboxTier::L2
+                }
+
+                fn capabilities(&self) -> SandboxCapabilities {
+                    SandboxCapabilities {
+                        filesystem: true,
+                        network: true,
+                        snapshots: true,
+                    }
+                }
+
+                async fn run_command(
+                    &self,
+                    _: &str,
+                    _: &[&str],
+                    _: &SandboxConfig,
+                ) -> anyhow::Result<CommandOutput> {
+                    anyhow::bail!("ordinary command execution must not be used")
+                }
+
+                fn wrap_spawn(
+                    &self,
+                    _: &SandboxConfig,
+                    _: &str,
+                    _: &[&str],
+                ) -> Option<tokio::process::Command> {
+                    panic!("ordinary process wrapping must not be used")
+                }
+
+                fn spawn_leased(
+                    &self,
+                    lease: Arc<agent_sandbox::snapshot::SnapshotLease>,
+                    cfg: &SandboxConfig,
+                    cmd: &str,
+                    args: &[&str],
+                ) -> anyhow::Result<SandboxedChild> {
+                    let executable = std::fs::canonicalize(cmd)?;
+                    let request = IsolatedSpawn {
+                        executable: executable.clone(),
+                        linux_launcher: None,
+                        linux_cgroup_parent: None,
+                        args: args.iter().map(std::ffi::OsString::from).collect(),
+                        root: Some(lease.map_source(&cfg.workspace_dir)?.0),
+                        kind: ExecutionKind::Tool,
+                        read_only: vec![executable, "/usr/lib".into(), "/System/Library".into()],
+                        deny_read: Vec::new(),
+                        deny_write: Vec::new(),
+                        env: Vec::new(),
+                        max_memory_bytes: 128 * 1024 * 1024,
+                        max_processes: 1,
+                        memory_enforcement: MemoryEnforcement::MonitoredRss,
+                        tool_policy: Some(cfg.clone()),
+                    };
+                    spawn_isolated(lease, &request)
+                }
+            }
+
+            let (_dir, mut snapshot, mut ctx) = prepared_ctx();
+            ctx.install_sandbox(Arc::new(LeasedBackend));
+            let program = std::env::current_exe().unwrap();
+            let registry = Arc::new(SerenaRegistry::with_env(
+                SerenaLaunch {
+                    program: Some(program.display().to_string()),
+                    source: String::new(),
+                    modes: Vec::new(),
+                    argv_override: Some(vec![
+                        "--exact".into(),
+                        "bridge::tests::stub_mcp_server".into(),
+                        "--nocapture".into(),
+                        "--quiet".into(),
+                    ]),
+                },
+                vec![
+                    ("AGENT_SERENA_STUB".into(), "write-on-call".into()),
+                    ("RUST_TEST_THREADS".into(), "1".into()),
+                ],
+            ));
+            bind(&mut ctx, registry.clone());
+            let source = ctx.root().unwrap().to_path_buf();
+            let ctx = Arc::new(ctx);
+            let bridge = tokio::time::timeout(Duration::from_secs(10), registry.bridge(&*ctx))
+                .await
+                .expect("isolated MCP handshake must complete")
+                .unwrap();
+            assert_eq!(
+                bridge.call("find_symbol", json!({})).await.unwrap(),
+                "stub-ok"
+            );
+            let again = registry.bridge(&*ctx).await.unwrap();
+            assert!(Arc::ptr_eq(&bridge, &again));
+            assert_eq!(registry.spawn_count(), 1);
+            assert!(
+                snapshot.seal().is_err(),
+                "live registry must occupy the lease"
+            );
+            drop(bridge);
+            drop(again);
+            drop(ctx);
+            drop(registry);
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while snapshot.seal().is_err() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("dropping the registry must release the real lease");
+            let changes = snapshot.diff().unwrap();
+            assert_eq!(changes.len(), 1);
+            assert_eq!(changes[0].path, Path::new("private-effect"));
+            assert!(!source.join("private-effect").exists());
+            assert_eq!(
+                std::fs::read_to_string(source.join("original")).unwrap(),
+                "unchanged"
+            );
+        }
     }
 }

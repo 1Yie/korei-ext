@@ -217,6 +217,7 @@ dependencies = [
  "agent-capabilities",
  "agent-sandbox",
  "agent-tool",
+ "anyhow",
  "async-trait",
  "futures",
  "schemars",

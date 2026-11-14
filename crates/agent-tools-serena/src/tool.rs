@@ -11,8 +11,8 @@ use futures::FutureExt;
 use serde_json::json;
 
 use super::catalog::DETAIL_ACTION;
-use super::manager::manager_for;
-use agent_capabilities::WorkspaceCtx;
+use super::manager::{manager_for, registry, SerenaRegistry};
+use agent_capabilities::{SandboxCtx, WorkspaceCtx};
 use agent_tool::{schema_for, ExecFn, ToolClass, ToolError, ToolResult, ToolSpec};
 
 /// `serena` meta-tool args — call one Serena tool by name.
@@ -27,7 +27,23 @@ struct SerenaCallArgs {
     arguments: Option<serde_json::Value>,
 }
 
-pub fn spec<C: WorkspaceCtx>() -> ToolSpec<C> {
+async fn drop_bridge<C: WorkspaceCtx>(
+    ctx: &C,
+    root: &std::path::Path,
+    session: Option<&Arc<SerenaRegistry>>,
+) -> Result<(), ToolError> {
+    if let Some(session) = session {
+        session.invalidate(ctx).await
+    } else {
+        manager_for(root).invalidate(root).await;
+        Ok(())
+    }
+}
+
+pub fn spec<C>() -> ToolSpec<C>
+where
+    C: WorkspaceCtx + SandboxCtx,
+{
     let exec: ExecFn<C> = Arc::new(|args, ctx| {
         let a: SerenaCallArgs = match serde_json::from_value(args) {
             Ok(a) => a,
@@ -35,12 +51,16 @@ pub fn spec<C: WorkspaceCtx>() -> ToolSpec<C> {
                 return async move { Err(ToolError::Args(format!("serena args: {e}"))) }.boxed()
             }
         };
-        // Scope every call to *this* workspace's server. A process-wide shared
-        // bridge would run project B's `replace_symbol_body` against project
-        // A's tree; the manager keys by root (and restarts a dead child).
+        // Unprepared calls share one server per workspace root. Prepared calls
+        // use that session's registry, keyed by its lease and authorization.
         async move {
             let root = ctx.root()?.to_path_buf();
-            let manager = manager_for(&root);
+            let prepared = ctx.workspace_lease().is_some();
+            let session = if prepared {
+                Some(registry(&*ctx)?)
+            } else {
+                None
+            };
 
             // Discovery is a bridge concern, not a Serena tool.
             if a.tool == DETAIL_ACTION || a.tool == "list_tools" {
@@ -49,12 +69,20 @@ pub fn spec<C: WorkspaceCtx>() -> ToolSpec<C> {
                     .as_ref()
                     .and_then(|v| v.get("name"))
                     .and_then(|v| v.as_str());
-                return Ok(ToolResult::text(
-                    manager.render_catalog(&root, detail).await?,
-                ));
+                let text = if let Some(session) = &session {
+                    session.render_catalog(&*ctx, detail).await?
+                } else {
+                    manager_for(&root).render_catalog(&root, detail).await?
+                };
+                return Ok(ToolResult::text(text));
             }
 
-            let bridge = manager.bridge(&root).await.map_err(|e| {
+            let bridge = if let Some(session) = &session {
+                session.bridge(&*ctx).await
+            } else {
+                manager_for(&root).bridge(&root).await
+            }
+            .map_err(|e| {
                 ToolError::Failed(format!(
                     "serena unavailable for {}: {e}\n(install: `uv tool install -p 3.13 \
                      serena-agent`, then `serena init`; `serena project health-check` \
@@ -68,7 +96,7 @@ pub fn spec<C: WorkspaceCtx>() -> ToolSpec<C> {
                     // The child can die right after answering — don't hand the
                     // dead handle to the next call.
                     if !bridge.is_healthy() {
-                        manager.invalidate(&root).await;
+                        drop_bridge(&*ctx, &root, session.as_ref()).await?;
                     }
                     Ok(ToolResult::text(out))
                 }
@@ -78,7 +106,7 @@ pub fn spec<C: WorkspaceCtx>() -> ToolSpec<C> {
                     // automatic retry — the call may have been a write that
                     // succeeded before the pipe broke.
                     if !bridge.is_healthy() {
-                        manager.invalidate(&root).await;
+                        drop_bridge(&*ctx, &root, session.as_ref()).await?;
                         return Err(ToolError::Failed(format!(
                             "{e}\n\nthe serena server for {} exited — its bridge was \
                              dropped and the next call restarts it. Safe to retry a \

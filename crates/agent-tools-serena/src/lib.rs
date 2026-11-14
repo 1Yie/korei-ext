@@ -4,14 +4,17 @@
 //! JSON-RPC), so this crate needs no HTTP client and no plugin bridge — it
 //! spawns the child directly.
 //!
-//! The meta-tool is generic over [`agent_capabilities::WorkspaceCtx`] (it reads only the
-//! workspace root), so this crate names no kernel type: the kernel depends on it,
-//! not the other way round.
+//! The meta-tool is generic over the tool context, so this crate names no
+//! kernel type: the kernel depends on it, not the other way round. Unprepared
+//! calls share one server per workspace root. Prepared calls require
+//! [`manager::install_registry`] and keep one server per live lease and
+//! authorization.
 //!
 //! ```text
-//! workspace  →  SerenaManager (one slot per root)
-//!                 └── SerenaBridge       — child process + JSON-RPC plumbing
-//!                 └── SerenaToolCatalog  — cached `tools/list`
+//! unprepared workspace → SerenaManager (one slot per root)
+//! prepared session     → SerenaRegistry (one slot per lease and authorization)
+//!                          └── SerenaBridge       — child process + JSON-RPC plumbing
+//!                          └── SerenaToolCatalog  — cached `tools/list`
 //! ```
 //!
 //! A missing `uvx`/serena or a failed start fails only that call and carries the
@@ -25,11 +28,17 @@ pub mod tool;
 
 pub use bridge::{BridgeFactory, McpBridge, SerenaBridge, SerenaLaunch, SerenaToolInfo};
 pub use catalog::SerenaToolCatalog;
-pub use manager::{manager_for, shutdown, SerenaManager};
+pub use manager::{
+    install_registry, manager_for, registry, shutdown, SerenaManager, SerenaRegistry,
+    SerenaRegistrySlot,
+};
 
-use agent_capabilities::WorkspaceCtx;
+use agent_capabilities::{SandboxCtx, WorkspaceCtx};
 use agent_tool::ToolSpec;
 
-pub fn spec<C: WorkspaceCtx>() -> ToolSpec<C> {
+pub fn spec<C>() -> ToolSpec<C>
+where
+    C: WorkspaceCtx + SandboxCtx,
+{
     tool::spec::<C>()
 }
