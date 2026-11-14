@@ -1,35 +1,27 @@
 //! `service` — manage long-lived background processes launched by
 //! `bash(persistent: true)`.
 //!
-//! Why a separate channel: `run_command` deliberately kills its whole
-//! process tree when the call ends (pidns init + die-with-parent), so dev
-//! servers / databases / watchers can't survive between bash calls.
-//! `SandboxBackend::wrap_spawn` is the other spawn path — the kernel owns
-//! the returned `Command`, so we park its `Child` in this process-wide
-//! registry and hand the model a `service` tool to observe or stop it.
-//!
-//! Containment is unchanged: the service runs under the same sandbox argv
-//! (read-only host fs + writable roots + domain-scoped egress proxy +
-//! pidns + die-with-parent); it simply isn't reaped when the spawning
-//! call returns. `--die-with-parent` still ends every service when the
-//! agent process exits. On the `none` backend the child is unsandboxed
-//! and loud, same contract as `run_command`.
+//! A session registry retains the actual process owner across calls. Process
+//! cleanup and log draining both complete before a service reports its exit.
 
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 
 use futures::FutureExt;
+use tokio::io::AsyncReadExt;
 use tokio::sync::Mutex;
 
 use crate::log::{create_log, log_dir, read_tail, DEFAULT_TAIL_LINES};
-use agent_capabilities::SandboxCtx;
+use agent_capabilities::{SandboxCtx, WorkspaceCtx};
+use agent_sandbox::process::{ManagedChild, ProcessOutput};
 use agent_tool::{schema_for, Args, ToolError, ToolResult, ToolSpec};
 
 /// The set of live background services one owner can see and stop. A host
 /// installs one per session ([`ServiceRegistrySlot`]) so sessions never see
-/// each other's services; a context without a slot uses the process default.
+/// each other's services. Unprepared contexts can use the process default.
 /// Dropping the registry kills whatever it still holds.
 #[derive(Default)]
 pub struct ServiceRegistry {
@@ -42,11 +34,17 @@ pub struct ServiceRegistrySlot(pub Arc<ServiceRegistry>);
 /// Ids stay unique process-wide so log files never collide across registries.
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
-fn registry<C: SandboxCtx>(ctx: &C) -> Arc<ServiceRegistry> {
+fn registry<C: SandboxCtx>(ctx: &C) -> Result<Arc<ServiceRegistry>, ToolError> {
     static DEFAULT: LazyLock<Arc<ServiceRegistry>> = LazyLock::new(Default::default);
-    ctx.service::<ServiceRegistrySlot>()
-        .map(|slot| slot.0.clone())
-        .unwrap_or_else(|| DEFAULT.clone())
+    if let Some(slot) = ctx.service::<ServiceRegistrySlot>() {
+        return Ok(slot.0.clone());
+    }
+    if ctx.workspace_lease().is_some() {
+        return Err(ToolError::Failed(
+            "prepared services require a session service registry".into(),
+        ));
+    }
+    Ok(DEFAULT.clone())
 }
 
 /// Install a fresh per-owner registry on `ctx`, shared with delegated children.
@@ -59,38 +57,25 @@ struct Service {
     command: String,
     pid: Option<u32>,
     log_path: PathBuf,
-    /// `None` after a stop consumed it.
-    child: Option<tokio::process::Child>,
+    child: ManagedChild,
+    readers: Vec<tokio::task::JoinHandle<std::io::Result<()>>>,
+    log_error: Option<String>,
 }
 
 impl Drop for Service {
     fn drop(&mut self) {
-        // A removed entry never leaks its process — `start_kill` is the
-        // sync variant Drop can call. (bwrap's die-with-parent also covers
-        // process exit; this is for the `none` backend and early removal.)
-        if let Some(mut c) = self.child.take() {
-            let _ = c.start_kill();
-        }
+        let _ = self.child.start_kill();
     }
 }
 
-/// Spawn `command` as a registered background service via `wrap_spawn`.
+/// Spawn `command` through the context's native or leased process owner.
 /// Called by `bash` when `persistent: true`. Returns the model-facing text.
 pub async fn spawn_persistent<C: SandboxCtx>(
     ctx: &Arc<C>,
     cfg: &agent_sandbox::SandboxConfig,
     command: &str,
 ) -> Result<ToolResult, ToolError> {
-    let sandbox = ctx.sandbox()?;
-    let mut cmd = sandbox
-        .wrap_spawn(cfg, "/bin/sh", &["-c", command])
-        .ok_or_else(|| {
-            ToolError::Failed(format!(
-                "sandbox backend {:?} can't spawn persistent services",
-                sandbox.id()
-            ))
-        })?;
-
+    let registry = registry(&**ctx)?;
     let id = format!("svc-{}", NEXT_ID.fetch_add(1, Ordering::Relaxed));
     // Private dir + 0600 file, never through a symlink: service output can
     // carry tokens.
@@ -100,45 +85,107 @@ pub async fn spawn_persistent<C: SandboxCtx>(
         .try_clone()
         .map_err(|e| ToolError::Failed(e.to_string()))?;
 
-    cmd.stdout(std::process::Stdio::from(log))
-        .stderr(std::process::Stdio::from(log_err))
-        // Caller-owned lifetime — kill_on_drop would defeat the feature.
-        .kill_on_drop(false);
-
-    let child = cmd
-        .spawn()
-        .map_err(|e| ToolError::Failed(format!("spawn service: {e}")))?;
+    #[cfg(windows)]
+    let mut child = ctx.spawn_process(cfg, "cmd.exe", &["/C", command])?;
+    #[cfg(not(windows))]
+    let mut child = ctx.spawn_process(cfg, "/bin/sh", &["-c", command])?;
+    child.stdin.take();
     let pid = child.id();
+    let mut readers = Vec::new();
+    for (pipe, log) in [(child.stdout.take(), log), (child.stderr.take(), log_err)] {
+        if let Some(pipe) = pipe {
+            let lease = ctx.workspace_lease();
+            readers.push(tokio::spawn(async move {
+                let _lease = lease;
+                append_output(pipe, log).await
+            }));
+        }
+    }
 
-    registry(&**ctx).map.lock().await.insert(
+    registry.map.lock().await.insert(
         id.clone(),
         Service {
             command: command.to_string(),
             pid,
             log_path: log_path.clone(),
-            child: Some(child),
+            child,
+            readers,
+            log_error: None,
         },
     );
 
     Ok(ToolResult::text(format!(
         "service started: id={id} pid={:?} log={}\n\
-         stdout+stderr append to the log; it dies when the agent process \
-         exits (die-with-parent). Manage it with the `service` tool: \
+         stdout+stderr append to the log. Manage it with the `service` tool: \
          list | logs | stop.",
         pid,
         log_path.display()
     )))
 }
 
-fn status_of(svc: &mut Service) -> String {
-    match svc.child.as_mut() {
-        None => "stopped".into(),
-        Some(c) => match c.try_wait() {
-            Ok(Some(s)) => format!("exited({})", s.code().unwrap_or(-1)),
-            Ok(None) => "running".into(),
-            Err(e) => format!("unknown({e})"),
-        },
+async fn append_output(mut pipe: ProcessOutput, mut log: std::fs::File) -> std::io::Result<()> {
+    let mut buffer = [0; 8192];
+    loop {
+        let read = pipe.read(&mut buffer).await?;
+        if read == 0 {
+            return log.flush();
+        }
+        // A synchronous append cannot outlive the I/O task's lease on cancellation.
+        log.write_all(&buffer[..read])?;
     }
+}
+
+fn record_log_result(
+    svc: &mut Service,
+    result: Result<std::io::Result<()>, tokio::task::JoinError>,
+) {
+    if let Err(error) = result
+        .map_err(|error| error.to_string())
+        .and_then(|result| result.map_err(|error| error.to_string()))
+    {
+        svc.log_error.get_or_insert(error);
+        let _ = svc.child.start_kill();
+    }
+}
+
+async fn status_of(svc: &mut Service) -> String {
+    while let Some(index) = svc.readers.iter().position(|reader| reader.is_finished()) {
+        let reader = svc.readers.swap_remove(index);
+        record_log_result(svc, reader.await);
+    }
+    match svc.child.try_wait() {
+        Ok(Some(status)) => {
+            svc.pid = None;
+            if !svc.readers.is_empty() {
+                "draining".into()
+            } else if let Some(error) = &svc.log_error {
+                format!("failed(log: {error})")
+            } else {
+                format!("exited({})", status.code().unwrap_or(-1))
+            }
+        }
+        Ok(None) if svc.log_error.is_some() => "stopping(log failure)".into(),
+        Ok(None) => "running".into(),
+        Err(error) => format!("unknown({error})"),
+    }
+}
+
+async fn stop(svc: &mut Service) -> Result<std::process::ExitStatus, ToolError> {
+    let status = svc
+        .child
+        .kill()
+        .await
+        .map_err(|error| ToolError::Failed(format!("service cleanup: {error}")))?;
+    svc.pid = None;
+    while let Some(reader) = svc.readers.last_mut() {
+        let result = reader.await;
+        svc.readers.pop();
+        record_log_result(svc, result);
+    }
+    if let Some(error) = &svc.log_error {
+        return Err(ToolError::Failed(format!("service log drain: {error}")));
+    }
+    Ok(status)
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
@@ -159,8 +206,8 @@ pub fn spec<C: SandboxCtx>() -> ToolSpec<C> {
             "Manage background services started via bash(persistent: true). \
              action=list shows every service with pid/status/log path; \
              action=logs tails its output; action=stop kills it. Services \
-             share the sandbox (same fs/network policy) and die when the \
-             agent process exits.",
+             retain their sandbox and execution view across calls. Stop \
+             waits for process cleanup and log draining.",
         ),
         readonly: false,
         class: agent_tool::ToolClass::Process,
@@ -175,7 +222,7 @@ pub fn spec<C: SandboxCtx>() -> ToolSpec<C> {
 async fn exec<C: SandboxCtx>(args: Args, ctx: Arc<C>) -> Result<ToolResult, ToolError> {
     let parsed: ServiceArgs =
         serde_json::from_value(args).map_err(|e| ToolError::Args(format!("service args: {e}")))?;
-    let reg = registry(&*ctx);
+    let reg = registry(&*ctx)?;
     match parsed.action.as_str() {
         "list" => {
             let mut map = reg.map.lock().await;
@@ -184,7 +231,7 @@ async fn exec<C: SandboxCtx>(args: Args, ctx: Arc<C>) -> Result<ToolResult, Tool
             }
             let mut out = String::new();
             for (id, svc) in map.iter_mut() {
-                let status = status_of(svc);
+                let status = status_of(svc).await;
                 out.push_str(&format!(
                     "{id}  pid={:?}  {status}  log={}\n    cmd: {}\n",
                     svc.pid,
@@ -202,7 +249,7 @@ async fn exec<C: SandboxCtx>(args: Args, ctx: Arc<C>) -> Result<ToolResult, Tool
             let svc = map
                 .get_mut(&id)
                 .ok_or_else(|| ToolError::Failed(format!("no service {id}")))?;
-            let status = status_of(svc);
+            let status = status_of(svc).await;
             let body = read_tail(
                 &svc.log_path.clone(),
                 parsed.tail_lines.unwrap_or(DEFAULT_TAIL_LINES),
@@ -215,28 +262,20 @@ async fn exec<C: SandboxCtx>(args: Args, ctx: Arc<C>) -> Result<ToolResult, Tool
             let id = parsed
                 .id
                 .ok_or_else(|| ToolError::Args("stop needs id".into()))?;
-            // Take the child out under a short lock; await outside it.
-            let child = {
-                let mut map = reg.map.lock().await;
-                let svc = map
-                    .get_mut(&id)
-                    .ok_or_else(|| ToolError::Failed(format!("no service {id}")))?;
-                svc.child.take()
-            };
-            match child {
-                None => Ok(ToolResult::text(format!("{id} already stopped"))),
-                Some(mut c) => {
-                    if c.try_wait().ok().flatten().is_none() {
-                        c.kill().await.ok();
-                    }
-                    let status = tokio::time::timeout(std::time::Duration::from_secs(5), c.wait())
-                        .await
-                        .map(|r| r.map(|s| s.to_string()).unwrap_or_else(|e| e.to_string()))
-                        .unwrap_or_else(|_| "kill sent, wait timed out".into());
-                    reg.map.lock().await.remove(&id);
-                    Ok(ToolResult::text(format!("{id} stopped: {status}")))
-                }
-            }
+            let mut map = reg.map.lock().await;
+            let svc = map
+                .get_mut(&id)
+                .ok_or_else(|| ToolError::Failed(format!("no service {id}")))?;
+            let status = tokio::time::timeout(std::time::Duration::from_secs(5), stop(svc))
+                .await
+                .map_err(|_| {
+                    ToolError::Failed(
+                        "service stop requested; cleanup is still pending, retry to observe it"
+                            .into(),
+                    )
+                })??;
+            map.remove(&id);
+            Ok(ToolResult::text(format!("{id} stopped: {status}")))
         }
         other => Err(ToolError::Args(format!(
             "unknown action {other:?} — list | logs | stop"

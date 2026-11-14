@@ -75,6 +75,14 @@ pub enum PathScope {
 }
 
 pub trait WorkspaceCtx: ToolContext + Sized {
+    /// Retain the prepared view for an owned process or I/O task.
+    #[cfg(feature = "sandbox")]
+    fn workspace_lease(&self) -> Option<Arc<agent_sandbox::snapshot::SnapshotLease>> {
+        self.extensions()
+            .get_ref::<super::workspace_io::WorkspaceLease>()
+            .map(|view| view.lease())
+    }
+
     /// Bind this context to one prepared snapshot for its entire execution.
     #[cfg(feature = "sandbox")]
     fn install_workspace_lease(

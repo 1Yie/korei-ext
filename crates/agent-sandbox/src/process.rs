@@ -19,6 +19,8 @@ pub struct ManagedChild {
     pub stdin: Option<ProcessInput>,
     pub stdout: Option<ProcessOutput>,
     pub stderr: Option<ProcessOutput>,
+    // The group guard must drop before its unreaped child owner.
+    group: Option<crate::group_kill::GroupGuard>,
     owner: Owner,
 }
 
@@ -42,6 +44,7 @@ impl From<tokio::process::Child> for ManagedChild {
                 .stderr
                 .take()
                 .map(|pipe| Box::new(pipe) as ProcessOutput),
+            group: None,
             owner: Owner::Native(child),
         }
     }
@@ -62,12 +65,20 @@ impl From<SandboxedChild> for ManagedChild {
                 .stderr
                 .take()
                 .map(|pipe| Box::new(pipe) as ProcessOutput),
+            group: None,
             owner: Owner::Isolated(child),
         }
     }
 }
 
 impl ManagedChild {
+    /// Adopt a native child started with `process_group(0)` on Unix.
+    pub fn from_process_group(child: tokio::process::Child) -> Self {
+        let mut process = Self::from(child);
+        process.group = Some(crate::group_kill::GroupGuard::new(process.id()));
+        process
+    }
+
     pub fn is_isolated(&self) -> bool {
         matches!(self.owner, Owner::Isolated(_))
     }
@@ -82,12 +93,21 @@ impl ManagedChild {
     /// Observe owner completion, including isolated process-tree cleanup.
     pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
         match &mut self.owner {
-            Owner::Native(child) => child.try_wait(),
+            Owner::Native(child) => {
+                let status = child.try_wait()?;
+                if status.is_some() {
+                    if let Some(group) = &mut self.group {
+                        group.disarm();
+                    }
+                }
+                Ok(status)
+            }
             Owner::Isolated(child) => child.try_wait(),
         }
     }
 
     pub fn start_kill(&mut self) -> io::Result<()> {
+        drop(self.group.take());
         match &mut self.owner {
             Owner::Native(child) => child.start_kill(),
             Owner::Isolated(child) => child.start_kill(),
@@ -97,7 +117,13 @@ impl ManagedChild {
     /// Wait for the retained owner rather than a PID-based liveness estimate.
     pub async fn wait(&mut self) -> io::Result<ExitStatus> {
         match &mut self.owner {
-            Owner::Native(child) => child.wait().await,
+            Owner::Native(child) => {
+                let status = child.wait().await?;
+                if let Some(group) = &mut self.group {
+                    group.disarm();
+                }
+                Ok(status)
+            }
             Owner::Isolated(child) => child.wait().await,
         }
     }

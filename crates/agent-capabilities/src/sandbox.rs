@@ -109,7 +109,7 @@ pub trait SandboxCtx: ToolContext + Sized {
         command.process_group(0);
         command
             .spawn()
-            .map(Into::into)
+            .map(agent_sandbox::process::ManagedChild::from_process_group)
             .map_err(|error| ToolError::Failed(format!("process spawn: {error}")))
     }
 
