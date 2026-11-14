@@ -411,6 +411,8 @@ async fn leased_bg_keeps_real_pause_resume_and_kill_across_calls() {
     );
     let control = Arc::new(control);
     let counter = private_path(&snapshot, "counter");
+    let view = counter.parent().unwrap();
+    assert!(registry.jobs_for_view(view).is_empty());
     let started = bg(
         &ctx,
         serde_json::json!({
@@ -422,15 +424,28 @@ async fn leased_bg_keeps_real_pause_resume_and_kill_across_calls() {
     let id = bg_id(&started);
     drop(ctx);
     wait_for_growth(&counter, 100).await;
+    assert!(registry.jobs_for_view(&source).is_empty());
+    let jobs = registry.jobs_for_view(view);
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].id, id);
+    assert!(matches!(
+        jobs[0].state,
+        agent_tools_shell::bg::BgJobState::Running
+    ));
     bg(&control, serde_json::json!({"action": "pause", "id": id})).await;
     let frozen = std::fs::metadata(&counter).unwrap().len();
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
     assert_eq!(std::fs::metadata(&counter).unwrap().len(), frozen);
     assert!(snapshot.seal().is_err());
+    assert!(matches!(
+        registry.jobs_for_view(view)[0].state,
+        agent_tools_shell::bg::BgJobState::Paused
+    ));
     registry.set_paused(&id, false).unwrap();
     wait_for_growth(&counter, frozen).await;
     bg(&control, serde_json::json!({"action": "kill", "id": id})).await;
     let jobs = registry.jobs();
+    assert_eq!(registry.jobs_for_view(view), jobs);
     assert!(matches!(
         jobs[0].state,
         agent_tools_shell::bg::BgJobState::Done {

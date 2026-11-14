@@ -55,6 +55,8 @@ registry carries a pause control capability rather than issuing signals from
 cached PIDs. Completion notifications follow owner completion and log draining;
 unconfirmed cleanup is reported as an error. A prepared job requires its
 session's job registry.
+`BgRegistry::jobs_for_view` selects jobs by their retained private-view identity
+without changing the Host job-event payload.
 
 `ManagedChild::control` retains a pause capability tied to its actual owner.
 Native process control is synchronized with reaping. Linux isolated control uses
