@@ -8,7 +8,7 @@ edition = "2021"
 # here depends on the kernel that instantiates it. Serena runs as an MCP child
 # over stdio, so there is no HTTP client and no plugin dependency either.
 agent-tool.workspace = true
-agent-capabilities = { path = "../agent-capabilities" }
+agent-capabilities = { path = "../agent-capabilities", features = ["sandbox"] }
 agent-sandbox = { path = "../agent-sandbox" }
 async-trait.workspace = true
 futures.workspace = true
@@ -18,4 +18,5 @@ schemars.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+anyhow.workspace = true
 tempfile = "3"

@@ -219,7 +219,7 @@ impl SerenaLaunch {
     }
 
     /// Explicit override → installed `serena` → `uvx`.
-    fn resolve(&self, root: &Path) -> (String, Vec<String>) {
+    pub(crate) fn resolve(&self, root: &Path) -> (String, Vec<String>) {
         if let Some(argv) = &self.argv_override {
             let program = self.program.clone().unwrap_or_else(|| "serena".into());
             return (program, argv.clone());
@@ -301,7 +301,17 @@ impl SerenaBridge {
         child: SandboxedChild,
         lease: Arc<SnapshotLease>,
     ) -> Result<Arc<Self>, ToolError> {
-        Self::connect(root, program, child.into(), Some(lease)).await
+        Self::from_managed(root, program, child.into(), Some(lease)).await
+    }
+
+    /// Attach to a managed child. A lease stays alive until owned stdio tasks finish.
+    pub async fn from_managed(
+        root: &Path,
+        program: String,
+        child: ManagedChild,
+        lease: Option<Arc<SnapshotLease>>,
+    ) -> Result<Arc<Self>, ToolError> {
+        Self::connect(root, program, child, lease).await
     }
 
     async fn connect(
