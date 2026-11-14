@@ -10,14 +10,16 @@ use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{oneshot, Mutex};
 
+use agent_sandbox::process::{ManagedChild, ProcessInput};
+use agent_sandbox::snapshot::SnapshotLease;
+use agent_sandbox::spawn::SandboxedChild;
 use agent_tool::ToolError;
 
 /// `uvx` first-run can take a while (resolve + build + import); the
@@ -31,6 +33,8 @@ pub const CALL_TIMEOUT: Duration = Duration::from_secs(90);
 /// How much of the child's stderr to keep for error messages. A ring buffer,
 /// not a log: Serena is chatty on startup and we only ever want the tail.
 const STDERR_TAIL_BYTES: usize = 64 * 1024;
+const MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// One tool as the server describes it in `tools/list`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -47,7 +51,70 @@ pub struct SerenaToolInfo {
 /// A response slot: the reader resolves it with the server's reply, or with a
 /// failure reason when the child dies (so a dead server fails its in-flight
 /// requests *now* instead of parking them until the timeout).
-type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, ToolError>>>>>;
+type Pending = Arc<StdMutex<HashMap<u64, oneshot::Sender<Result<Value, ToolError>>>>>;
+type Input = Arc<Mutex<Option<ProcessInput>>>;
+type ChildOwner = Arc<Mutex<ManagedChild>>;
+type Reader = tokio::task::JoinHandle<Result<(), String>>;
+
+fn fail_pending(pending: &Pending, reason: &str) {
+    for (_, tx) in pending.lock().unwrap_or_else(|e| e.into_inner()).drain() {
+        let _ = tx.send(Err(ToolError::Failed(reason.to_owned())));
+    }
+}
+
+async fn cleanup_child(child: &ChildOwner, stdin: &Input) -> Result<(), String> {
+    let result = child
+        .lock()
+        .await
+        .kill()
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("serena process cleanup: {e}"));
+    stdin.lock().await.take();
+    result
+}
+
+async fn read_frame(
+    reader: &mut (impl AsyncBufRead + Unpin),
+    frame: &mut Vec<u8>,
+) -> std::io::Result<bool> {
+    frame.clear();
+    loop {
+        let bytes = reader.fill_buf().await?;
+        if bytes.is_empty() {
+            return Ok(!frame.is_empty());
+        }
+        let end = bytes.iter().position(|&b| b == b'\n');
+        let count = end.map_or(bytes.len(), |n| n + 1);
+        if frame.len() + count > MAX_FRAME_BYTES {
+            return Err(std::io::Error::other("serena incoming frame exceeds limit"));
+        }
+        frame.extend_from_slice(&bytes[..count]);
+        reader.consume(count);
+        if end.is_some() {
+            return Ok(true);
+        }
+    }
+}
+
+struct PendingRequest<'a> {
+    bridge: &'a SerenaBridge,
+    id: u64,
+    completed: bool,
+}
+
+impl Drop for PendingRequest<'_> {
+    fn drop(&mut self) {
+        self.bridge
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.id);
+        if !self.completed {
+            self.bridge.cancel("serena request cancelled");
+        }
+    }
+}
 
 /// What the meta-tool needs from a live server. A trait so the manager's
 /// scoping and restart behaviour can be tested without `uvx`, without a
@@ -177,6 +244,8 @@ impl SerenaLaunch {
             // undiagnosable (see `diagnostics`).
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        #[cfg(unix)]
+        cmd.process_group(0);
         cmd
     }
 }
@@ -196,13 +265,13 @@ pub struct SerenaBridge {
     program: String,
     /// Root the server was scoped to — for diagnostics and error messages.
     root: std::path::PathBuf,
-    stdin: Mutex<ChildStdin>,
+    stdin: Input,
     pending: Pending,
     req_id: AtomicU64,
-    _child: Mutex<Child>,
-    /// Set by the stdout reader when the pipe closes — the single source of
-    /// truth for "this bridge is dead". `Arc` because the reader task owns a
-    /// clone of it.
+    // Cleanup requests kill before yielding while this lock is held.
+    child: ChildOwner,
+    readers: Mutex<Vec<Reader>>,
+    /// Closed request admission, shared with the stdout owner.
     dead: Arc<AtomicBool>,
     stderr_tail: Arc<Mutex<VecDeque<u8>>>,
 }
@@ -216,13 +285,31 @@ impl SerenaBridge {
 
     pub async fn spawn_with(root: &Path, launch: SerenaLaunch) -> Result<Arc<Self>, ToolError> {
         let (program, args) = launch.resolve(root);
-        let mut child = launch.command(&program, &args, root).spawn().map_err(|e| {
+        let child = launch.command(&program, &args, root).spawn().map_err(|e| {
             ToolError::Failed(format!(
                 "spawn serena via `{program}` failed: {e}\n(install it: `uv tool install \
                  -p 3.13 serena-agent`, then `serena init` — `uvx` is only the fallback)"
             ))
         })?;
+        Self::connect(root, program, ManagedChild::from_process_group(child), None).await
+    }
 
+    /// Attach to an isolated server, retaining its lease until stdio cleanup completes.
+    pub async fn from_isolated(
+        root: &Path,
+        program: String,
+        child: SandboxedChild,
+        lease: Arc<SnapshotLease>,
+    ) -> Result<Arc<Self>, ToolError> {
+        Self::connect(root, program, child.into(), Some(lease)).await
+    }
+
+    async fn connect(
+        root: &Path,
+        program: String,
+        mut child: ManagedChild,
+        lease: Option<Arc<SnapshotLease>>,
+    ) -> Result<Arc<Self>, ToolError> {
         let stdin = child
             .stdin
             .take()
@@ -236,15 +323,16 @@ impl SerenaBridge {
             .take()
             .ok_or_else(|| ToolError::Failed("serena child has no stderr".into()))?;
 
-        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let pending: Pending = Arc::new(StdMutex::new(HashMap::new()));
         let stderr_tail: Arc<Mutex<VecDeque<u8>>> = Arc::new(Mutex::new(VecDeque::new()));
         let bridge = Arc::new(Self {
             program,
             root: root.to_path_buf(),
-            stdin: Mutex::new(stdin),
+            stdin: Arc::new(Mutex::new(Some(stdin))),
             pending: pending.clone(),
             req_id: AtomicU64::new(1),
-            _child: Mutex::new(child),
+            child: Arc::new(Mutex::new(child)),
+            readers: Mutex::new(Vec::new()),
             dead: Arc::new(AtomicBool::new(false)),
             stderr_tail: stderr_tail.clone(),
         });
@@ -252,11 +340,17 @@ impl SerenaBridge {
         // stderr → ring buffer. Chunked, not line-based: uv/pip progress and a
         // Python traceback both arrive without useful line structure.
         let stderr_ring = stderr_tail.clone();
-        tokio::spawn(async move {
+        let stderr_lease = lease.clone();
+        let stderr_task = tokio::spawn(async move {
+            let _lease = stderr_lease;
             let mut reader = BufReader::new(stderr);
             let mut buf = [0u8; 4096];
             let tail = stderr_ring;
-            while let Ok(n) = reader.read(&mut buf).await {
+            loop {
+                let n = reader
+                    .read(&mut buf)
+                    .await
+                    .map_err(|e| format!("serena stderr: {e}"))?;
                 if n == 0 {
                     break;
                 }
@@ -266,51 +360,58 @@ impl SerenaBridge {
                     ring.pop_front();
                 }
             }
+            Ok(())
         });
 
-        // stdout → pending. On EOF the child is gone: mark the bridge dead and
-        // fail every in-flight request *with a reason* instead of letting them
-        // sit until the 90s timeout.
-        {
+        let stdout_task = {
             let pending = pending.clone();
             let dead = bridge.dead.clone();
-            let tail = stderr_tail.clone();
+            let child = bridge.child.clone();
+            let stdin = bridge.stdin.clone();
             tokio::spawn(async move {
-                let mut lines = BufReader::new(stdout).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    let Ok(v) = serde_json::from_str::<Value>(&line) else {
+                let _lease = lease;
+                let mut reader = BufReader::new(stdout);
+                let mut frame = Vec::new();
+                let reason = loop {
+                    match read_frame(&mut reader, &mut frame).await {
+                        Ok(true) => {}
+                        Ok(false) => break "serena server exited before answering".to_owned(),
+                        Err(e) => break format!("serena stdout: {e}"),
+                    }
+                    let Ok(v) = serde_json::from_slice::<Value>(&frame) else {
                         continue;
                     };
+                    if v.get("method").is_some()
+                        || (v.get("result").is_none() && v.get("error").is_none())
+                    {
+                        continue;
+                    }
                     if let Some(id) = v.get("id").and_then(|i| i.as_u64()) {
-                        if let Some(tx) = pending.lock().await.remove(&id) {
+                        let tx = pending
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .remove(&id);
+                        if let Some(tx) = tx {
                             let _ = tx.send(Ok(v));
                         }
                     }
-                }
-                dead.store(true, Ordering::Relaxed);
-                let tail_text = String::from_utf8_lossy(
-                    &tail.lock().await.iter().copied().collect::<Vec<u8>>(),
-                )
-                .trim()
-                .to_string();
-                let reason = if tail_text.is_empty() {
-                    "serena server exited before answering".to_string()
-                } else {
-                    format!("serena server exited before answering — stderr tail:\n{tail_text}")
                 };
-                for (_, tx) in pending.lock().await.drain() {
-                    let _ = tx.send(Err(ToolError::Failed(reason.clone())));
-                }
-            });
-        }
+                dead.store(true, Ordering::Release);
+                fail_pending(&pending, &reason);
+                cleanup_child(&child, &stdin).await
+            })
+        };
+        *bridge.readers.lock().await = vec![stderr_task, stdout_task];
 
         match bridge.initialize().await {
             Ok(()) => Ok(bridge),
-            Err(e) => Err(ToolError::Failed(format!(
-                "serena did not come up ({}): {e}{}",
-                bridge.program,
-                bridge.stderr_suffix().await
-            ))),
+            Err(e) => {
+                let e = bridge.transport_failure(e).await;
+                Err(ToolError::Failed(format!(
+                    "serena did not come up ({}): {e}",
+                    bridge.program,
+                )))
+            }
         }
     }
 
@@ -323,11 +424,46 @@ impl SerenaBridge {
         }
     }
 
-    /// Mark the bridge dead and kill the child (idempotent).
-    async fn shutdown_child(&self) {
-        self.dead.store(true, Ordering::Relaxed);
-        let mut child = self._child.lock().await;
-        let _ = child.start_kill();
+    fn cancel(&self, reason: &str) {
+        self.dead.store(true, Ordering::Release);
+        fail_pending(&self.pending, reason);
+        if let Ok(mut child) = self.child.try_lock() {
+            let _ = child.start_kill();
+        }
+    }
+
+    /// Confirm process termination and completion of every owned stdio task.
+    pub async fn shutdown(&self) -> Result<(), ToolError> {
+        self.cancel("serena bridge shut down");
+        tokio::time::timeout(CLEANUP_TIMEOUT, async {
+            cleanup_child(&self.child, &self.stdin)
+                .await
+                .map_err(ToolError::Failed)?;
+            let mut readers = self.readers.lock().await;
+            let mut failure = None;
+            // Keep the handle in the bridge while waiting so cancellation cannot detach it.
+            while let Some(reader) = readers.last_mut() {
+                let result = reader
+                    .await
+                    .map_err(|e| format!("serena reader task: {e}"))
+                    .and_then(|result| result);
+                readers.pop();
+                if let Err(error) = result {
+                    failure.get_or_insert(error);
+                }
+            }
+            failure.map_or(Ok(()), |error| Err(ToolError::Failed(error)))
+        })
+        .await
+        .map_err(|_| ToolError::Failed("serena cleanup timed out; quiescence unconfirmed".into()))?
+    }
+
+    async fn transport_failure(&self, error: ToolError) -> ToolError {
+        let error = match self.shutdown().await {
+            Ok(()) => error,
+            Err(cleanup) => ToolError::Failed(format!("{error}; {cleanup}")),
+        };
+        self.enrich(error).await
     }
 
     /// `initialize` + `notifications/initialized` handshake.
@@ -356,7 +492,15 @@ impl SerenaBridge {
         let mut line = serde_json::to_vec(body)
             .map_err(|e| ToolError::Failed(format!("serena encode: {e}")))?;
         line.push(b'\n');
+        if line.len() > MAX_FRAME_BYTES {
+            return Err(ToolError::Failed(
+                "serena outgoing frame exceeds limit".into(),
+            ));
+        }
         let mut stdin = self.stdin.lock().await;
+        let stdin = stdin
+            .as_mut()
+            .ok_or_else(|| ToolError::Failed("serena stdin is closed".into()))?;
         stdin
             .write_all(&line)
             .await
@@ -375,33 +519,32 @@ impl SerenaBridge {
     async fn request(&self, body: Value, timeout: Duration) -> Result<Value, ToolError> {
         let id = body.get("id").and_then(|i| i.as_u64()).unwrap_or(0);
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().await.insert(id, tx);
-
-        if let Err(e) = self.send(&body).await {
-            self.pending.lock().await.remove(&id);
-            return Err(self.enrich(e).await);
-        }
-
-        let reply = match tokio::time::timeout(timeout, rx).await {
-            Err(_) => {
-                self.pending.lock().await.remove(&id);
-                // The server is still busy with an id nobody waits for any more,
-                // so the next request would queue behind it: kill it and let the
-                // manager start a clean one.
-                self.shutdown_child().await;
-                Err(ToolError::Failed(format!(
-                    "serena request timed out after {}s (server killed; the next call restarts it)",
-                    timeout.as_secs()
-                )))
-            }
-            Ok(Err(_)) => Err(ToolError::Failed("serena response channel closed".into())),
-            Ok(Ok(Err(e))) => Err(e),
-            Ok(Ok(Ok(v))) => Ok(v),
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, tx);
+        let mut guard = PendingRequest {
+            bridge: self,
+            id,
+            completed: false,
         };
+        let reply = tokio::time::timeout(timeout, async {
+            self.send(&body).await?;
+            rx.await
+                .map_err(|_| ToolError::Failed("serena response channel closed".into()))?
+        })
+        .await
+        .unwrap_or_else(|_| {
+            Err(ToolError::Failed(format!(
+                "serena request timed out after {}s",
+                timeout.as_secs()
+            )))
+        });
         let v = match reply {
             Ok(v) => v,
-            Err(e) => return Err(self.enrich(e).await),
+            Err(e) => return Err(self.transport_failure(e).await),
         };
+        guard.completed = true;
         if let Some(err) = v.get("error") {
             return Err(ToolError::Failed(format!("serena rpc: {err}")));
         }
@@ -412,6 +555,12 @@ impl SerenaBridge {
     /// server process actually said.
     async fn enrich(&self, e: ToolError) -> ToolError {
         ToolError::Failed(format!("{e}{}", self.stderr_suffix().await))
+    }
+}
+
+impl Drop for SerenaBridge {
+    fn drop(&mut self) {
+        self.cancel("serena bridge dropped");
     }
 }
 
@@ -454,7 +603,7 @@ impl McpBridge for SerenaBridge {
     }
 
     fn is_healthy(&self) -> bool {
-        !self.dead.load(Ordering::Relaxed)
+        !self.dead.load(Ordering::Acquire)
     }
 
     async fn diagnostics(&self) -> String {
@@ -499,6 +648,7 @@ mod tests {
                 "--exact".into(),
                 STUB_TEST.into(),
                 "--nocapture".into(),
+                "--quiet".into(),
             ]),
         }
     }
@@ -524,6 +674,7 @@ mod tests {
     fn stub_main() {
         use std::io::{BufRead, Write};
         let mode = std::env::var(STUB_MODE).unwrap_or_default();
+        let mut held: Option<Value> = None;
         let stdin = std::io::stdin();
         for line in stdin.lock().lines() {
             let Ok(line) = line else { return };
@@ -552,6 +703,43 @@ mod tests {
                     }
                     // Never answer — drives the timeout path.
                     "silent" => {}
+                    "oversized" => {
+                        let _ = std::io::stdout().write_all(&vec![b'x'; MAX_FRAME_BYTES + 1]);
+                        let _ = std::io::stdout().flush();
+                    }
+                    "reverse-order" => {
+                        if let Some(first) = held.take() {
+                            for request in [v, first] {
+                                let response = json!({
+                                    "jsonrpc":"2.0",
+                                    "id":request["id"],
+                                    "result":{"content":[{
+                                        "type":"text",
+                                        "text":request["params"]["arguments"]["name_path"],
+                                    }]}
+                                });
+                                let _ = writeln!(std::io::stdout(), "{response}");
+                            }
+                            let _ = std::io::stdout().flush();
+                        } else {
+                            held = Some(v);
+                        }
+                    }
+                    "rpc-error" => {
+                        let error = json!({
+                            "jsonrpc":"2.0",
+                            "id":id,
+                            "error":{"code":-32602,"message":"bad arguments"},
+                        });
+                        let _ = writeln!(std::io::stdout(), "{error}");
+                        let _ = std::io::stdout().flush();
+                    }
+                    "write-on-call" => {
+                        std::fs::write("private-effect", "isolated").unwrap();
+                        if v["params"]["arguments"]["wait"] != true {
+                            reply(json!({"content":[{"type":"text","text":"stub-ok"}]}));
+                        }
+                    }
                     _ => reply(json!({"content":[{"type":"text","text":"stub-ok"}]})),
                 },
                 _ => {}
@@ -596,12 +784,13 @@ mod tests {
             .unwrap()
             .get("properties")
             .is_some());
+        bridge.shutdown().await.unwrap();
+        assert!(bridge.readers.lock().await.is_empty());
+        assert!(bridge.stdin.lock().await.is_none());
+        assert!(bridge.child.lock().await.try_wait().unwrap().is_some());
     }
 
-    /// A child that exits mid-request must fail that request with the reason
-    /// (and the stderr tail) *immediately* — the old reader loop just ended,
-    /// leaving the caller parked until the 90s timeout and the dead bridge
-    /// cached forever.
+    /// A child that exits mid-request must promptly report its stderr diagnostics.
     #[tokio::test]
     async fn dying_child_fails_in_flight_calls_with_stderr() {
         let dir = tempfile::tempdir().unwrap();
@@ -636,22 +825,214 @@ mod tests {
             .expect_err("no reply must time out");
         assert!(format!("{err}").contains("timed out"), "{err}");
         assert!(
-            bridge.pending.lock().await.is_empty(),
+            bridge.pending.lock().unwrap().is_empty(),
             "timeout leaked a pending slot"
         );
 
-        // Send-failure path: the stub is still alive, so kill it by closing
-        // the pipe — `send` then errors before a reply can arrive.
-        bridge.dead.store(true, Ordering::Relaxed);
+        // A closed bridge rejects new sends without retaining pending entries.
         let body = json!({"jsonrpc":"2.0","id":78,"method":"tools/call","params":{}});
         bridge
             .request(body, Duration::from_millis(150))
             .await
             .expect_err("dead bridge");
         assert!(
-            bridge.pending.lock().await.is_empty(),
+            bridge.pending.lock().unwrap().is_empty(),
             "send failure leaked a pending slot"
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_request_closes_the_transport_and_fails_other_waiters() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bridge, _guard) = stub_session("silent", dir.path()).await;
+        let other = {
+            let bridge = bridge.clone();
+            tokio::spawn(async move { bridge.call("find_symbol", json!({})).await })
+        };
+        assert!(tokio::time::timeout(
+            Duration::from_millis(100),
+            bridge.call("find_symbol", json!({})),
+        )
+        .await
+        .is_err());
+        tokio::time::timeout(Duration::from_secs(10), other)
+            .await
+            .unwrap()
+            .unwrap()
+            .expect_err("cancelling a request must fail other waiters");
+        bridge.shutdown().await.unwrap();
+        assert!(!bridge.is_healthy());
+        assert!(bridge.pending.lock().unwrap().is_empty());
+        assert!(bridge.child.lock().await.try_wait().unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn oversized_frame_fails_the_request_and_reaps_the_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bridge, _guard) = stub_session("oversized", dir.path()).await;
+        let error = tokio::time::timeout(
+            Duration::from_secs(10),
+            bridge.call("find_symbol", json!({})),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("incoming frame exceeds limit"),
+            "{error}"
+        );
+        assert!(!bridge.is_healthy());
+        assert!(bridge.pending.lock().unwrap().is_empty());
+        assert!(bridge.child.lock().await.try_wait().unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn concurrent_calls_match_out_of_order_replies_and_rpc_errors_keep_the_server() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let (bridge, _guard) = stub_session("reverse-order", dir.path()).await;
+            let (first, second) = tokio::join!(
+                bridge.call("find_symbol", json!({"name_path":"first"})),
+                bridge.call("find_symbol", json!({"name_path":"second"})),
+            );
+            assert_eq!(first.unwrap(), "first");
+            assert_eq!(second.unwrap(), "second");
+            bridge.shutdown().await.unwrap();
+        }
+        let (bridge, _guard) = stub_session("rpc-error", dir.path()).await;
+        let error = bridge.call("find_symbol", json!({})).await.unwrap_err();
+        assert!(error.to_string().contains("bad arguments"), "{error}");
+        assert!(bridge.is_healthy());
+        assert_eq!(bridge.list_tools().await.unwrap().len(), 1);
+        bridge.shutdown().await.unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn isolated_transport_holds_the_real_lease_through_io_cleanup() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use agent_sandbox::snapshot::{SnapshotBudget, SnapshotPreference, WorkspaceSnapshot};
+        use agent_sandbox::spawn::{
+            spawn_isolated, ExecutionKind, IsolatedSpawn, MemoryEnforcement,
+        };
+        use agent_sandbox::traits::SandboxConfig;
+
+        for termination in ["shutdown", "cancel", "drop"] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().canonicalize().unwrap();
+            let source = root.join("source");
+            let storage = root.join("storage");
+            std::fs::create_dir_all(&source).unwrap();
+            std::fs::create_dir_all(&storage).unwrap();
+            std::fs::set_permissions(&storage, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::write(source.join("original"), "unchanged").unwrap();
+            let mut snapshot = WorkspaceSnapshot::prepare(
+                std::slice::from_ref(&source),
+                &storage,
+                SnapshotBudget {
+                    max_bytes: 1024 * 1024,
+                    max_entries: 64,
+                    max_depth: 8,
+                },
+                SnapshotPreference::PrivateCopy,
+            )
+            .unwrap();
+            let lease = Arc::new(snapshot.lease().unwrap());
+            let program = std::env::current_exe().unwrap();
+            let request = IsolatedSpawn {
+                executable: program.clone(),
+                args: vec![
+                    "--exact".into(),
+                    STUB_TEST.into(),
+                    "--nocapture".into(),
+                    "--quiet".into(),
+                ],
+                env: vec![
+                    (STUB_MODE.into(), "write-on-call".into()),
+                    ("RUST_TEST_THREADS".into(), "1".into()),
+                ],
+                root: lease.roots().next(),
+                read_only: vec![program.clone(), "/usr/lib".into(), "/System/Library".into()],
+                deny_read: Vec::new(),
+                deny_write: Vec::new(),
+                max_memory_bytes: 128 * 1024 * 1024,
+                max_processes: 1,
+                memory_enforcement: MemoryEnforcement::MonitoredRss,
+                kind: ExecutionKind::Tool,
+                tool_policy: Some(SandboxConfig {
+                    workspace_dir: source.clone(),
+                    ..Default::default()
+                }),
+                linux_launcher: None,
+                linux_cgroup_parent: None,
+            };
+            let child = spawn_isolated(lease.clone(), &request).unwrap();
+            let bridge = tokio::time::timeout(
+                Duration::from_secs(10),
+                SerenaBridge::from_isolated(&source, program.display().to_string(), child, lease),
+            )
+            .await
+            .expect("isolated MCP handshake must complete")
+            .unwrap();
+            assert_eq!(
+                bridge.call("find_symbol", json!({})).await.unwrap(),
+                "stub-ok"
+            );
+            assert!(
+                snapshot.seal().is_err(),
+                "live transport must occupy the lease"
+            );
+            let retained = match termination {
+                "shutdown" => {
+                    bridge.shutdown().await.unwrap();
+                    assert!(bridge.stdin.lock().await.is_none());
+                    assert!(bridge.readers.lock().await.is_empty());
+                    assert!(bridge.child.lock().await.try_wait().unwrap().is_some());
+                    Some(bridge)
+                }
+                "cancel" => {
+                    assert!(tokio::time::timeout(
+                        Duration::from_millis(100),
+                        bridge.call("find_symbol", json!({"wait":true})),
+                    )
+                    .await
+                    .is_err());
+                    assert!(!bridge.is_healthy());
+                    Some(bridge)
+                }
+                "drop" => {
+                    drop(bridge);
+                    None
+                }
+                _ => unreachable!(),
+            };
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while snapshot.seal().is_err() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("transport termination must release the real lease");
+            if let Some(bridge) = retained {
+                assert!(bridge.stdin.lock().await.is_none());
+                assert!(bridge
+                    .readers
+                    .lock()
+                    .await
+                    .iter()
+                    .all(|task| task.is_finished()));
+                assert!(bridge.child.lock().await.try_wait().unwrap().is_some());
+            }
+            let changes = snapshot.diff().unwrap();
+            assert_eq!(changes.len(), 1);
+            assert_eq!(changes[0].path, Path::new("private-effect"));
+            assert!(!source.join("private-effect").exists());
+            assert_eq!(
+                std::fs::read_to_string(source.join("original")).unwrap(),
+                "unchanged"
+            );
+        }
     }
 
     #[tokio::test]

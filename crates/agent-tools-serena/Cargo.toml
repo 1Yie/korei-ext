@@ -9,6 +9,7 @@ edition = "2021"
 # over stdio, so there is no HTTP client and no plugin dependency either.
 agent-tool.workspace = true
 agent-capabilities = { path = "../agent-capabilities" }
+agent-sandbox = { path = "../agent-sandbox" }
 async-trait.workspace = true
 futures.workspace = true
 serde.workspace = true
