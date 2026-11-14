@@ -776,6 +776,14 @@ pub fn spawn_isolated(
             request.max_processes = request.max_processes.min(policy.max_processes);
         }
     }
+    // Host merges such as `/bin` -> `usr/bin` are real directories only after
+    // resolution. The directory walk does not follow links, so an unresolved
+    // parent fails as "not a directory".
+    #[cfg(unix)]
+    {
+        request.executable =
+            std::fs::canonicalize(&request.executable).context("resolve isolated executable")?;
+    }
     let request = &request;
     if request.max_memory_bytes == 0 || request.max_processes == 0 {
         bail!("isolated execution requires explicit memory and process limits");
