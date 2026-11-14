@@ -1204,6 +1204,163 @@ mod tests {
         assert!(check_exec_arg("/etc/hostname").is_err());
     }
 
+    /// A prepared view must hand officecli its private file, not the host
+    /// source. The real `officecli` binary is not required: the resolved path
+    /// is written through the same leased shell pipeline the tool uses.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn leased_file_path_is_private_and_the_source_stays_unchanged() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Arc;
+
+        use agent_capabilities::{SandboxCtx, WorkspaceCtx};
+        use agent_sandbox::snapshot::{
+            SnapshotBudget, SnapshotLease, SnapshotPreference, WorkspaceSnapshot,
+        };
+        use agent_sandbox::spawn::{
+            spawn_isolated, ExecutionKind, IsolatedSpawn, MemoryEnforcement, SandboxedChild,
+        };
+        use agent_sandbox::{
+            CommandOutput, SandboxBackend, SandboxCapabilities, SandboxConfig, SandboxTier,
+        };
+        use agent_tool::ToolContext;
+        use agent_tools_shell::sandbox_cfg::prepare;
+
+        #[derive(Default)]
+        struct Ctx(agent_tool::Extensions);
+
+        impl ToolContext for Ctx {
+            fn extensions(&self) -> &agent_tool::Extensions {
+                &self.0
+            }
+
+            fn extensions_mut(&mut self) -> &mut agent_tool::Extensions {
+                &mut self.0
+            }
+        }
+
+        struct LeasedBackend;
+
+        #[async_trait::async_trait]
+        impl SandboxBackend for LeasedBackend {
+            fn id(&self) -> &'static str {
+                "leased-test"
+            }
+
+            fn tier(&self) -> SandboxTier {
+                SandboxTier::L2
+            }
+
+            fn capabilities(&self) -> SandboxCapabilities {
+                SandboxCapabilities {
+                    filesystem: true,
+                    network: true,
+                    snapshots: true,
+                }
+            }
+
+            async fn run_command(
+                &self,
+                _: &str,
+                _: &[&str],
+                _: &SandboxConfig,
+            ) -> anyhow::Result<CommandOutput> {
+                anyhow::bail!("ordinary command execution must not be used")
+            }
+
+            fn wrap_spawn(
+                &self,
+                _: &SandboxConfig,
+                _: &str,
+                _: &[&str],
+            ) -> Option<tokio::process::Command> {
+                panic!("ordinary process wrapping must not be used")
+            }
+
+            fn spawn_leased(
+                &self,
+                lease: Arc<SnapshotLease>,
+                cfg: &SandboxConfig,
+                cmd: &str,
+                args: &[&str],
+            ) -> anyhow::Result<SandboxedChild> {
+                let executable = std::fs::canonicalize(cmd)?;
+                let request = IsolatedSpawn {
+                    executable: executable.clone(),
+                    linux_launcher: None,
+                    linux_cgroup_parent: None,
+                    args: args.iter().map(std::ffi::OsString::from).collect(),
+                    root: Some(lease.map_source(&cfg.workspace_dir)?.0),
+                    kind: ExecutionKind::Tool,
+                    read_only: vec!["/bin".into(), "/usr/lib".into(), "/System/Library".into()],
+                    deny_read: Vec::new(),
+                    deny_write: Vec::new(),
+                    env: Vec::new(),
+                    max_memory_bytes: 64 * 1024 * 1024,
+                    max_processes: 1,
+                    memory_enforcement: MemoryEnforcement::MonitoredRss,
+                    tool_policy: Some(cfg.clone()),
+                };
+                spawn_isolated(lease, &request)
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let source = base.join("source");
+        let storage = base.join("storage");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&storage).unwrap();
+        std::fs::set_permissions(&storage, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(source.join("original"), "unchanged").unwrap();
+        let mut snapshot = WorkspaceSnapshot::prepare(
+            &[source.clone()],
+            &storage,
+            SnapshotBudget {
+                max_bytes: 1024 * 1024,
+                max_entries: 64,
+                max_depth: 8,
+            },
+            SnapshotPreference::PrivateCopy,
+        )
+        .unwrap();
+        let mut ctx = Ctx::default().with_workspace(&source);
+        ctx.install_workspace_lease(snapshot.lease().unwrap())
+            .unwrap();
+        ctx.install_sandbox(Arc::new(LeasedBackend));
+        let ctx = Arc::new(ctx);
+
+        let resolved = resolve_file(&ctx, "original").unwrap();
+        let lease = ctx.workspace_lease().unwrap();
+        let (id, relative) = lease.map_source(&source.join("original")).unwrap();
+        let private_file = lease.working_root(id).unwrap().join(relative);
+        assert_eq!(resolved, private_file.display().to_string());
+        assert_ne!(resolved, source.join("original").display().to_string());
+        assert!(resolve_file(&ctx, "../secret").is_err());
+        assert!(check_exec_arg(source.join("original").to_str().unwrap()).is_err());
+
+        let cmd = format!("printf leased > {}", shell_join(&[resolved]));
+        let (_verdict, cfg) = prepare(&*ctx, &cmd, Duration::from_secs(30)).unwrap();
+        assert!(
+            !cfg.allow_network,
+            "a file write must not open tool network"
+        );
+        let output = ctx.run_command(&cmd, &[], &cfg).await.unwrap();
+        assert_eq!(output.status, 0, "{}", output.stderr);
+        assert_eq!(std::fs::read_to_string(&private_file).unwrap(), "leased");
+        assert_eq!(
+            std::fs::read_to_string(source.join("original")).unwrap(),
+            "unchanged"
+        );
+        assert!(
+            snapshot.seal().is_err(),
+            "the live command must hold the lease"
+        );
+        drop(lease);
+        drop(ctx);
+        assert_eq!(snapshot.seal().unwrap().len(), 1);
+    }
+
     /// Missing timeout uses the default; an oversized one is clamped.
     #[test]
     fn timeout_of_defaults_and_clamps() {
