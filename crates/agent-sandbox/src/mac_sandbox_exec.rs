@@ -31,6 +31,11 @@
 //!  - DNS inside the sandbox is denied — name resolution happens at the
 //!    proxy, host-side.
 //!
+//! `spawn_leased` does not use that profile. Prepared execution goes through
+//! `spawn_isolated`: one process, fork denied, no network or extra read
+//! exceptions, and monitored RSS. Unprepared `run_command` and `wrap_spawn`
+//! keep the profile above.
+//!
 //! UNTESTED-on-CI note: this file compiles only on macOS.
 
 #![cfg(target_os = "macos")]
@@ -308,6 +313,47 @@ impl SandboxBackend for MacSandboxExec {
         c.process_group(0);
         Some(c)
     }
+
+    fn spawn_leased(
+        &self,
+        lease: std::sync::Arc<crate::snapshot::SnapshotLease>,
+        cfg: &SandboxConfig,
+        cmd: &str,
+        args: &[&str],
+    ) -> Result<crate::spawn::SandboxedChild> {
+        if cfg.allow_network || !cfg.allowed_domains.is_empty() || !cfg.allow_read.is_empty() {
+            anyhow::bail!(
+                "prepared macOS execution does not grant network or extra read exceptions"
+            );
+        }
+        if cfg.max_processes > 1 {
+            anyhow::bail!("prepared macOS execution supports exactly one process");
+        }
+        let executable = std::fs::canonicalize(cmd)
+            .with_context(|| format!("canonicalize prepared executable {cmd}"))?;
+        let request = crate::spawn::IsolatedSpawn {
+            executable,
+            linux_launcher: None,
+            linux_cgroup_parent: None,
+            args: args.iter().map(std::ffi::OsString::from).collect(),
+            root: Some(lease.map_source(&cfg.workspace_dir)?.0),
+            kind: crate::spawn::ExecutionKind::Tool,
+            read_only: vec!["/usr/lib".into(), "/System/Library".into()],
+            deny_read: Vec::new(),
+            deny_write: Vec::new(),
+            env: Vec::new(),
+            // A zero host cap cannot be expressed as an absent monitor limit.
+            max_memory_bytes: if cfg.max_memory_mb == 0 {
+                u64::MAX
+            } else {
+                cfg.max_memory_mb.saturating_mul(1024 * 1024)
+            },
+            max_processes: 1,
+            memory_enforcement: crate::spawn::MemoryEnforcement::MonitoredRss,
+            tool_policy: Some(cfg.clone()),
+        };
+        crate::spawn::spawn_isolated(lease, &request)
+    }
 }
 
 /// `sandbox-exec` shipped with macOS — absent ⇒ fall through to `none`.
@@ -319,4 +365,145 @@ pub fn sandbox_exec_on_path() -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::Arc;
+
+    use tokio::io::AsyncReadExt;
+
+    use super::MacSandboxExec;
+    use crate::snapshot::{SnapshotBudget, SnapshotPreference, WorkspaceSnapshot};
+    use crate::spawn::SandboxedChild;
+    use crate::traits::{SandboxBackend, SandboxConfig};
+
+    fn prepared() -> (tempfile::TempDir, WorkspaceSnapshot, SandboxConfig) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let source = root.join("source");
+        let storage = root.join("storage");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&storage).unwrap();
+        std::fs::set_permissions(&storage, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(source.join("original"), "unchanged").unwrap();
+        let snapshot = WorkspaceSnapshot::prepare(
+            &[source.clone()],
+            &storage,
+            SnapshotBudget {
+                max_bytes: 1024 * 1024,
+                max_entries: 64,
+                max_depth: 8,
+            },
+            SnapshotPreference::PrivateCopy,
+        )
+        .unwrap();
+        let cfg = SandboxConfig {
+            workspace_dir: source,
+            allow_network: false,
+            ..SandboxConfig::default()
+        };
+        (temp, snapshot, cfg)
+    }
+
+    async fn finish(mut child: SandboxedChild) -> std::process::ExitStatus {
+        child.stdin.take();
+        let mut stdout = child.stdout.take().unwrap();
+        let mut stderr = child.stderr.take().unwrap();
+        let (status, _, _) = tokio::join!(
+            child.wait(),
+            async {
+                let mut bytes = Vec::new();
+                stdout.read_to_end(&mut bytes).await.unwrap();
+                bytes
+            },
+            async {
+                let mut bytes = Vec::new();
+                stderr.read_to_end(&mut bytes).await.unwrap();
+                bytes
+            },
+        );
+        status.unwrap()
+    }
+
+    #[tokio::test]
+    async fn prepared_launch_writes_the_private_view_and_releases_the_lease() {
+        let (_temp, mut snapshot, cfg) = prepared();
+        let source = cfg.workspace_dir.clone();
+        let lease = Arc::new(snapshot.lease().unwrap());
+        let (id, relative) = lease.map_source(&source.join("original")).unwrap();
+        let private_file = lease.working_root(id).unwrap().join(relative);
+        let mut child = MacSandboxExec
+            .spawn_leased(
+                lease.clone(),
+                &cfg,
+                "/bin/sh",
+                &["-c", "printf leased > original; sleep 30"],
+            )
+            .unwrap();
+        assert!(
+            snapshot.seal().is_err(),
+            "a live prepared process must occupy the lease"
+        );
+        child.kill().await.unwrap();
+        drop(lease);
+        assert_eq!(std::fs::read_to_string(&private_file).unwrap(), "leased");
+        assert_eq!(
+            std::fs::read_to_string(source.join("original")).unwrap(),
+            "unchanged"
+        );
+        assert_eq!(snapshot.seal().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn prepared_launch_rejects_network_process_trees_and_forks() {
+        let (_temp, mut snapshot, mut cfg) = prepared();
+        let source = cfg.workspace_dir.clone();
+        let lease = Arc::new(snapshot.lease().unwrap());
+        cfg.allow_network = true;
+        let Err(error) = MacSandboxExec.spawn_leased(
+            lease.clone(),
+            &cfg,
+            "/bin/sh",
+            &["-c", "printf no > original"],
+        ) else {
+            panic!("network must be rejected before launch");
+        };
+        assert!(error.to_string().contains("network"), "{error}");
+        cfg.allow_network = false;
+        cfg.max_processes = 2;
+        let Err(error) = MacSandboxExec.spawn_leased(
+            lease.clone(),
+            &cfg,
+            "/bin/sh",
+            &["-c", "printf no > original"],
+        ) else {
+            panic!("a process tree must be rejected before launch");
+        };
+        assert!(error.to_string().contains("one process"), "{error}");
+        cfg.max_processes = 1;
+        let child = MacSandboxExec
+            .spawn_leased(
+                lease.clone(),
+                &cfg,
+                "/bin/sh",
+                &["-c", "(/bin/sh -c 'printf child > child-marker')"],
+            )
+            .unwrap();
+        let status = finish(child).await;
+        assert!(!status.success(), "fork must be denied, status {status}");
+        drop(lease);
+        let changes = snapshot.seal().unwrap();
+        assert!(
+            changes
+                .iter()
+                .all(|change| change.path != std::path::Path::new("child-marker")),
+            "forked child must not write {changes:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(source.join("original")).unwrap(),
+            "unchanged"
+        );
+    }
 }
