@@ -376,6 +376,25 @@ pub(crate) fn spawn(
     }
     let profile = Profile::create()?;
     let mut grants = Vec::new();
+    // The private parent DACL does not include the AppContainer. Without
+    // traverse there, CreateProcessW reports the working directory as an
+    // invalid name. Traverse does not include write or create.
+    if let Some(parent) = cwd.parent() {
+        grants.push(AclGrant::entry(
+            acl_file(parent)?,
+            profile.sid,
+            FILE_GENERIC_EXECUTE,
+            GRANT_ACCESS,
+            true,
+        )?);
+    }
+    grants.push(AclGrant::entry(
+        acl_file(&cwd)?,
+        profile.sid,
+        FILE_GENERIC_EXECUTE,
+        GRANT_ACCESS,
+        true,
+    )?);
     grant_tree(
         &directory.path,
         profile.sid,
@@ -531,7 +550,8 @@ pub(crate) fn spawn(
             &startup.StartupInfo,
             &mut information,
         )
-    })?;
+    })
+    .context("CreateProcessW")?;
     let mut suspended = Suspended {
         process: Handle(information.hProcess),
         thread: Handle(information.hThread),

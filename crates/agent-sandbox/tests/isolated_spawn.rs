@@ -804,7 +804,7 @@ async fn running_process_cannot_release_its_scope() {
 #[tokio::test]
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 async fn owned_pause_stops_private_writes_and_expires_with_the_process() {
-    let (_temp, mut snapshot, source) = snapshot();
+    let (temp, mut snapshot, source) = snapshot();
     let lease = snapshot.lease().unwrap();
     let root = lease.roots().next().unwrap();
     let counter = lease.working_root(root).unwrap().join("counter");
@@ -813,6 +813,12 @@ async fn owned_pause_stops_private_writes_and_expires_with_the_process() {
         "while :; do printf x >> counter; done".into(),
         ExecutionKind::Tool,
     );
+    #[cfg(target_os = "linux")]
+    {
+        request.linux_launcher = Some(install_launcher(temp.path()));
+    }
+    // The temp directory owns the snapshot until the process and lease are gone.
+    let _snapshot_storage = temp;
     request.tool_policy = Some(agent_sandbox::SandboxConfig {
         workspace_dir: source,
         ..Default::default()
