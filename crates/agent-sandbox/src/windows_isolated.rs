@@ -627,7 +627,11 @@ mod tests {
         assert!(std::fs::read(std::env::var_os("KOREI_PROBE_FILE").unwrap()).is_err());
         assert!(std::fs::write(std::env::current_dir().unwrap().join("escape"), b"x").is_err());
         let port: u16 = std::env::var("KOREI_PROBE_PORT").unwrap().parse().unwrap();
-        assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err());
+        assert!(std::net::TcpStream::connect_timeout(
+            &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+            Duration::from_secs(1),
+        )
+        .is_err());
         assert!(std::process::Command::new(std::env::current_exe().unwrap())
             .arg("--list")
             .spawn()
@@ -712,10 +716,23 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(250)).await;
                 process.start_kill().unwrap();
             }
-            let status = tokio::time::timeout(Duration::from_secs(10), process.wait())
-                .await
-                .unwrap()
-                .unwrap();
+            let status = match tokio::time::timeout(Duration::from_secs(10), process.wait()).await {
+                Ok(status) => status.unwrap(),
+                Err(_) => {
+                    process.start_kill().unwrap();
+                    tokio::time::timeout(Duration::from_secs(5), process.wait())
+                        .await
+                        .expect("timed-out probe did not terminate")
+                        .unwrap();
+                    let out = output.await.unwrap();
+                    let errors = errors.await.unwrap();
+                    panic!(
+                        "probe timed out (cancel={cancel}); stdout: {}; stderr: {}",
+                        String::from_utf8_lossy(&out),
+                        String::from_utf8_lossy(&errors),
+                    );
+                }
+            };
             let out = output.await.unwrap();
             let errors = errors.await.unwrap();
             if !cancel {
