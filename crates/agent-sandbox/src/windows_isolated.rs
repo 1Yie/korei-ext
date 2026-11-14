@@ -19,6 +19,7 @@ use windows_sys::Win32::Security::Isolation::*;
 use windows_sys::Win32::Security::*;
 use windows_sys::Win32::Storage::FileSystem::*;
 use windows_sys::Win32::System::JobObjects::*;
+use windows_sys::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
 use windows_sys::Win32::System::Threading::*;
 
 use crate::snapshot::WorkerScope;
@@ -504,6 +505,26 @@ pub(crate) fn spawn(
     command.push(0);
     let mut environment = Vec::new();
     let mut entries = request.env.clone();
+    if !entries
+        .iter()
+        .any(|(key, _)| key.eq_ignore_ascii_case("SystemRoot"))
+    {
+        // AppContainer creation needs SystemRoot even with an isolated environment.
+        let mut directory = [0u16; MAX_PATH as usize + 1];
+        let length =
+            unsafe { GetSystemWindowsDirectoryW(directory.as_mut_ptr(), directory.len() as u32) }
+                as usize;
+        if length == 0 {
+            return Err(io::Error::last_os_error()).context("read Windows system directory");
+        }
+        if length >= directory.len() {
+            bail!("Windows system directory exceeds the supported path length");
+        }
+        entries.push((
+            "SystemRoot".into(),
+            String::from_utf16(&directory[..length])?,
+        ));
+    }
     entries.sort_by_key(|(key, _)| key.to_uppercase());
     let mut previous: Option<String> = None;
     for (key, value) in entries {
@@ -580,6 +601,7 @@ mod tests {
             return;
         }
         assert!(std::env::var_os("HOME").is_none());
+        assert!(std::env::var_os("SystemRoot").is_some());
         assert!(std::fs::read(std::env::var_os("KOREI_PROBE_FILE").unwrap()).is_err());
         assert!(std::fs::write(std::env::current_dir().unwrap().join("escape"), b"x").is_err());
         let port: u16 = std::env::var("KOREI_PROBE_PORT").unwrap().parse().unwrap();
