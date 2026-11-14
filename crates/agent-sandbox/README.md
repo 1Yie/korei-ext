@@ -81,6 +81,8 @@ are untouched. After the main process exits or cancellation is requested,
 the owner terminates remaining Job members and waits for `ActiveProcesses`
 to reach zero before releasing the scope, AppContainer profile and temporary
 ACL grants. See [windows_isolated.rs](src/windows_isolated.rs).
+Required Windows runtime environment entries omitted by the caller are obtained
+from OS APIs; the host environment is not inherited.
 
 ### Linux Execution Setup
 
@@ -233,7 +235,7 @@ rejections, explicit runtime symlinks, protected aliases and cancellation/reap.
 Owner regressions cover descendants that keep writing after the main process
 exits, double-fork and `setsid()` cancellation, endpoint Drop, setup/exec/migration
 failures and retention when cleanup cannot be proven.
-Missing prerequisites fail the tests. Native Linux execution remains pending.
+Missing prerequisites fail the tests.
 
 The host-UID rejection branch needs a separate run from an existing Linux root
 environment, selecting only
@@ -245,4 +247,6 @@ containment, ADS/hardlink rejection, snapshot publication and in-place
 junction mutation with pinned directory handles.
 Run them on Windows with
 `cargo test --locked --offline -p agent-sandbox --lib --bin agent-sandbox-launcher`
-under the same build-resource limits. Native Windows execution remains pending.
+under the same build-resource limits. The
+[Code Mode Native workflow](../../.github/workflows/code-mode-native.yml) runs
+both platform suites with their native prerequisites.
