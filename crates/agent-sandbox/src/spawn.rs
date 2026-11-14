@@ -24,12 +24,18 @@ pub enum MemoryEnforcement {
 }
 
 pub enum ExecutionScope {
-    Snapshot(SnapshotLease),
+    Snapshot(Arc<SnapshotLease>),
     Worker(WorkerScope),
 }
 
 impl From<SnapshotLease> for ExecutionScope {
     fn from(lease: SnapshotLease) -> Self {
+        Self::Snapshot(Arc::new(lease))
+    }
+}
+
+impl From<Arc<SnapshotLease>> for ExecutionScope {
+    fn from(lease: Arc<SnapshotLease>) -> Self {
         Self::Snapshot(lease)
     }
 }
@@ -126,6 +132,16 @@ impl Drop for SandboxedChild {
 }
 
 impl SandboxedChild {
+    /// Observe completion only after the owner has finished scope cleanup.
+    pub fn try_wait(&self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        let closed = self.completion.has_changed().is_err();
+        match self.completion.borrow().as_ref() {
+            Some(result) => result.clone().map(Some).map_err(std::io::Error::other),
+            None if closed => Err(std::io::Error::other("execution owner lost completion")),
+            None => Ok(None),
+        }
+    }
+
     /// Wait for quiescence and scope release. Dropping this future only stops waiting.
     /// An owner error retains the scope whenever quiescence could not be proved.
     pub async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {

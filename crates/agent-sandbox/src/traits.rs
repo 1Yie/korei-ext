@@ -194,6 +194,21 @@ pub trait SandboxBackend: Send + Sync {
         cfg: &SandboxConfig,
     ) -> anyhow::Result<CommandOutput>;
 
+    /// Start a tool through its prepared view and return the real isolated owner.
+    /// A backend must bind its trusted launch resources to the supplied lease.
+    fn spawn_leased(
+        &self,
+        _lease: std::sync::Arc<crate::snapshot::SnapshotLease>,
+        _cfg: &SandboxConfig,
+        _cmd: &str,
+        _args: &[&str],
+    ) -> anyhow::Result<crate::spawn::SandboxedChild> {
+        anyhow::bail!(
+            "sandbox backend `{}` has no lease-bound process launcher; refusing before execution",
+            self.id()
+        )
+    }
+
     /// Build a long-lived `Command` that runs `cmd args` inside the sandbox
     /// — for servers the caller keeps alive (MCP stdio children, plugin
     /// hooks). Unlike `run_command` nothing pipes output or enforces a

@@ -23,6 +23,15 @@ Dropping a wait future stops that waiter; dropping the endpoint requests
 cancellation. The owner continues cleanup in both cases. An owner error that
 leaves cleanup unproven retains the actual scope and reports an error.
 
+`process::ManagedChild` retains either a native child or that isolated owner
+behind the same piped I/O and control operations. `SandboxCtx::spawn_process`
+uses `SandboxBackend::spawn_leased` for prepared workspace contexts. Its default
+refuses execution; the Host supplies a launcher using the passed lease.
+Read-only roots are carried into the process's write-deny policy, and revoked
+roots are rejected before launch. Ordinary contexts use the backend's native
+wrapper. A shared `Arc<SnapshotLease>` keeps its original root range and blocks
+sealing until every context and process owner releases it.
+
 Use `WorkerScope::prepare` for a private empty working directory without
 workspace authorization. Tool execution requires a live `SnapshotLease` and
 the original `SandboxConfig`; its protected paths and read-only mounts are
