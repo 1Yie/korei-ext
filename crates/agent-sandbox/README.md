@@ -46,6 +46,9 @@ lease through their synchronous file appends; a completed process remains
 `draining` until those readers finish. Service stop retains its owner during
 cancellation and reports success after process and log cleanup. Registry teardown
 requests process cancellation without retaining a context/registry reference cycle.
+The Host reads structured service state and private-view association through
+`ServiceRegistry::services`; `ServiceRegistry::stop` uses the same confirmed
+cleanup path as the service tool.
 
 Background jobs use the same owner and lease-retaining log pump. Their session
 registry carries a pause control capability rather than issuing signals from

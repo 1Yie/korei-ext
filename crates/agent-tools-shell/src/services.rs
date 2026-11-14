@@ -26,6 +26,54 @@ pub struct ServiceRegistry {
     map: Mutex<BTreeMap<String, Service>>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ServiceInfo {
+    pub id: String,
+    pub command: String,
+    pub pid: Option<u32>,
+    pub log_path: PathBuf,
+    pub workspace_view: Option<PathBuf>,
+    /// Process exit or log draining has not yet been confirmed.
+    pub active: bool,
+    pub status: String,
+}
+
+impl ServiceRegistry {
+    pub async fn services(&self) -> Vec<ServiceInfo> {
+        let mut map = self.map.lock().await;
+        let mut services = Vec::with_capacity(map.len());
+        for (id, service) in map.iter_mut() {
+            let status = status_of(service).await;
+            services.push(ServiceInfo {
+                id: id.clone(),
+                command: service.command.clone(),
+                pid: service.pid,
+                log_path: service.log_path.clone(),
+                workspace_view: service.workspace_view.clone(),
+                active: service.pid.is_some() || !service.readers.is_empty(),
+                status,
+            });
+        }
+        services
+    }
+
+    pub async fn stop(&self, id: &str) -> Result<std::process::ExitStatus, ToolError> {
+        let mut map = self.map.lock().await;
+        let service = map
+            .get_mut(id)
+            .ok_or_else(|| ToolError::Failed(format!("no service {id}")))?;
+        let status = tokio::time::timeout(std::time::Duration::from_secs(5), stop(service))
+            .await
+            .map_err(|_| {
+                ToolError::Failed(
+                    "service stop requested; cleanup is still pending, retry to observe it".into(),
+                )
+            })??;
+        map.remove(id);
+        Ok(status)
+    }
+}
+
 /// Host-installed registry for this context (and its delegated children).
 pub struct ServiceRegistrySlot(pub Arc<ServiceRegistry>);
 
@@ -55,6 +103,7 @@ struct Service {
     command: String,
     pid: Option<u32>,
     log_path: PathBuf,
+    workspace_view: Option<PathBuf>,
     child: ManagedChild,
     readers: Vec<tokio::task::JoinHandle<std::io::Result<()>>>,
     log_error: Option<String>,
@@ -74,6 +123,20 @@ pub async fn spawn_persistent<C: SandboxCtx>(
     command: &str,
 ) -> Result<ToolResult, ToolError> {
     let registry = registry(&**ctx)?;
+    let workspace_view = match ctx.workspace_lease() {
+        Some(lease) => {
+            let (root, relative) = lease
+                .map_source(ctx.root()?)
+                .map_err(|error| ToolError::Failed(error.to_string()))?;
+            Some(
+                lease
+                    .working_root(root)
+                    .map_err(|error| ToolError::Failed(error.to_string()))?
+                    .join(relative),
+            )
+        }
+        None => None,
+    };
     let id = format!("svc-{}", NEXT_ID.fetch_add(1, Ordering::Relaxed));
     // Private dir + 0600 file, never through a symlink: service output can
     // carry tokens.
@@ -102,6 +165,7 @@ pub async fn spawn_persistent<C: SandboxCtx>(
             command: command.to_string(),
             pid,
             log_path: log_path.clone(),
+            workspace_view,
             child,
             readers,
             log_error: None,
@@ -207,13 +271,14 @@ async fn exec<C: SandboxCtx>(args: Args, ctx: Arc<C>) -> Result<ToolResult, Tool
     let reg = registry(&*ctx)?;
     match parsed.action.as_str() {
         "list" => {
-            let mut map = reg.map.lock().await;
-            if map.is_empty() {
+            let services = reg.services().await;
+            if services.is_empty() {
                 return Ok(ToolResult::text("no services running"));
             }
             let mut out = String::new();
-            for (id, svc) in map.iter_mut() {
-                let status = status_of(svc).await;
+            for svc in services {
+                let id = &svc.id;
+                let status = &svc.status;
                 out.push_str(&format!(
                     "{id}  pid={:?}  {status}  log={}\n    cmd: {}\n",
                     svc.pid,
@@ -244,19 +309,7 @@ async fn exec<C: SandboxCtx>(args: Args, ctx: Arc<C>) -> Result<ToolResult, Tool
             let id = parsed
                 .id
                 .ok_or_else(|| ToolError::Args("stop needs id".into()))?;
-            let mut map = reg.map.lock().await;
-            let svc = map
-                .get_mut(&id)
-                .ok_or_else(|| ToolError::Failed(format!("no service {id}")))?;
-            let status = tokio::time::timeout(std::time::Duration::from_secs(5), stop(svc))
-                .await
-                .map_err(|_| {
-                    ToolError::Failed(
-                        "service stop requested; cleanup is still pending, retry to observe it"
-                            .into(),
-                    )
-                })??;
-            map.remove(&id);
+            let status = reg.stop(&id).await?;
             Ok(ToolResult::text(format!("{id} stopped: {status}")))
         }
         other => Err(ToolError::Args(format!(
