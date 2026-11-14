@@ -18,9 +18,11 @@ use windows_sys::Win32::Security::Cryptography::{
 use windows_sys::Win32::Security::Isolation::*;
 use windows_sys::Win32::Security::*;
 use windows_sys::Win32::Storage::FileSystem::*;
+use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::System::JobObjects::*;
 use windows_sys::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
 use windows_sys::Win32::System::Threading::*;
+use windows_sys::Win32::UI::Shell::{FOLDERID_LocalAppData, SHGetKnownFolderPath};
 
 use crate::snapshot::WorkerScope;
 use crate::spawn::{ExecutionKind, ExecutionScope, IsolatedSpawn};
@@ -507,6 +509,25 @@ pub(crate) fn spawn(
     let mut entries = request.env.clone();
     if !entries
         .iter()
+        .any(|(key, _)| key.eq_ignore_ascii_case("LOCALAPPDATA"))
+    {
+        // Windows derives AppContainer profile paths from LOCALAPPDATA at launch.
+        let mut folder = null_mut();
+        let result =
+            unsafe { SHGetKnownFolderPath(&FOLDERID_LocalAppData, 0, null_mut(), &mut folder) };
+        if result < 0 {
+            bail!("read local application data directory: {result:#x}");
+        }
+        let mut length = 0;
+        while unsafe { *folder.add(length) } != 0 {
+            length += 1;
+        }
+        let value = String::from_utf16(unsafe { std::slice::from_raw_parts(folder, length) });
+        unsafe { CoTaskMemFree(folder.cast()) };
+        entries.push(("LOCALAPPDATA".into(), value?));
+    }
+    if !entries
+        .iter()
         .any(|(key, _)| key.eq_ignore_ascii_case("SystemRoot"))
     {
         // AppContainer creation needs SystemRoot even with an isolated environment.
@@ -602,6 +623,7 @@ mod tests {
         }
         assert!(std::env::var_os("HOME").is_none());
         assert!(std::env::var_os("SystemRoot").is_some());
+        assert!(std::env::var_os("LOCALAPPDATA").is_some());
         assert!(std::fs::read(std::env::var_os("KOREI_PROBE_FILE").unwrap()).is_err());
         assert!(std::fs::write(std::env::current_dir().unwrap().join("escape"), b"x").is_err());
         let port: u16 = std::env::var("KOREI_PROBE_PORT").unwrap().parse().unwrap();
@@ -666,34 +688,7 @@ mod tests {
             if cancel {
                 request.env.push(("KOREI_PROBE_WAIT".into(), "1".into()));
             }
-            let mut process = match crate::spawn::spawn_isolated(scope, &request) {
-                Ok(process) => process,
-                Err(error) => {
-                    let keys = ["USERPROFILE", "LOCALAPPDATA", "APPDATA", "TEMP", "TMP"];
-                    for group in keys
-                        .iter()
-                        .map(std::slice::from_ref)
-                        .chain([keys.as_slice()])
-                    {
-                        let mut probe = request.clone();
-                        for key in group {
-                            if let Ok(value) = std::env::var(key) {
-                                probe.env.push(((*key).into(), value));
-                            }
-                        }
-                        let scope = WorkerScope::prepare(&storage).unwrap();
-                        match crate::spawn::spawn_isolated(scope, &probe) {
-                            Ok(mut process) => {
-                                eprintln!("[DEBUG-win-env] {group:?}: launched");
-                                process.start_kill().unwrap();
-                                process.wait().await.unwrap();
-                            }
-                            Err(error) => eprintln!("[DEBUG-win-env] {group:?}: {error:#}"),
-                        }
-                    }
-                    panic!("{error:#}");
-                }
-            };
+            let mut process = crate::spawn::spawn_isolated(scope, &request).unwrap();
             process
                 .stdin
                 .take()
