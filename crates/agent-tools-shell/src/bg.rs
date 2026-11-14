@@ -158,8 +158,18 @@ impl BgRegistry {
 
     /// Every job this registry holds, oldest id first.
     pub fn jobs(&self) -> Vec<BgJobInfo> {
+        self.jobs_matching(|_| true)
+    }
+
+    /// Jobs launched in this private workspace view, including completed jobs.
+    pub fn jobs_for_view(&self, workspace_view: &Path) -> Vec<BgJobInfo> {
+        self.jobs_matching(|job| job.workspace_view.as_deref() == Some(workspace_view))
+    }
+
+    fn jobs_matching(&self, matches: impl Fn(&Job) -> bool) -> Vec<BgJobInfo> {
         let mut jobs: Vec<BgJobInfo> = lock(&self.map)
             .iter()
+            .filter(|(_, job)| matches(job))
             .map(|(id, job)| BgJobInfo {
                 id: id.clone(),
                 command: job.command.clone(),
@@ -286,6 +296,7 @@ enum Ctl {
 
 struct Job {
     command: String,
+    workspace_view: Option<PathBuf>,
     /// `None` once the job was reaped — or removed. Never signal a stale pid.
     pid: Option<u32>,
     control: Option<ProcessControl>,
@@ -685,6 +696,20 @@ where
     // The monitor owns this job's wall-clock deadline across tool calls.
     let (verdict, cfg) =
         crate::sandbox_cfg::prepare(&**ctx, command, Duration::from_secs(MAX_WAIT_SECS))?;
+    let workspace_view = match ctx.workspace_lease() {
+        Some(lease) => {
+            let (root, relative) = lease
+                .map_source(ctx.root()?)
+                .map_err(|error| ToolError::Failed(error.to_string()))?;
+            Some(
+                lease
+                    .working_root(root)
+                    .map_err(|error| ToolError::Failed(error.to_string()))?
+                    .join(relative),
+            )
+        }
+        None => None,
+    };
     let id = format!("bg-{}", NEXT_ID.fetch_add(1, Ordering::Relaxed));
     let dir = log_dir("agent-bg")?;
     let (log, log_path) = create_log(&dir, &id)?;
@@ -715,6 +740,7 @@ where
     let (ctl, ctl_rx) = mpsc::unbounded_channel();
     let job = Job {
         command: command.to_string(),
+        workspace_view,
         pid,
         control: Some(control),
         log_path: log_path.clone(),
@@ -1916,6 +1942,7 @@ mod tests {
         let now = Instant::now();
         let job = Job {
             command: "cargo test".into(),
+            workspace_view: None,
             pid: None,
             control: None,
             log_path: PathBuf::from("/tmp/x.log"),
