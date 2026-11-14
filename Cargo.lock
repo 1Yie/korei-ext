@@ -215,6 +215,7 @@ name = "agent-tools-serena"
 version = "0.1.0"
 dependencies = [
  "agent-capabilities",
+ "agent-sandbox",
  "agent-tool",
  "async-trait",
  "futures",
