@@ -114,13 +114,21 @@ where
                     root.display()
                 ))
             })?;
+            let coverage = if let Some(session) = &session {
+                session.coverage_notice(&*ctx).await?
+            } else {
+                None
+            };
             let arguments = a.arguments.unwrap_or(json!({}));
             match bridge.call(&a.tool, arguments).await {
-                Ok(out) => {
+                Ok(mut out) => {
                     // The child can die right after answering — don't hand the
                     // dead handle to the next call.
                     if !bridge.is_healthy() {
                         drop_bridge(&*ctx, &root, session.as_ref()).await?;
+                    }
+                    if let Some(notice) = &coverage {
+                        out.push_str(&format!("\n\n{notice}"));
                     }
                     Ok(ToolResult::text(out))
                 }
@@ -138,7 +146,10 @@ where
                             root.display()
                         )));
                     }
-                    Err(e)
+                    match &coverage {
+                        Some(notice) => Err(ToolError::Failed(format!("{e}\n\n{notice}"))),
+                        None => Err(e),
+                    }
                 }
             }
         }

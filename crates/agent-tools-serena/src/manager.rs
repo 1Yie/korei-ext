@@ -2,9 +2,8 @@
 //!
 //! An unprepared workspace has one Serena server, keyed by its root. Prepared
 //! execution installs a session registry and keeps one server per private project
-//! and linked-root authorization. That server's `--project` is the
-//! lease's private working root. A changed authorization starts a new server
-//! and drops the previous one; dropping the registry drops its servers.
+//! and fixed linked-root authorization. Additive contexts reuse the original
+//! lease and report its narrower coverage; revocation waits for owner cleanup.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -30,6 +29,7 @@ struct WorkspaceSlot {
     /// the spawn so concurrent callers wait for one server instead of racing
     /// to start several.
     live: Mutex<Option<Live>>,
+    effective_grants: StdMutex<Option<Arc<agent_sandbox::EffectiveOsGrants>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,8 +40,17 @@ pub enum SerenaStatus {
 }
 
 impl WorkspaceSlot {
+    fn cleanup_pending(&self) -> bool {
+        self.effective_grants
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|grants| !grants.is_quiescent())
+    }
+
     async fn status(&self) -> SerenaStatus {
         match self.live.lock().await.as_ref() {
+            None if self.cleanup_pending() => SerenaStatus::CleanupPending,
             None => SerenaStatus::Stopped,
             Some(live) if live.bridge.is_healthy() => SerenaStatus::Running,
             Some(_) => SerenaStatus::CleanupPending,
@@ -53,7 +62,16 @@ impl WorkspaceSlot {
         if let Some(entry) = live.as_ref() {
             entry.bridge.shutdown().await?;
         }
+        if self.cleanup_pending() {
+            return Err(ToolError::Failed(
+                "Serena owner cleanup is unconfirmed; its original OS grants remain active".into(),
+            ));
+        }
         live.take();
+        self.effective_grants
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
         Ok(())
     }
 }
@@ -112,6 +130,7 @@ impl SerenaManager {
             .or_insert_with(|| {
                 Arc::new(WorkspaceSlot {
                     live: Mutex::new(None),
+                    effective_grants: StdMutex::new(None),
                 })
             })
             .clone()
@@ -195,9 +214,20 @@ where
         if let Some(entry) = live.as_ref() {
             entry.bridge.shutdown().await?;
         }
+        if slot.cleanup_pending() {
+            return Err(ToolError::Failed(
+                "Serena owner cleanup is unconfirmed; refusing to replace its lease".into(),
+            ));
+        }
         live.take();
     }
     if live.is_none() {
+        if slot.cleanup_pending() {
+            return Err(ToolError::Failed(
+                "Serena startup cleanup is unconfirmed; its original OS grants remain active"
+                    .into(),
+            ));
+        }
         live.replace(Live {
             bridge: spawn().await?,
             catalog: SerenaToolCatalog::default(),
@@ -211,6 +241,7 @@ where
 struct ViewKey {
     project: PathBuf,
     auth: Vec<(PathBuf, RootAccess)>,
+    root_count: usize,
 }
 
 #[cfg(test)]
@@ -298,11 +329,16 @@ impl SerenaRegistry {
     where
         C: SandboxCtx + WorkspaceCtx,
     {
-        let key = view_key(ctx)?;
-        self.stop_stale(&key).await?;
+        let current = view_key(ctx)?;
+        let key = self.select_key(&current).await?;
         let slot = self.slot(&key);
         let project = project_path(ctx)?;
-        let live = ensure_slot(&slot, &self.spawns, || self.open(ctx, &project)).await?;
+        let live = ensure_slot(&slot, &self.spawns, || async {
+            if key != current {
+                return Err(ToolError::Failed("retained Serena coverage has stopped; call again to start with the current authorization".into()));
+            }
+            self.open(ctx, &project, &slot).await
+        }).await?;
         Ok(live.as_ref().expect("ensure_slot").bridge.clone())
     }
 
@@ -314,30 +350,82 @@ impl SerenaRegistry {
     where
         C: SandboxCtx + WorkspaceCtx,
     {
-        let key = view_key(ctx)?;
-        self.stop_stale(&key).await?;
+        let current = view_key(ctx)?;
+        let key = self.select_key(&current).await?;
         let slot = self.slot(&key);
         let project = project_path(ctx)?;
-        let mut live = ensure_slot(&slot, &self.spawns, || self.open(ctx, &project)).await?;
+        let mut live = ensure_slot(&slot, &self.spawns, || async {
+            if key != current {
+                return Err(ToolError::Failed("retained Serena coverage has stopped; call again to start with the current authorization".into()));
+            }
+            self.open(ctx, &project, &slot).await
+        }).await?;
         let entry = live.as_mut().expect("ensure_slot");
         let bridge = entry.bridge.clone();
         entry.catalog.tools(bridge.as_ref()).await?;
-        Ok(entry.catalog.render(detail))
+        let mut rendered = entry.catalog.render(detail);
+        if let Some(notice) = coverage_notice(&key, &current) {
+            rendered.push_str(&format!("\n\n{notice}"));
+        }
+        Ok(rendered)
     }
 
-    /// Drop the bridge for the context's current private project and authorization.
+    /// Confirm cleanup for every retained owner of this private project.
     pub async fn invalidate<C: WorkspaceCtx>(&self, ctx: &C) -> Result<(), ToolError> {
-        let key = view_key(ctx)?;
-        let slot = self
+        self.stop(ctx).await
+    }
+
+    /// Includes owners recorded before the stdio handshake completes.
+    pub fn effective_grants_for_project(
+        &self,
+        project: &Path,
+    ) -> Vec<Arc<agent_sandbox::EffectiveOsGrants>> {
+        self.project_slots(project)
+            .into_iter()
+            .filter_map(|slot| {
+                slot.effective_grants
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone()
+            })
+            .filter(|grants| !grants.is_quiescent())
+            .collect()
+    }
+
+    pub fn effective_grants<C: WorkspaceCtx>(
+        &self,
+        ctx: &C,
+    ) -> Result<Vec<Arc<agent_sandbox::EffectiveOsGrants>>, ToolError> {
+        Ok(self.effective_grants_for_project(&project_path(ctx)?))
+    }
+
+    pub async fn coverage_notice<C: WorkspaceCtx>(
+        &self,
+        ctx: &C,
+    ) -> Result<Option<String>, ToolError> {
+        let current = view_key(ctx)?;
+        let slots: Vec<_> = self
             .slots
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .get(&key)
-            .cloned();
-        if let Some(slot) = slot {
-            slot.live.lock().await.take();
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|(key, _)| key.project == current.project)
+            .map(|(key, slot)| (key.clone(), slot.clone()))
+            .collect();
+        for (key, slot) in slots {
+            if slot
+                .live
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|live| live.bridge.is_healthy())
+            {
+                if let Some(notice) = coverage_notice(&key, &current) {
+                    return Ok(Some(notice));
+                }
+            }
         }
-        Ok(())
+        Ok(None)
     }
 
     fn slot(&self, key: &ViewKey) -> Arc<WorkspaceSlot> {
@@ -347,12 +435,13 @@ impl SerenaRegistry {
             .or_insert_with(|| {
                 Arc::new(WorkspaceSlot {
                     live: Mutex::new(None),
+                    effective_grants: StdMutex::new(None),
                 })
             })
             .clone()
     }
 
-    async fn stop_stale(&self, current: &ViewKey) -> Result<(), ToolError> {
+    async fn select_key(&self, current: &ViewKey) -> Result<ViewKey, ToolError> {
         let stale: Vec<_> = self
             .slots
             .lock()
@@ -361,21 +450,35 @@ impl SerenaRegistry {
             .filter(|(key, _)| key.project == current.project && *key != current)
             .map(|(key, slot)| (key.clone(), slot.clone()))
             .collect();
+        let mut retained = None;
         for (key, slot) in stale {
-            let mut live = slot.live.lock().await;
-            if let Some(entry) = live.as_ref() {
-                entry.bridge.shutdown().await?;
+            if is_addition(&key, current) {
+                let healthy = slot
+                    .live
+                    .lock()
+                    .await
+                    .as_ref()
+                    .is_some_and(|live| live.bridge.is_healthy());
+                if healthy {
+                    retained = Some(key);
+                    continue;
+                }
             }
-            live.take();
+            slot.stop().await?;
             self.slots
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .remove(&key);
         }
-        Ok(())
+        Ok(retained.unwrap_or_else(|| current.clone()))
     }
 
-    async fn open<C>(&self, ctx: &C, project: &Path) -> Result<Arc<dyn McpBridge>, ToolError>
+    async fn open<C>(
+        &self,
+        ctx: &C,
+        project: &Path,
+        slot: &WorkspaceSlot,
+    ) -> Result<Arc<dyn McpBridge>, ToolError>
     where
         C: SandboxCtx + WorkspaceCtx,
     {
@@ -395,6 +498,10 @@ impl SerenaRegistry {
         };
         cfg.env_vars.extend(self.child_env.iter().cloned());
         let child = ctx.spawn_process(&cfg, &program, &arg_refs)?;
+        *slot
+            .effective_grants
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = child.effective_grants();
         let bridge = SerenaBridge::from_managed(project, program, child, Some(lease)).await?;
         Ok(bridge)
     }
@@ -419,7 +526,40 @@ fn view_key<C: WorkspaceCtx>(ctx: &C) -> Result<ViewKey, ToolError> {
     Ok(ViewKey {
         project: project_path(ctx)?,
         auth: authorization(ctx),
+        root_count: ctx
+            .workspace_lease()
+            .ok_or_else(|| ToolError::Failed("prepared serena has no execution lease".into()))?
+            .roots()
+            .count(),
     })
+}
+
+fn is_addition(original: &ViewKey, current: &ViewKey) -> bool {
+    original.project == current.project
+        && original.root_count <= current.root_count
+        && original.auth.iter().all(|(path, access)| {
+            current.auth.iter().any(|(next_path, next_access)| {
+                path == next_path
+                    && (access == next_access
+                        || (*access == RootAccess::Read && *next_access == RootAccess::ReadWrite))
+            })
+        })
+}
+
+fn coverage_notice(original: &ViewKey, current: &ViewKey) -> Option<String> {
+    if original == current || !is_addition(original, current) {
+        return None;
+    }
+    let auth = original
+        .auth
+        .iter()
+        .map(|(path, access)| format!("{} ({})", path.display(), access.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "Serena coverage: this server retains its original authorization [{}] and original lease root count {} (current context: {}). Its coverage does not include newly added roots or permissions. Use serena_stop, then call again to start with the current authorization.",
+        auth, original.root_count, current.root_count
+    ))
 }
 
 fn project_path<C: WorkspaceCtx>(ctx: &C) -> Result<PathBuf, ToolError> {
@@ -928,7 +1068,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn changed_authorization_drops_the_previous_server() {
+        async fn added_authorization_reuses_original_coverage_and_revocation_stops_it() {
             let dropped = Arc::new(AtomicBool::new(false));
             let flag = dropped.clone();
             let registry = Arc::new(SerenaRegistry::hooked(Arc::new(move |_, _| {
@@ -941,14 +1081,47 @@ mod tests {
             let roots = Arc::new(LinkedRoots::default());
             ctx.install_linked_roots(roots.clone());
             bind(&mut ctx, registry.clone());
-            drop(registry.bridge(&ctx).await.unwrap());
+            let linked = ctx.root().unwrap().join("linked");
             roots.set(vec![LinkedRoot {
-                path: ctx.root().unwrap().join("linked"),
+                path: linked.clone(),
+                access: RootAccess::ReadWrite,
+            }]);
+            let original = registry.bridge(&ctx).await.unwrap();
+            roots.set(vec![
+                LinkedRoot {
+                    path: linked.clone(),
+                    access: RootAccess::ReadWrite,
+                },
+                LinkedRoot {
+                    path: ctx.root().unwrap().join("added"),
+                    access: RootAccess::Read,
+                },
+            ]);
+            let reused = registry.bridge(&ctx).await.unwrap();
+            assert!(Arc::ptr_eq(&original, &reused));
+            assert!(!dropped.load(Ordering::Acquire));
+            assert_eq!(registry.spawn_count(), 1);
+            let catalog = registry.render_catalog(&ctx, None).await.unwrap();
+            assert!(catalog.contains("original authorization ["));
+            assert!(catalog.contains(&linked.display().to_string()));
+            assert!(catalog.contains("original lease root count 1"));
+            let spec = crate::tool::spec::<Ctx>();
+            let ctx = Arc::new(ctx);
+            let result = (spec.exec)(json!({"tool":"find_symbol"}), ctx.clone())
+                .await
+                .unwrap();
+            assert!(result.content.contains("serena_stop"));
+            roots.set(vec![LinkedRoot {
+                path: linked,
                 access: RootAccess::Read,
             }]);
-            let _replacement = registry.bridge(&ctx).await.unwrap();
-            assert!(dropped.load(Ordering::Acquire));
+            let replacement = registry.bridge(&*ctx).await.unwrap();
+            assert!(!original.is_healthy());
+            assert!(!Arc::ptr_eq(&original, &replacement));
             assert_eq!(registry.spawn_count(), 2);
+            drop(reused);
+            drop(original);
+            assert!(dropped.load(Ordering::Acquire));
         }
 
         #[tokio::test]
@@ -966,6 +1139,10 @@ mod tests {
             let roots = Arc::new(LinkedRoots::default());
             ctx.install_linked_roots(roots.clone());
             bind(&mut ctx, registry.clone());
+            roots.set(vec![LinkedRoot {
+                path: ctx.root().unwrap().join("linked"),
+                access: RootAccess::ReadWrite,
+            }]);
             registry.bridge(&ctx).await.unwrap();
             roots.set(vec![LinkedRoot {
                 path: ctx.root().unwrap().join("linked"),
@@ -1151,14 +1328,39 @@ mod tests {
                     bridge.call("find_symbol", json!({})).await.unwrap(),
                     "stub-ok"
                 );
+                let added = source.parent().unwrap().join("added");
+                std::fs::create_dir(&added).unwrap();
+                let grants = snapshot.effective_grants();
+                assert_eq!(grants.len(), 1);
+                snapshot
+                    .append_roots_checked(&[added.clone()], |source, working| {
+                        for grant in &grants {
+                            grant.check_root_addition(source, working)?;
+                        }
+                        Ok(())
+                    })
+                    .unwrap();
+                assert!(ctx.workspace_lease().unwrap().map_source(&added).is_err());
                 let mut next_turn = Ctx::default().with_workspace(source.clone());
                 next_turn.install_sandbox(Arc::new(LeasedBackend));
+                let linked = Arc::new(LinkedRoots::default());
+                linked.set(vec![LinkedRoot {
+                    path: added,
+                    access: RootAccess::ReadWrite,
+                }]);
+                next_turn.install_linked_roots(linked);
                 next_turn
                     .install_workspace_lease(snapshot.lease().unwrap())
                     .unwrap();
                 bind(&mut next_turn, registry.clone());
                 let again = registry.bridge(&next_turn).await.unwrap();
                 assert!(Arc::ptr_eq(&bridge, &again));
+                assert!(Arc::ptr_eq(
+                    &grants[0],
+                    &registry.effective_grants(&next_turn).unwrap()[0],
+                ));
+                let catalog = registry.render_catalog(&next_turn, None).await.unwrap();
+                assert!(catalog.contains("original lease root count 1 (current context: 2)"));
                 assert_eq!(
                     again.call("find_symbol", json!({})).await.unwrap(),
                     "stub-ok"
@@ -1203,6 +1405,7 @@ mod tests {
                     .await
                     .expect("dropping the registry must release the real lease");
                 }
+                assert!(grants[0].is_quiescent());
                 let changes = snapshot.diff().unwrap();
                 assert_eq!(changes.len(), 1);
                 assert_eq!(changes[0].path, Path::new("private-effect"));

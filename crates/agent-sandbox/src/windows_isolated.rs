@@ -340,7 +340,9 @@ impl Drop for Suspended {
 pub(crate) fn spawn(
     scope: &ExecutionScope,
     request: &IsolatedSpawn,
+    effective: &crate::EffectiveOsGrants,
 ) -> Result<WindowsIsolatedChild> {
+    effective.unknown("AppContainer implicit system and inherited ACL access has no effective-access proof for candidate roots");
     let writable = scope.writable_roots()?;
     if request
         .deny_read
@@ -368,6 +370,7 @@ pub(crate) fn spawn(
         let mut output = directory.create(destination)?;
         std::io::copy(&mut input, &mut output)?;
         output.sync_all()?;
+        effective.copied(source, &directory.path.join(destination));
         Ok(())
     };
     copy(
@@ -394,6 +397,11 @@ pub(crate) fn spawn(
         &mut grants,
     )
     .context("grant AppContainer runtime access")?;
+    effective.allow(
+        &directory.path,
+        None,
+        "AppContainer copied runtime ACL read/execute",
+    )?;
     if request.kind == ExecutionKind::Tool {
         for root in scope.writable_roots()? {
             grant_tree(
@@ -403,6 +411,7 @@ pub(crate) fn spawn(
                 GRANT_ACCESS,
                 &mut grants,
             )?;
+            effective.allow(&root, None, "AppContainer private ACL read/write")?;
         }
         for (paths, rights) in [
             (&request.deny_read, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE),
@@ -433,6 +442,14 @@ pub(crate) fn spawn(
                 } else {
                     bail!("Windows protected path must exist before launch");
                 }
+                effective.deny(
+                    path,
+                    if rights == (FILE_GENERIC_READ | FILE_GENERIC_EXECUTE) {
+                        "AppContainer ACL read deny"
+                    } else {
+                        "AppContainer ACL write deny"
+                    },
+                );
                 for parent in path.ancestors().skip(1) {
                     if !scope
                         .writable_roots()?
@@ -448,6 +465,7 @@ pub(crate) fn spawn(
                         DENY_ACCESS,
                         true,
                     )?);
+                    effective.deny(parent, "AppContainer ACL delete deny");
                 }
             }
         }
@@ -611,6 +629,7 @@ pub(crate) fn spawn(
         _profile: profile,
         _runtime: runtime,
     };
+    effective.ready();
     Ok(child)
 }
 

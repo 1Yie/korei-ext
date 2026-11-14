@@ -33,6 +33,7 @@ pub struct ServiceInfo {
     pub pid: Option<u32>,
     pub log_path: PathBuf,
     pub workspace_view: Option<PathBuf>,
+    pub effective_grants: Option<Arc<agent_sandbox::EffectiveOsGrants>>,
     /// Process exit or log draining has not yet been confirmed.
     pub active: bool,
     pub status: String,
@@ -50,6 +51,7 @@ impl ServiceRegistry {
                 pid: service.pid,
                 log_path: service.log_path.clone(),
                 workspace_view: service.workspace_view.clone(),
+                effective_grants: service.child.effective_grants(),
                 active: service.pid.is_some() || !service.readers.is_empty(),
                 status,
             });

@@ -78,6 +78,13 @@ impl From<SandboxedChild> for ManagedChild {
 }
 
 impl ManagedChild {
+    pub fn effective_grants(&self) -> Option<std::sync::Arc<crate::EffectiveOsGrants>> {
+        match &self.owner {
+            Owner::Native(_) => None,
+            Owner::Isolated(child) => child.effective_grants(),
+        }
+    }
+
     /// Adopt a native child started with `process_group(0)` on Unix.
     pub fn from_process_group(child: tokio::process::Child) -> Self {
         let mut process = Self::from(child);

@@ -23,6 +23,16 @@ Dropping a wait future stops that waiter; dropping the endpoint requests
 cancellation. The owner continues cleanup in both cases. An owner error that
 leaves cleanup unproven retains the actual scope and reports an error.
 
+`SandboxedChild::effective_grants` and `ManagedChild::effective_grants` share
+the isolated owner's opaque `EffectiveOsGrants`; ordinary children return
+`None`. Its quiescence flag changes only after the owner releases its process,
+platform resources and scope. Endpoint Drop, cancellation and a failed wait
+leave the flag unchanged. Grants are registered in the scope before startup;
+`WorkspaceSnapshot::effective_grants` and `WorkerScope::effective_grants`
+include retained startup failures with no returned endpoint. Clone a
+`WorkerScope` before consuming it to keep that same private scope queryable.
+The scope holds weak references; the facts hold no scope or lease.
+
 `process::ManagedChild` retains either a native child or that isolated owner
 behind the same piped I/O and control operations. `SandboxCtx::spawn_process`
 uses `SandboxBackend::spawn_leased` for prepared workspace contexts. Its default
@@ -48,7 +58,8 @@ cancellation and reports success after process and log cleanup. Registry teardow
 requests process cancellation without retaining a context/registry reference cycle.
 The Host reads structured service state and private-view association through
 `ServiceRegistry::services`; `ServiceRegistry::stop` uses the same confirmed
-cleanup path as the service tool.
+cleanup path as the service tool. Each `ServiceInfo` includes the actual
+owner's optional `effective_grants`.
 
 Background jobs use the same owner and lease-retaining log pump. Their session
 registry carries a pause control capability rather than issuing signals from
@@ -56,7 +67,10 @@ cached PIDs. Completion notifications follow owner completion and log draining;
 unconfirmed cleanup is reported as an error. A prepared job requires its
 session's job registry.
 `BgRegistry::jobs_for_view` selects jobs by their retained private-view identity
-without changing the Host job-event payload.
+without changing the Host job-event payload. `jobs_with_grants_for_view`
+returns the same display data alongside each owner's optional grants. A job
+whose wait failed remains queryable and cannot be removed while those grants
+are non-quiescent; its display completion is separate from owner cleanup.
 
 `ManagedChild::control` retains a pause capability tied to its actual owner.
 Native process control is synchronized with reaping. Linux isolated control uses
@@ -173,12 +187,27 @@ when it was minted; a fresh lease sees an entire appended batch. Configuration
 reads classify newly prepared source and private paths globally, so old leases
 refuse them instead of reading them as Host configuration.
 
-Before appending, the Host must rule out overlap or aliases between the new
-sources and every running owner's effective OS read grants, or stop and drain
-the affected owners. OS process permissions remain fixed at launch, while the
-lease range bounds Rust file operations. The method validates snapshot state,
-directory identities, source/storage topology and budget; the Host owns the
-process-admission decision.
+Use `append_roots_checked` to check each fixed source/private-working pair
+before linking the entire prepared batch. Rejection removes that batch and
+preserves existing roots, private edits and statistics. The Host serializes
+owner startup and root admission, gathers every active snapshot and retained
+worker scope's grants, and calls each `check_root_addition` in the callback.
+An overlap, changed identity or unknown access rejects admission; healthy
+owners retain their fixed permissions until explicitly stopped. `append_roots`
+uses the same preparation path with an unconditional callback.
+
+Facts describe the formed Seatbelt rules, resolved Linux source/destination
+binds, or Windows runtime copies and temporary AppContainer ACLs. Pinned
+directory handles, identities and lineage protect the overlap comparison.
+Deny entries are retained without attempting a full permission simulation;
+an overlapping allow is conservatively rejected even when a deny may mask it.
+Windows runtime copies grant access to the private destination, not continued
+access to their source. AppContainer implicit/inherited ACL access currently
+lacks a candidate effective-access proof, so a live Windows owner reports
+unknown and blocks additions. Pending startup facts also block additions.
+OS process permissions remain fixed at launch; lease ranges bound Rust file
+operations. Exact APIs and diagnostics live in [effective_grants.rs](src/effective_grants.rs)
+and [snapshot.rs](src/snapshot.rs).
 
 Publication checks source identities and preimages. Multiple files and
 volumes are published incrementally. Consume the complete `PublishReport`,
