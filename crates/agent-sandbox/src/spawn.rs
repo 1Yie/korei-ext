@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::process_control::ProcessControl;
 use crate::snapshot::{RootId, SnapshotLease, WorkerScope};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,16 +123,22 @@ pub struct SandboxedChild {
     pid: u32,
     cancel: Arc<AtomicBool>,
     rss_exceeded: Arc<AtomicBool>,
+    control: ProcessControl,
     completion: tokio::sync::watch::Receiver<Option<Result<std::process::ExitStatus, String>>>,
 }
 
 impl Drop for SandboxedChild {
     fn drop(&mut self) {
+        self.control.close();
         self.cancel.store(true, Ordering::Release);
     }
 }
 
 impl SandboxedChild {
+    pub fn control(&self) -> ProcessControl {
+        self.control.clone()
+    }
+
     /// Observe completion only after the owner has finished scope cleanup.
     pub fn try_wait(&self) -> std::io::Result<Option<std::process::ExitStatus>> {
         let closed = self.completion.has_changed().is_err();
@@ -162,6 +169,7 @@ impl SandboxedChild {
     }
 
     pub fn start_kill(&mut self) -> std::io::Result<()> {
+        self.control.close();
         self.cancel.store(true, Ordering::Release);
         Ok(())
     }
@@ -185,6 +193,7 @@ type Child = crate::windows_isolated::WindowsIsolatedChild;
 struct ExecutionOwner {
     scope: Option<ExecutionScope>,
     child: Option<Child>,
+    control: ProcessControl,
     #[cfg(target_os = "macos")]
     group: crate::group_kill::GroupGuard,
     #[cfg(target_os = "linux")]
@@ -193,6 +202,7 @@ struct ExecutionOwner {
 
 impl ExecutionOwner {
     fn cleanup(&mut self) -> Result<()> {
+        self.control.close();
         #[cfg(target_os = "linux")]
         if let Some(group) = self.cgroup.as_mut() {
             group.kill()?;
@@ -223,6 +233,7 @@ impl ExecutionOwner {
     }
 
     fn release(&mut self) {
+        self.control.close();
         drop(self.child.take());
         drop(self.scope.take());
     }
@@ -252,6 +263,7 @@ impl ExecutionOwner {
                         .context("observe isolated monitor");
                 }
                 if unsafe { info.si_pid() } != 0 || cancel.load(Ordering::Acquire) {
+                    self.control.close();
                     let group = self.cgroup.as_mut().context("execution has no cgroup")?;
                     group.kill()?;
                     while group.populated()? {
@@ -271,7 +283,7 @@ impl ExecutionOwner {
         let mut killed = false;
         #[cfg(not(target_os = "linux"))]
         loop {
-            if let Some(status) = child.try_wait()? {
+            if let Some(status) = self.control.observe_exit(|| child.try_wait())? {
                 #[cfg(target_os = "macos")]
                 self.group.disarm();
                 return Ok(status);
@@ -291,6 +303,7 @@ impl ExecutionOwner {
             #[cfg(not(target_os = "macos"))]
             let _ = (rss_exceeded, memory_limit);
             if cancel.load(Ordering::Acquire) && !killed {
+                self.control.close();
                 #[cfg(target_os = "macos")]
                 child.kill()?;
                 #[cfg(windows)]
@@ -321,6 +334,7 @@ fn start_owner(
             let mut owner = std::mem::ManuallyDrop::new(ExecutionOwner {
                 scope: Some(scope),
                 child: None,
+                control: ProcessControl::closed(),
                 #[cfg(target_os = "macos")]
                 group: crate::group_kill::GroupGuard::new(None),
                 #[cfg(target_os = "linux")]
@@ -335,11 +349,23 @@ fn start_owner(
                         let pid = owner.child.as_ref().map(Child::id);
                         owner.group = crate::group_kill::GroupGuard::new(pid);
                     }
+                    let control = owner.control.clone();
+                    #[cfg(target_os = "linux")]
+                    {
+                        let group = owner
+                            .cgroup
+                            .as_ref()
+                            .context("execution owner has no cgroup")?;
+                        let (freeze, events) = group.freeze_control()?;
+                        control.bind_cgroup(freeze, events);
+                    }
                     let child = owner.child.as_mut().unwrap();
                     #[cfg(unix)]
                     let pid = child.id();
                     #[cfg(windows)]
                     let pid = child.id().context("isolated process has no PID")?;
+                    #[cfg(not(target_os = "linux"))]
+                    control.bind_native(pid);
                     let endpoint = SandboxedChild {
                         #[cfg(unix)]
                         stdin: child
@@ -368,6 +394,7 @@ fn start_owner(
                         pid,
                         cancel,
                         rss_exceeded,
+                        control,
                         completion: receiver,
                     };
                     drop(entered);

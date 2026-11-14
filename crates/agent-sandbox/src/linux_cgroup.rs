@@ -173,6 +173,13 @@ impl Cgroup {
         self.procs.try_clone()
     }
 
+    pub(crate) fn freeze_control(&self) -> Result<(File, File)> {
+        Ok((
+            open_at(&self.directory.group, c"cgroup.freeze", libc::O_RDWR)?,
+            open_at(&self.directory.group, c"cgroup.events", libc::O_RDONLY)?,
+        ))
+    }
+
     pub(crate) fn kill(&mut self) -> Result<()> {
         if self.kill_attempted {
             if self.killed {

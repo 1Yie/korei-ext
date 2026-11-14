@@ -801,6 +801,50 @@ async fn running_process_cannot_release_its_scope() {
     }
 }
 
+#[tokio::test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn owned_pause_stops_private_writes_and_expires_with_the_process() {
+    let (_temp, mut snapshot, source) = snapshot();
+    let lease = snapshot.lease().unwrap();
+    let root = lease.roots().next().unwrap();
+    let counter = lease.working_root(root).unwrap().join("counter");
+    let mut request = request(
+        &lease,
+        "while :; do printf x >> counter; done".into(),
+        ExecutionKind::Tool,
+    );
+    request.tool_policy = Some(agent_sandbox::SandboxConfig {
+        workspace_dir: source,
+        ..Default::default()
+    });
+    let mut process =
+        agent_sandbox::process::ManagedChild::from(spawn_isolated(lease, &request).unwrap());
+    let control = process.control();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while fs::metadata(&counter).map(|m| m.len()).unwrap_or(0) < 100 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    control.set_paused(true).unwrap();
+    let frozen_len = fs::metadata(&counter).unwrap().len();
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    assert_eq!(fs::metadata(&counter).unwrap().len(), frozen_len);
+    assert!(snapshot.seal().is_err());
+    control.set_paused(false).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while fs::metadata(&counter).unwrap().len() == frozen_len {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    process.kill().await.unwrap();
+    assert!(control.set_paused(true).is_err());
+    snapshot.seal().unwrap();
+}
+
 #[test]
 #[cfg(target_os = "macos")]
 fn dropped_wait_and_runtime_leave_the_owner_responsible_for_cleanup() {
