@@ -32,6 +32,12 @@ roots are rejected before launch. Ordinary contexts use the backend's native
 wrapper. A shared `Arc<SnapshotLease>` keeps its original root range and blocks
 sealing until every context and process owner releases it.
 
+`SandboxCtx::run_command` preserves the backend's ordinary execution path for
+unprepared contexts. Prepared contexts use the owned launcher and
+`ManagedChild::output`: stdout and stderr share the capture budget declared in
+[process.rs](src/process.rs). Timeout and capture failures kill and await the
+actual owner before returning. Bash, the test runner and Office use this path.
+
 Use `WorkerScope::prepare` for a private empty working directory without
 workspace authorization. Tool execution requires a live `SnapshotLease` and
 the original `SandboxConfig`; its protected paths and read-only mounts are

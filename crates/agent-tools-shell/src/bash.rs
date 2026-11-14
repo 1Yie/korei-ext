@@ -86,16 +86,11 @@ async fn exec<C: WorkspaceCtx + SandboxCtx>(
 
     // Audit before spawn; its verdict becomes the result's risk tier.
     let (verdict, cfg) = prepare(&*ctx, &parsed.command, timeout)?;
-    let sandbox = ctx.sandbox()?;
-
     if parsed.persistent.unwrap_or(false) {
         return crate::services::spawn_persistent(&ctx, &cfg, &parsed.command).await;
     }
 
-    let output = sandbox
-        .run_command(&parsed.command, &[], &cfg)
-        .await
-        .map_err(|e| ToolError::Failed(e.to_string()))?;
+    let output = ctx.run_command(&parsed.command, &[], &cfg).await?;
 
     let mut raw = output.stdout;
     if !output.stderr.is_empty() {
