@@ -342,7 +342,8 @@ pub(crate) fn spawn(
         bail!("Windows external read-deny policy requires an effective-access adapter; refusing before launch");
     }
     let cwd = scope.cwd(request)?.to_owned();
-    let runtime = WorkerScope::prepare(cwd.parent().context("private cwd has no parent")?)?;
+    let runtime = WorkerScope::prepare(cwd.parent().context("private cwd has no parent")?)
+        .context("prepare Windows runtime directory")?;
     let directory = crate::snapshot_fs::Dir::open(runtime.directory()?)?;
     let executable = directory.path.join(
         request
@@ -364,7 +365,8 @@ pub(crate) fn spawn(
     copy(
         &request.executable,
         Path::new(executable.file_name().unwrap()),
-    )?;
+    )
+    .context("copy isolated executable")?;
     for resource in &request.read_only {
         if resource.is_dir() {
             bail!("Windows runtime resources must be explicit files for private copying");
@@ -462,7 +464,7 @@ pub(crate) fn spawn(
     }
     let job = Handle(unsafe { CreateJobObjectW(null(), null()) });
     if job.0.is_null() {
-        return Err(io::Error::last_os_error().into());
+        return Err(io::Error::last_os_error()).context("create job");
     }
     let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
     limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
@@ -480,10 +482,11 @@ pub(crate) fn spawn(
             (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
             std::mem::size_of_val(&limits) as u32,
         )
-    })?;
-    let (stdin, input) = pipe(true)?;
-    let (stdout, output) = pipe(false)?;
-    let (stderr, error) = pipe(false)?;
+    })
+    .context("set job limits")?;
+    let (stdin, input) = pipe(true).context("stdin pipe")?;
+    let (stdout, output) = pipe(false).context("stdout pipe")?;
+    let (stderr, error) = pipe(false).context("stderr pipe")?;
     let mut handles = [input.0, output.0, error.0];
     let mut capabilities = SECURITY_CAPABILITIES {
         AppContainerSid: profile.sid,
@@ -491,12 +494,16 @@ pub(crate) fn spawn(
         CapabilityCount: 0,
         Reserved: 0,
     };
-    let mut attributes = Attributes::new()?;
-    attributes.set(
-        PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize,
-        &mut capabilities,
-    )?;
-    attributes.set(PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize, &mut handles)?;
+    let mut attributes = Attributes::new().context("process attribute list")?;
+    attributes
+        .set(
+            PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize,
+            &mut capabilities,
+        )
+        .context("security capabilities")?;
+    attributes
+        .set(PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize, &mut handles)
+        .context("inherited handles")?;
     let mut startup = STARTUPINFOEXW::default();
     startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
     startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
