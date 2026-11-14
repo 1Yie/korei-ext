@@ -249,6 +249,15 @@ async fn persistent_service_survives_the_invocation_and_stops_before_publication
     let (_temp, mut snapshot, mut ctx) = fixture(Arc::new(LeasedBackend));
     agent_tools_shell::services::install_registry(Arc::get_mut(&mut ctx).unwrap());
     let control = service_control(&ctx);
+    let slot = control
+        .service::<agent_tools_shell::services::ServiceRegistrySlot>()
+        .unwrap();
+    assert!(slot.0.services().await.is_empty());
+    let private = {
+        let lease = snapshot.lease().unwrap();
+        let root = lease.roots().next().unwrap();
+        lease.working_root(root).unwrap().to_path_buf()
+    };
     let source = ctx.root().unwrap().to_path_buf();
     let id = start_service(
         &ctx,
@@ -262,16 +271,22 @@ async fn persistent_service_survives_the_invocation_and_stops_before_publication
         .content
         .contains("running"));
     assert!(snapshot.seal().is_err());
+    let services = slot.0.services().await;
+    assert_eq!(services.len(), 1);
+    assert_eq!(services[0].id, id);
+    assert!(services[0].active);
+    assert_eq!(
+        services[0].workspace_view.as_deref(),
+        Some(private.as_path())
+    );
     assert_eq!(
         std::fs::read_to_string(source.join("file")).unwrap(),
         "original"
     );
-    assert!(service(&control, "stop", &id)
-        .await
-        .content
-        .contains("stopped"));
+    slot.0.stop(&id).await.unwrap();
     assert_eq!(snapshot.seal().unwrap().len(), 1);
     assert!(!service(&control, "list", &id).await.content.contains(&id));
+    assert!(slot.0.services().await.is_empty());
     snapshot.rollback().unwrap();
 }
 
@@ -299,6 +314,13 @@ async fn natural_service_exit_includes_both_drained_log_streams() {
     let output = service(&control, "logs", &id).await.content;
     assert!(output.contains("STDOUT_END"));
     assert!(output.contains("STDERR_END"));
+    let slot = control
+        .service::<agent_tools_shell::services::ServiceRegistrySlot>()
+        .unwrap();
+    let services = slot.0.services().await;
+    assert_eq!(services.len(), 1);
+    assert!(!services[0].active);
+    assert_eq!(services[0].status, "exited(0)");
     assert!(snapshot.seal().unwrap().is_empty());
 }
 
