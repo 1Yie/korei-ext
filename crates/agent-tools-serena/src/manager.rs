@@ -32,6 +32,32 @@ struct WorkspaceSlot {
     live: Mutex<Option<Live>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SerenaStatus {
+    Stopped,
+    Running,
+    CleanupPending,
+}
+
+impl WorkspaceSlot {
+    async fn status(&self) -> SerenaStatus {
+        match self.live.lock().await.as_ref() {
+            None => SerenaStatus::Stopped,
+            Some(live) if live.bridge.is_healthy() => SerenaStatus::Running,
+            Some(_) => SerenaStatus::CleanupPending,
+        }
+    }
+
+    async fn stop(&self) -> Result<(), ToolError> {
+        let mut live = self.live.lock().await;
+        if let Some(entry) = live.as_ref() {
+            entry.bridge.shutdown().await?;
+        }
+        live.take();
+        Ok(())
+    }
+}
+
 pub struct SerenaManager {
     factory: Arc<dyn BridgeFactory>,
     slots: StdMutex<HashMap<PathBuf, Arc<WorkspaceSlot>>>,
@@ -51,6 +77,32 @@ impl SerenaManager {
 
     pub fn spawn_count(&self) -> usize {
         self.spawns.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub async fn status(&self, root: &Path) -> SerenaStatus {
+        let slot = self
+            .slots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&normalize_root(root))
+            .cloned();
+        match slot {
+            Some(slot) => slot.status().await,
+            None => SerenaStatus::Stopped,
+        }
+    }
+
+    pub async fn stop(&self, root: &Path) -> Result<(), ToolError> {
+        let slot = self
+            .slots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&normalize_root(root))
+            .cloned();
+        if let Some(slot) = slot {
+            slot.stop().await?;
+        }
+        Ok(())
     }
 
     fn slot(&self, root: &Path) -> Arc<WorkspaceSlot> {
@@ -140,7 +192,9 @@ where
         .map(|entry| !entry.bridge.is_healthy())
         .unwrap_or(false)
     {
-        // Drop the previous owner so its process and stdio cleanup can finish.
+        if let Some(entry) = live.as_ref() {
+            entry.bridge.shutdown().await?;
+        }
         live.take();
     }
     if live.is_none() {
@@ -205,14 +259,47 @@ impl SerenaRegistry {
         self.spawns.load(Ordering::Relaxed)
     }
 
+    pub async fn status<C: WorkspaceCtx>(&self, ctx: &C) -> Result<SerenaStatus, ToolError> {
+        let mut status = SerenaStatus::Stopped;
+        for slot in self.project_slots(&project_path(ctx)?) {
+            match slot.status().await {
+                SerenaStatus::CleanupPending => return Ok(SerenaStatus::CleanupPending),
+                SerenaStatus::Running => status = SerenaStatus::Running,
+                SerenaStatus::Stopped => {}
+            }
+        }
+        Ok(status)
+    }
+
+    pub async fn stop<C: WorkspaceCtx>(&self, ctx: &C) -> Result<(), ToolError> {
+        let mut failure = None;
+        for slot in self.project_slots(&project_path(ctx)?) {
+            if let Err(error) = slot.stop().await {
+                failure.get_or_insert(error);
+            }
+        }
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    fn project_slots(&self, project: &Path) -> Vec<Arc<WorkspaceSlot>> {
+        self.slots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|(key, _)| key.project == project)
+            .map(|(_, slot)| slot.clone())
+            .collect()
+    }
+
     pub async fn bridge<C>(&self, ctx: &C) -> Result<Arc<dyn McpBridge>, ToolError>
     where
         C: SandboxCtx + WorkspaceCtx,
     {
         let key = view_key(ctx)?;
-        for stale in self.take_stale(&key) {
-            stale.live.lock().await.take();
-        }
+        self.stop_stale(&key).await?;
         let slot = self.slot(&key);
         let project = project_path(ctx)?;
         let live = ensure_slot(&slot, &self.spawns, || self.open(ctx, &project)).await?;
@@ -228,9 +315,7 @@ impl SerenaRegistry {
         C: SandboxCtx + WorkspaceCtx,
     {
         let key = view_key(ctx)?;
-        for stale in self.take_stale(&key) {
-            stale.live.lock().await.take();
-        }
+        self.stop_stale(&key).await?;
         let slot = self.slot(&key);
         let project = project_path(ctx)?;
         let mut live = ensure_slot(&slot, &self.spawns, || self.open(ctx, &project)).await?;
@@ -267,17 +352,27 @@ impl SerenaRegistry {
             .clone()
     }
 
-    fn take_stale(&self, current: &ViewKey) -> Vec<Arc<WorkspaceSlot>> {
-        let mut slots = self.slots.lock().unwrap_or_else(|error| error.into_inner());
-        let stale: Vec<ViewKey> = slots
-            .keys()
-            .filter(|key| key.project == current.project && *key != current)
-            .cloned()
+    async fn stop_stale(&self, current: &ViewKey) -> Result<(), ToolError> {
+        let stale: Vec<_> = self
+            .slots
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+            .filter(|(key, _)| key.project == current.project && *key != current)
+            .map(|(key, slot)| (key.clone(), slot.clone()))
             .collect();
-        stale
-            .into_iter()
-            .filter_map(|key| slots.remove(&key))
-            .collect()
+        for (key, slot) in stale {
+            let mut live = slot.live.lock().await;
+            if let Some(entry) = live.as_ref() {
+                entry.bridge.shutdown().await?;
+            }
+            live.take();
+            self.slots
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .remove(&key);
+        }
+        Ok(())
     }
 
     async fn open<C>(&self, ctx: &C, project: &Path) -> Result<Arc<dyn McpBridge>, ToolError>
@@ -366,7 +461,7 @@ fn normalize_root(root: &Path) -> PathBuf {
 /// One manager per unprepared workspace root, process-wide.
 ///
 /// Prepared execution is not stored here. A session [`SerenaRegistry`] owns
-/// those servers and keys them by live lease and authorization, so two views
+/// those servers and keys them by private project and authorization, so two views
 /// of one workspace cannot share an index. `invalidate` and `shutdown` release
 /// an unprepared server when its workspace closes.
 pub fn manager_for(root: &Path) -> Arc<SerenaManager> {
@@ -420,10 +515,19 @@ mod tests {
     struct FakeBridge {
         healthy: AtomicBool,
         lists: Arc<AtomicUsize>,
+        stop_error: AtomicBool,
     }
 
     #[async_trait::async_trait]
     impl McpBridge for FakeBridge {
+        async fn shutdown(&self) -> Result<(), ToolError> {
+            self.healthy.store(false, Ordering::Release);
+            if self.stop_error.load(Ordering::Acquire) {
+                return Err(ToolError::Failed("cleanup unconfirmed".into()));
+            }
+            Ok(())
+        }
+
         async fn call(&self, tool: &str, _args: Value) -> Result<String, ToolError> {
             if !self.is_healthy() {
                 return Err(ToolError::Failed("fake bridge is gone".into()));
@@ -453,6 +557,7 @@ mod tests {
             let bridge = Arc::new(FakeBridge {
                 healthy: AtomicBool::new(true),
                 lists: self.lists.clone(),
+                stop_error: AtomicBool::new(false),
             });
             *self.last.lock().unwrap() = Some(bridge.clone());
             Ok(bridge)
@@ -487,6 +592,36 @@ mod tests {
             roots[1].ends_with("project-b"),
             "workspace B reused A's bridge: {roots:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn status_and_stop_preserve_failed_cleanup_without_spawning() {
+        let factory = Arc::new(FakeFactory::default());
+        let manager = SerenaManager::new(factory.clone());
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(manager.status(root.path()).await, SerenaStatus::Stopped);
+        manager.stop(root.path()).await.unwrap();
+        assert_eq!(manager.spawn_count(), 0);
+        let bridge = manager.bridge(root.path()).await.unwrap();
+        let retained = factory.last.lock().unwrap().as_ref().unwrap().clone();
+        assert_eq!(manager.status(root.path()).await, SerenaStatus::Running);
+        retained.stop_error.store(true, Ordering::Release);
+        assert!(manager.stop(root.path()).await.is_err());
+        assert_eq!(
+            manager.status(root.path()).await,
+            SerenaStatus::CleanupPending
+        );
+        assert!(manager.bridge(root.path()).await.is_err());
+        assert_eq!(manager.spawn_count(), 1);
+        retained.stop_error.store(false, Ordering::Release);
+        manager.stop(root.path()).await.unwrap();
+        manager.stop(root.path()).await.unwrap();
+        assert_eq!(manager.status(root.path()).await, SerenaStatus::Stopped);
+        assert_eq!(manager.spawn_count(), 1);
+        assert!(!bridge.is_healthy());
+        let replacement = manager.bridge(root.path()).await.unwrap();
+        assert!(!Arc::ptr_eq(&bridge, &replacement));
+        assert_eq!(manager.spawn_count(), 2);
     }
 
     /// A dead child must be replaced on the next call — the old code cached
@@ -613,9 +748,11 @@ mod tests {
     #[cfg(unix)]
     mod prepared {
         use super::{
-            registry, Arc, AtomicBool, McpBridge, Ordering, PathBuf, SerenaRegistry,
-            SerenaRegistrySlot, SerenaToolInfo, StdMutex, ToolError, Value,
+            registry, Arc, AtomicBool, AtomicUsize, FakeBridge, McpBridge, Ordering, PathBuf,
+            SerenaRegistry, SerenaRegistrySlot, SerenaStatus, SerenaToolInfo, StdMutex, ToolError,
+            Value,
         };
+        use serde_json::json;
         use std::os::unix::fs::PermissionsExt;
 
         use agent_capabilities::{LinkedRoot, LinkedRoots, RootAccess, WorkspaceCtx};
@@ -657,6 +794,11 @@ mod tests {
 
         #[async_trait::async_trait]
         impl McpBridge for Probe {
+            async fn shutdown(&self) -> Result<(), ToolError> {
+                self.healthy.store(false, Ordering::Release);
+                Ok(())
+            }
+
             async fn call(&self, _tool: &str, _args: Value) -> Result<String, ToolError> {
                 Ok("ok".into())
             }
@@ -703,6 +845,46 @@ mod tests {
         fn bind(ctx: &mut Ctx, registry: Arc<SerenaRegistry>) {
             ctx.extensions_mut()
                 .insert_shared(Arc::new(SerenaRegistrySlot(registry)));
+        }
+
+        #[tokio::test]
+        async fn control_tools_do_not_start_servers_and_stop_only_their_view() {
+            let registry = Arc::new(SerenaRegistry::hooked(Arc::new(|_, _| {
+                Ok(Arc::new(Probe::healthy()))
+            })));
+            let (_dir, _snapshot, mut ctx) = prepared_ctx();
+            let (_other_dir, _other_snapshot, mut other) = prepared_ctx();
+            bind(&mut ctx, registry.clone());
+            bind(&mut other, registry.clone());
+            let roots = Arc::new(LinkedRoots::default());
+            ctx.install_linked_roots(roots.clone());
+            let ctx = Arc::new(ctx);
+            let spec = crate::tool::spec::<Ctx>();
+            let status = (spec.exec)(json!({"tool":"serena_status"}), ctx.clone())
+                .await
+                .unwrap();
+            assert_eq!(status.content, "serena: stopped");
+            (spec.exec)(json!({"tool":"serena_stop"}), ctx.clone())
+                .await
+                .unwrap();
+            assert_eq!(registry.spawn_count(), 0);
+            let bridge = registry.bridge(&*ctx).await.unwrap();
+            let other_bridge = registry.bridge(&other).await.unwrap();
+            roots.set(vec![LinkedRoot {
+                path: ctx.root().unwrap().join("linked"),
+                access: RootAccess::Read,
+            }]);
+            let status = (spec.exec)(json!({"tool":"serena_status"}), ctx.clone())
+                .await
+                .unwrap();
+            assert_eq!(status.content, "serena: running");
+            (spec.exec)(json!({"tool":"serena_stop"}), ctx.clone())
+                .await
+                .unwrap();
+            assert!(!bridge.is_healthy());
+            assert!(other_bridge.is_healthy());
+            assert_eq!(registry.status(&*ctx).await.unwrap(), SerenaStatus::Stopped);
+            assert_eq!(registry.spawn_count(), 2);
         }
 
         #[tokio::test]
@@ -767,6 +949,37 @@ mod tests {
             let _replacement = registry.bridge(&ctx).await.unwrap();
             assert!(dropped.load(Ordering::Acquire));
             assert_eq!(registry.spawn_count(), 2);
+        }
+
+        #[tokio::test]
+        async fn changed_authorization_keeps_failed_cleanup_reachable() {
+            let bridge = Arc::new(FakeBridge {
+                healthy: AtomicBool::new(true),
+                lists: Arc::new(AtomicUsize::new(0)),
+                stop_error: AtomicBool::new(true),
+            });
+            let registry = Arc::new(SerenaRegistry::hooked({
+                let bridge = bridge.clone();
+                Arc::new(move |_, _| Ok(bridge.clone()))
+            }));
+            let (_dir, _snapshot, mut ctx) = prepared_ctx();
+            let roots = Arc::new(LinkedRoots::default());
+            ctx.install_linked_roots(roots.clone());
+            bind(&mut ctx, registry.clone());
+            registry.bridge(&ctx).await.unwrap();
+            roots.set(vec![LinkedRoot {
+                path: ctx.root().unwrap().join("linked"),
+                access: RootAccess::Read,
+            }]);
+            assert!(registry.bridge(&ctx).await.is_err());
+            assert_eq!(registry.spawn_count(), 1);
+            assert_eq!(
+                registry.status(&ctx).await.unwrap(),
+                SerenaStatus::CleanupPending
+            );
+            bridge.stop_error.store(false, Ordering::Release);
+            registry.stop(&ctx).await.unwrap();
+            assert_eq!(registry.status(&ctx).await.unwrap(), SerenaStatus::Stopped);
         }
 
         #[tokio::test]
@@ -906,74 +1119,99 @@ mod tests {
                 }
             }
 
-            let (_dir, mut snapshot, mut ctx) = prepared_ctx();
-            ctx.install_sandbox(Arc::new(LeasedBackend));
-            let program = std::env::current_exe().unwrap();
-            let registry = Arc::new(SerenaRegistry::with_env(
-                SerenaLaunch {
-                    program: Some(program.display().to_string()),
-                    source: String::new(),
-                    modes: Vec::new(),
-                    argv_override: Some(vec![
-                        "--exact".into(),
-                        "bridge::tests::stub_mcp_server".into(),
-                        "--nocapture".into(),
-                        "--quiet".into(),
-                    ]),
-                },
-                vec![
-                    ("AGENT_SERENA_STUB".into(), "write-on-call".into()),
-                    ("RUST_TEST_THREADS".into(), "1".into()),
-                ],
-            ));
-            bind(&mut ctx, registry.clone());
-            let source = ctx.root().unwrap().to_path_buf();
-            let ctx = Arc::new(ctx);
-            let bridge = tokio::time::timeout(Duration::from_secs(10), registry.bridge(&*ctx))
-                .await
-                .expect("isolated MCP handshake must complete")
-                .unwrap();
-            assert_eq!(
-                bridge.call("find_symbol", json!({})).await.unwrap(),
-                "stub-ok"
-            );
-            let mut next_turn = Ctx::default().with_workspace(source.clone());
-            next_turn.install_sandbox(Arc::new(LeasedBackend));
-            next_turn
-                .install_workspace_lease(snapshot.lease().unwrap())
-                .unwrap();
-            bind(&mut next_turn, registry.clone());
-            let again = registry.bridge(&next_turn).await.unwrap();
-            assert!(Arc::ptr_eq(&bridge, &again));
-            assert_eq!(
-                again.call("find_symbol", json!({})).await.unwrap(),
-                "stub-ok"
-            );
-            assert_eq!(registry.spawn_count(), 1);
-            assert!(
-                snapshot.seal().is_err(),
-                "live registry must occupy the lease"
-            );
-            drop(bridge);
-            drop(again);
-            drop(next_turn);
-            drop(ctx);
-            drop(registry);
-            tokio::time::timeout(Duration::from_secs(10), async {
-                while snapshot.seal().is_err() {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
+            for explicit_stop in [false, true] {
+                let (_dir, mut snapshot, mut ctx) = prepared_ctx();
+                ctx.install_sandbox(Arc::new(LeasedBackend));
+                let program = std::env::current_exe().unwrap();
+                let registry = Arc::new(SerenaRegistry::with_env(
+                    SerenaLaunch {
+                        program: Some(program.display().to_string()),
+                        source: String::new(),
+                        modes: Vec::new(),
+                        argv_override: Some(vec![
+                            "--exact".into(),
+                            "bridge::tests::stub_mcp_server".into(),
+                            "--nocapture".into(),
+                            "--quiet".into(),
+                        ]),
+                    },
+                    vec![
+                        ("AGENT_SERENA_STUB".into(), "write-on-call".into()),
+                        ("RUST_TEST_THREADS".into(), "1".into()),
+                    ],
+                ));
+                bind(&mut ctx, registry.clone());
+                let source = ctx.root().unwrap().to_path_buf();
+                let ctx = Arc::new(ctx);
+                let bridge = tokio::time::timeout(Duration::from_secs(10), registry.bridge(&*ctx))
+                    .await
+                    .expect("isolated MCP handshake must complete")
+                    .unwrap();
+                assert_eq!(
+                    bridge.call("find_symbol", json!({})).await.unwrap(),
+                    "stub-ok"
+                );
+                let mut next_turn = Ctx::default().with_workspace(source.clone());
+                next_turn.install_sandbox(Arc::new(LeasedBackend));
+                next_turn
+                    .install_workspace_lease(snapshot.lease().unwrap())
+                    .unwrap();
+                bind(&mut next_turn, registry.clone());
+                let again = registry.bridge(&next_turn).await.unwrap();
+                assert!(Arc::ptr_eq(&bridge, &again));
+                assert_eq!(
+                    again.call("find_symbol", json!({})).await.unwrap(),
+                    "stub-ok"
+                );
+                assert_eq!(registry.spawn_count(), 1);
+                assert!(
+                    snapshot.seal().is_err(),
+                    "live registry must occupy the lease"
+                );
+                if explicit_stop {
+                    registry.stop(&next_turn).await.unwrap();
+                    registry.stop(&next_turn).await.unwrap();
+                    assert_eq!(
+                        registry.status(&next_turn).await.unwrap(),
+                        SerenaStatus::Stopped
+                    );
+                    assert!(!bridge.is_healthy());
+                    let restarted = registry.bridge(&next_turn).await.unwrap();
+                    assert!(!Arc::ptr_eq(&bridge, &restarted));
+                    assert_eq!(registry.spawn_count(), 2);
+                    assert_eq!(
+                        restarted.call("find_symbol", json!({})).await.unwrap(),
+                        "stub-ok"
+                    );
+                    registry.stop(&next_turn).await.unwrap();
+                    drop(next_turn);
+                    drop(ctx);
+                    snapshot
+                        .seal()
+                        .expect("confirmed stop must release every process and stdio lease");
+                } else {
+                    drop(bridge);
+                    drop(again);
+                    drop(next_turn);
+                    drop(ctx);
+                    drop(registry);
+                    tokio::time::timeout(Duration::from_secs(10), async {
+                        while snapshot.seal().is_err() {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    })
+                    .await
+                    .expect("dropping the registry must release the real lease");
                 }
-            })
-            .await
-            .expect("dropping the registry must release the real lease");
-            let changes = snapshot.diff().unwrap();
-            assert_eq!(changes.len(), 1);
-            assert_eq!(changes[0].path, Path::new("private-effect"));
-            assert!(!source.join("private-effect").exists());
-            assert_eq!(
-                std::fs::read_to_string(source.join("original")).unwrap(),
-                "unchanged"
-            );
+                let changes = snapshot.diff().unwrap();
+                assert_eq!(changes.len(), 1);
+                assert_eq!(changes[0].path, Path::new("private-effect"));
+                assert!(!source.join("private-effect").exists());
+                assert_eq!(
+                    std::fs::read_to_string(source.join("original")).unwrap(),
+                    "unchanged"
+                );
+            }
         }
     }
 }
