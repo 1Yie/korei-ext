@@ -807,7 +807,7 @@ mod tests {
         std::fs::write(outside.join("host-file"), b"host").unwrap();
         let root = Dir::open(&private).unwrap();
         let pinned = root.mkdir(Path::new("junction")).unwrap();
-        let mutation = open_at(
+        let mutation = open_at_inner(
             &root.file,
             Path::new("junction"),
             GENERIC_WRITE,
@@ -815,6 +815,7 @@ mod tests {
             true,
             std::ptr::null_mut(),
             FILE_SHARE_READ | FILE_SHARE_WRITE,
+            true,
         )
         .unwrap();
         let substitute: Vec<_> = format!(r"\??\{}", outside.display())
