@@ -178,7 +178,12 @@ fn pipe(input: bool) -> Result<(NamedPipeServer, Handle)> {
     if child == INVALID_HANDLE_VALUE {
         return Err(io::Error::last_os_error().into());
     }
-    Ok((server, Handle(child)))
+    let child = Handle(child);
+    // The synchronous client is already connected; this arms Tokio's I/O state.
+    tokio::runtime::Handle::current()
+        .block_on(server.connect())
+        .context("connect inherited pipe")?;
+    Ok((server, child))
 }
 
 fn acl_file(path: &Path) -> io::Result<File> {
