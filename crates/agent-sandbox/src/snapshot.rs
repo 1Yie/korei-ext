@@ -350,6 +350,7 @@ impl Seek for SnapshotFile {
 #[derive(Clone)]
 pub struct WorkerScope {
     private: Arc<Private>,
+    view: Option<Arc<SnapshotLease>>,
 }
 
 impl WorkerScope {
@@ -369,6 +370,7 @@ impl WorkerScope {
                 active: AtomicUsize::new(0),
                 owners: Mutex::new(Vec::new()),
             }),
+            view: None,
         })
     }
 
@@ -386,6 +388,20 @@ impl WorkerScope {
 
     pub(crate) fn register_owner(&self, grants: &Arc<crate::EffectiveOsGrants>) {
         self.private.register_owner(grants);
+        if let Some(view) = &self.view {
+            view.register_owner(grants);
+        }
+    }
+
+    pub(crate) fn in_view(mut self, view: Arc<SnapshotLease>) -> Self {
+        self.view = Some(view);
+        self
+    }
+
+    pub(crate) fn admission_roots(&self) -> Result<Vec<PathBuf>> {
+        self.view
+            .as_ref()
+            .map_or_else(|| Ok(Vec::new()), |view| view.admission_roots())
     }
 }
 
@@ -396,6 +412,20 @@ impl Drop for SnapshotLease {
 }
 
 impl SnapshotLease {
+    pub(crate) fn admission_roots(&self) -> Result<Vec<PathBuf>> {
+        let mut paths = Vec::new();
+        for root in self.private.roots.iter() {
+            if Dir::open(&root.source.path)?.identity()? != root.identity
+                || Dir::open(&root.working.path)?.identity()? != root.working.identity()?
+            {
+                bail!("snapshot root identity changed before owner admission");
+            }
+            paths.push(root.source.path.clone());
+            paths.push(root.working.path.clone());
+        }
+        Ok(paths)
+    }
+
     pub(crate) fn register_owner(&self, grants: &Arc<crate::EffectiveOsGrants>) {
         self.private.register_owner(grants);
     }
@@ -887,14 +917,14 @@ impl WorkspaceSnapshot {
         })
     }
 
-    /// Append disjoint roots without widening existing leases. The Host must
-    /// exclude overlap with every running owner's fixed OS read grants first.
+    /// Append disjoint roots without widening existing leases.
     pub fn append_roots(&mut self, source_roots: &[PathBuf]) -> Result<Vec<RootId>> {
         self.append_roots_checked(source_roots, |_, _| Ok(()))
     }
 
     /// Check each pinned candidate pair before committing the entire root batch.
-    /// The Host serializes owner startup and root admission around this call.
+    /// The owners lock covers owner checks, the callback and batch commit.
+    /// The callback must not reenter append or `effective_grants()`.
     pub fn append_roots_checked(
         &mut self,
         source_roots: &[PathBuf],
@@ -947,11 +977,21 @@ impl WorkspaceSnapshot {
             self.preference,
             &mut stats,
         )?;
+        let owners = self
+            .private
+            .owners
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         for root in prepared.roots.iter() {
             if Dir::open(&root.source.path)?.identity()? != root.identity
                 || Dir::open(&root.working.path)?.identity()? != root.working.identity()?
             {
                 bail!("candidate root identity changed before admission");
+            }
+            for owner in owners.iter().filter_map(Weak::upgrade) {
+                if !owner.is_quiescent() {
+                    owner.check_root_addition(&root.source.path, &root.working.path)?;
+                }
             }
             check(&root.source.path, &root.working.path)?;
             if Dir::open(&root.source.path)?.identity()? != root.identity
@@ -970,6 +1010,7 @@ impl WorkspaceSnapshot {
         }
         drop(prepared.container.take());
         self.stats = stats;
+        drop(owners);
         Ok((first..end).map(RootId).collect())
     }
 
@@ -1741,4 +1782,76 @@ fn set_mode(f: &File, mode: u32) -> Result<()> {
 #[cfg(windows)]
 fn check_private(dir: &Dir) -> Result<()> {
     crate::snapshot_fs::check_private(dir).map_err(Into::into)
+}
+
+#[cfg(all(test, unix))]
+mod admission_owner_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::Arc;
+
+    fn fixture() -> (tempfile::TempDir, WorkspaceSnapshot, std::path::PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let source = base.join("source");
+        let storage = base.join("storage");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&storage).unwrap();
+        std::fs::set_permissions(&storage, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let snapshot = WorkspaceSnapshot::prepare(
+            &[source],
+            &storage,
+            SnapshotBudget {
+                max_bytes: 1024 * 1024,
+                max_entries: 32,
+                max_depth: 4,
+            },
+            SnapshotPreference::PrivateCopy,
+        )
+        .unwrap();
+        (temp, snapshot, base.join("candidate"))
+    }
+
+    fn rejected(snapshot: &mut WorkspaceSnapshot, candidate: &Path) {
+        let before = snapshot.stats();
+        let mut called = false;
+        assert!(snapshot
+            .append_roots_checked(&[candidate.to_owned()], |_, _| {
+                called = true;
+                Ok(())
+            })
+            .is_err());
+        assert!(!called, "host callback must not bypass a live owner");
+        assert_eq!(snapshot.stats(), before);
+        assert_eq!(snapshot.lease().unwrap().roots().count(), 1);
+    }
+
+    #[test]
+    fn starting_unknown_and_unreleased_owners_block_admission() {
+        let (_temp, mut snapshot, candidate) = fixture();
+        std::fs::create_dir(&candidate).unwrap();
+        let lease = snapshot.lease().unwrap();
+
+        let starting = Arc::new(crate::EffectiveOsGrants::default());
+        lease.register_owner(&starting);
+        rejected(&mut snapshot, &candidate);
+        drop(starting);
+        assert!(snapshot.effective_grants().is_empty());
+
+        let unknown = Arc::new(crate::EffectiveOsGrants::default());
+        unknown.unknown("cleanup was not proved");
+        unknown.ready();
+        lease.register_owner(&unknown);
+        rejected(&mut snapshot, &candidate);
+        drop(unknown);
+
+        let active = Arc::new(crate::EffectiveOsGrants::default());
+        active.allow(&candidate, None, "test read").unwrap();
+        active.ready();
+        lease.register_owner(&active);
+        rejected(&mut snapshot, &candidate);
+        active.released();
+        assert!(snapshot.append_roots(&[candidate]).unwrap().len() == 1);
+        assert_eq!(snapshot.lease().unwrap().roots().count(), 2);
+    }
 }

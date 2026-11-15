@@ -189,9 +189,14 @@ refuse them instead of reading them as Host configuration.
 
 Use `append_roots_checked` to check each fixed source/private-working pair
 before linking the entire prepared batch. Rejection removes that batch and
-preserves existing roots, private edits and statistics. The Host serializes
-owner startup and root admission, gathers every active snapshot and retained
-worker scope's grants, and calls each `check_root_addition` in the callback.
+preserves existing roots, private edits and statistics. After preparing the batch,
+the snapshot holds its owners lock through all non-quiescent owner checks, the
+callback and commit. The callback must not reenter append or `effective_grants()`.
+Owner startup registers the same grants object before validating all current
+source and working roots, including roots outside an old lease's file range.
+`spawn_worker_in_view` registers a workspace-denied worker in that snapshot's
+owner list without granting snapshot file access. Hosts can use the callback
+to check owners belonging to other views.
 An overlap, changed identity or unknown access rejects admission; healthy
 owners retain their fixed permissions until explicitly stopped. `append_roots`
 uses the same preparation path with an unconditional callback.

@@ -333,6 +333,7 @@ impl ExecutionOwner {
 
 fn start_owner(
     scope: ExecutionScope,
+    effective_grants: Arc<crate::EffectiveOsGrants>,
     memory_limit: u64,
     spawn: impl FnOnce(&mut ExecutionOwner) -> Result<Child> + Send + 'static,
 ) -> Result<SandboxedChild> {
@@ -343,8 +344,6 @@ fn start_owner(
     let rss_exceeded = Arc::new(AtomicBool::new(false));
     let owner_cancel = Arc::clone(&cancel);
     let owner_rss = Arc::clone(&rss_exceeded);
-    let effective_grants = Arc::new(crate::EffectiveOsGrants::default());
-    scope.register_owner(&effective_grants);
     std::thread::Builder::new()
         .name("sandbox-execution".into())
         .spawn(move || {
@@ -491,6 +490,16 @@ mod owner_tests {
     use super::*;
     use crate::snapshot::{SnapshotBudget, SnapshotPreference, WorkspaceSnapshot};
     use std::os::unix::fs::PermissionsExt;
+
+    fn start_owner(
+        scope: ExecutionScope,
+        memory_limit: u64,
+        spawn: impl FnOnce(&mut ExecutionOwner) -> Result<Child> + Send + 'static,
+    ) -> Result<SandboxedChild> {
+        let grants = Arc::new(crate::EffectiveOsGrants::default());
+        scope.register_owner(&grants);
+        super::start_owner(scope, grants, memory_limit, spawn)
+    }
 
     fn snapshot() -> (tempfile::TempDir, WorkspaceSnapshot) {
         let temp = tempfile::tempdir().unwrap();
@@ -754,6 +763,8 @@ pub fn spawn_isolated(
     request: &IsolatedSpawn,
 ) -> Result<SandboxedChild> {
     let scope = scope.into();
+    let effective_grants = Arc::new(crate::EffectiveOsGrants::default());
+    scope.register_owner(&effective_grants);
     scope.validate()?;
     let mut request = request.clone();
     if request.kind == ExecutionKind::Tool {
@@ -935,12 +946,9 @@ pub fn spawn_isolated(
     if request.memory_enforcement != MemoryEnforcement::OsHard {
         bail!("this platform requires OS-hard memory enforcement");
     }
-    let source_roots: Vec<_> = match &scope {
-        ExecutionScope::Snapshot(lease) => lease
-            .roots()
-            .map(|id| lease.source_root(id).map(Path::to_owned))
-            .collect::<Result<_>>()?,
-        ExecutionScope::Worker(_) => Vec::new(),
+    let source_roots = match &scope {
+        ExecutionScope::Snapshot(lease) => lease.admission_roots()?,
+        ExecutionScope::Worker(worker) => worker.admission_roots()?,
     };
     let source_handles = source_roots
         .iter()
@@ -1035,13 +1043,18 @@ pub fn spawn_isolated(
     #[cfg(windows)]
     {
         let request = request.clone();
-        return start_owner(scope, request.max_memory_bytes, move |owner| {
-            crate::windows_isolated::spawn(
-                owner.scope.as_ref().unwrap(),
-                &request,
-                &owner.effective_grants,
-            )
-        });
+        return start_owner(
+            scope,
+            effective_grants,
+            request.max_memory_bytes,
+            move |owner| {
+                crate::windows_isolated::spawn(
+                    owner.scope.as_ref().unwrap(),
+                    &request,
+                    &owner.effective_grants,
+                )
+            },
+        );
     }
     #[cfg(unix)]
     {
@@ -1050,7 +1063,7 @@ pub fn spawn_isolated(
         #[cfg(target_os = "linux")]
         let parent = request.linux_cgroup_parent.clone()
             .context("Linux isolated execution requires linux_cgroup_parent in a delegated cgroup v2 subtree")?;
-        start_owner(scope, memory, move |owner| {
+        start_owner(scope, effective_grants, memory, move |owner| {
             let scope = owner.scope.as_ref().unwrap();
             #[cfg(target_os = "linux")]
             let mut command =
@@ -1098,6 +1111,18 @@ pub fn spawn_isolated(
     }
     #[cfg(not(any(unix, windows)))]
     bail!("isolated process launch is unsupported on this platform")
+}
+
+/// Start a workspace-denied worker whose OS grants participate in view admission.
+pub fn spawn_worker_in_view(
+    scope: WorkerScope,
+    view: Arc<SnapshotLease>,
+    request: &IsolatedSpawn,
+) -> Result<SandboxedChild> {
+    if request.kind != ExecutionKind::Worker {
+        bail!("worker-in-view execution requires a worker request");
+    }
+    spawn_isolated(scope.in_view(view), request)
 }
 
 #[cfg(all(unix, any(target_os = "linux", test)))]
