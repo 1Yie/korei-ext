@@ -524,13 +524,15 @@ async fn dropped_commit_and_cancelled_waiter_keep_actual_io_alive_through_observ
     );
     release.send(()).unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while weak.upgrade().is_some() {
+        loop {
+            if weak.upgrade().is_none() && f.snapshot.seal().is_ok() {
+                break;
+            }
             tokio::task::yield_now().await;
         }
     })
     .await
-    .unwrap();
-    f.snapshot.seal().unwrap();
+    .expect("the released write did not drop its snapshot lease");
     assert_eq!(
         std::fs::read_to_string(f.source.join("file.rs")).unwrap(),
         "pub fn before() {}\n"
