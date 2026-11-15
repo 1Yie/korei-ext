@@ -230,7 +230,7 @@ impl EffectiveOsGrants {
             .push((source.to_owned(), destination.to_owned()));
     }
 
-    #[cfg(windows)]
+    #[cfg_attr(not(any(windows, test)), allow(dead_code))]
     pub(crate) fn unknown(&self, reason: &str) {
         self.facts.lock().unwrap_or_else(|e| e.into_inner()).unknown = Some(reason.into());
     }

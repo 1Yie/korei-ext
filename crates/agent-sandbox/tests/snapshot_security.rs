@@ -15,6 +15,229 @@ fn budget() -> SnapshotBudget {
     }
 }
 
+#[test]
+fn checked_rejection_preserves_the_entire_batch_and_private_bytes() {
+    let (_temp, source, storage) = setup();
+    fs::write(source.join("file"), b"source").unwrap();
+    let mut snapshot = prepare(&source, &storage, SnapshotPreference::PrivateCopy);
+    let old = snapshot.lease().unwrap();
+    let root = old.roots().next().unwrap();
+    old.write_file(root, Path::new("file"), b"private").unwrap();
+    let before = format!("{:?}", snapshot.stats());
+    let candidates: Vec<_> = ["extra", "another"]
+        .into_iter()
+        .map(|name| {
+            let path = source.parent().unwrap().join(name);
+            fs::create_dir(&path).unwrap();
+            fs::write(path.join("file"), b"candidate").unwrap();
+            path
+        })
+        .collect();
+    let mut checked = 0;
+    assert!(snapshot
+        .append_roots_checked(&candidates, |_, _| {
+            checked += 1;
+            if checked == 2 {
+                anyhow::bail!("injected rejection");
+            }
+            Ok(())
+        })
+        .is_err());
+    assert_eq!(checked, 2);
+    assert_eq!(format!("{:?}", snapshot.stats()), before);
+    assert_eq!(snapshot.lease().unwrap().roots().count(), 1);
+    assert_eq!(old.roots().count(), 1);
+    let mut bytes = Vec::new();
+    old.read_file(root, Path::new("file"))
+        .unwrap()
+        .read_to_end(&mut bytes)
+        .unwrap();
+    assert_eq!(bytes, b"private");
+    assert_eq!(fs::read(source.join("file")).unwrap(), b"source");
+    assert_eq!(snapshot.append_roots(&candidates).unwrap().len(), 2);
+}
+
+#[cfg(target_os = "macos")]
+fn worker_request(mut read_only: Vec<std::path::PathBuf>) -> agent_sandbox::spawn::IsolatedSpawn {
+    use agent_sandbox::spawn::*;
+    if cfg!(target_os = "macos") {
+        for path in ["/usr/lib", "/System/Library"] {
+            let path = std::path::PathBuf::from(path);
+            if !read_only.contains(&path) {
+                read_only.push(path);
+            }
+        }
+    }
+    IsolatedSpawn {
+        executable: "/bin/sh".into(),
+        args: vec!["-c".into(), "IFS= read -r finish".into()],
+        linux_launcher: None,
+        linux_cgroup_parent: None,
+        root: None,
+        kind: ExecutionKind::Worker,
+        read_only,
+        deny_read: vec![],
+        deny_write: vec![],
+        env: vec![],
+        max_memory_bytes: 64 * 1024 * 1024,
+        max_processes: 1,
+        memory_enforcement: MemoryEnforcement::MonitoredRss,
+        tool_policy: None,
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn retained_owners_block_admission_until_actual_quiescence() {
+    use agent_sandbox::spawn::{spawn_isolated, spawn_worker_in_view};
+    use std::sync::Arc;
+    for in_view in [false, true] {
+        let (_temp, source, storage) = setup();
+        let mut snapshot = prepare(&source, &storage, SnapshotPreference::PrivateCopy);
+        let candidate = source.parent().unwrap().join("candidate");
+        fs::create_dir(&candidate).unwrap();
+        let view = Arc::new(snapshot.lease().unwrap());
+        let mut request = worker_request(vec![candidate.clone()]);
+        if !in_view {
+            request.root = Some(view.roots().next().unwrap());
+        }
+        let mut child = if in_view {
+            spawn_worker_in_view(
+                WorkerScope::prepare(&storage).unwrap(),
+                view.clone(),
+                &request,
+            )
+        } else {
+            spawn_isolated(view.clone(), &request)
+        }
+        .unwrap();
+        let grants = snapshot.effective_grants();
+        assert_eq!(grants.len(), 1);
+        assert!(Arc::ptr_eq(&grants[0], &child.effective_grants().unwrap()));
+        let mut callback_called = false;
+        assert!(snapshot
+            .append_roots_checked(&[candidate.clone()], |_, _| {
+                callback_called = true;
+                Ok(())
+            })
+            .is_err());
+        assert!(
+            !callback_called,
+            "an empty host blocker list cannot release an owner"
+        );
+        child.kill().await.unwrap();
+        assert!(grants[0].is_quiescent());
+        snapshot.append_roots(&[candidate]).unwrap();
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn startup_during_checked_commit_validates_all_current_roots() {
+    use agent_sandbox::spawn::{spawn_isolated, spawn_worker_in_view};
+    use std::sync::{mpsc, Arc};
+    use std::time::Duration;
+    for in_view in [false, true] {
+        for grant_working in [false, true] {
+            let (_temp, source, storage) = setup();
+            fs::write(source.join("file"), b"old").unwrap();
+            let mut snapshot = prepare(&source, &storage, SnapshotPreference::PrivateCopy);
+            let old = Arc::new(snapshot.lease().unwrap());
+            let extra = source.parent().unwrap().join("extra");
+            fs::create_dir(&extra).unwrap();
+            let (attempting, attempted) = mpsc::sync_channel(1);
+            let (finished, result) = mpsc::sync_channel(1);
+            let mut thread = None;
+            let added = snapshot
+                .append_roots_checked(&[extra.clone()], |candidate, working| {
+                    let mut request = worker_request(vec![if grant_working {
+                        working.to_owned()
+                    } else {
+                        candidate.to_owned()
+                    }]);
+                    let view = old.clone();
+                    if !in_view {
+                        request.root = Some(view.roots().next().unwrap());
+                    }
+                    let worker = WorkerScope::prepare(&storage).unwrap();
+                    let attempting = attempting.clone();
+                    let finished = finished.clone();
+                    thread = Some(std::thread::spawn(move || {
+                        attempting.send(()).unwrap();
+                        let result = if in_view {
+                            spawn_worker_in_view(worker, view, &request)
+                        } else {
+                            spawn_isolated(view, &request)
+                        };
+                        finished
+                            .send(result.map(|_| ()).map_err(|error| format!("{error:#}")))
+                            .unwrap();
+                    }));
+                    attempted.recv_timeout(Duration::from_secs(5)).unwrap();
+                    assert!(matches!(
+                        result.recv_timeout(Duration::from_millis(30)),
+                        Err(mpsc::RecvTimeoutError::Timeout)
+                    ));
+                    Ok(())
+                })
+                .unwrap();
+            let error = result
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap_err();
+            thread.unwrap().join().unwrap();
+            assert!(error.contains("source workspace"), "{error}");
+            assert!(
+                snapshot.effective_grants().is_empty(),
+                "pre-thread failure leaked a starting owner"
+            );
+            assert!(old.working_root(added[0]).is_err());
+            assert!(snapshot.lease().unwrap().working_root(added[0]).is_ok());
+            let mut bytes = Vec::new();
+            old.read_file(old.roots().next().unwrap(), Path::new("file"))
+                .unwrap()
+                .read_to_end(&mut bytes)
+                .unwrap();
+            assert_eq!(bytes, b"old");
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn worker_in_view_cannot_read_or_write_snapshot_files() {
+    use agent_sandbox::spawn::spawn_worker_in_view;
+    use std::sync::Arc;
+    use tokio::io::AsyncReadExt;
+    let (_temp, source, storage) = setup();
+    fs::write(source.join("file"), b"source").unwrap();
+    let snapshot = prepare(&source, &storage, SnapshotPreference::PrivateCopy);
+    let view = Arc::new(snapshot.lease().unwrap());
+    let working = view.working_root(view.roots().next().unwrap()).unwrap();
+    let mut request = worker_request(vec![]);
+    request.args = vec![
+        "-c".into(),
+        "for path in \"$@\"; do if IFS= read -r value < \"$path\"; then exit 11; fi; if printf overwritten > \"$path\"; then exit 12; fi; done; printf denied".into(),
+        "worker".into(),
+        source.join("file").into_os_string(),
+        working.join("file").into_os_string(),
+    ];
+    let mut child = spawn_worker_in_view(
+        WorkerScope::prepare(&storage).unwrap(),
+        view.clone(),
+        &request,
+    )
+    .unwrap();
+    let mut output = child.stdout.take().unwrap();
+    let mut bytes = Vec::new();
+    let (status, read) = tokio::join!(child.wait(), output.read_to_end(&mut bytes));
+    read.unwrap();
+    assert!(status.unwrap().success());
+    assert_eq!(bytes, b"denied");
+    assert_eq!(fs::read(source.join("file")).unwrap(), b"source");
+    assert_eq!(fs::read(working.join("file")).unwrap(), b"source");
+}
+
 fn setup() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().canonicalize().unwrap();
