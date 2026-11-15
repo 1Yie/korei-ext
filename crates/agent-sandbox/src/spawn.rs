@@ -247,6 +247,8 @@ impl ExecutionOwner {
 
     fn release(&mut self) {
         self.control.close();
+        // Windows pins must close before the child's runtime scope is removed.
+        self.effective_grants.close_pins();
         drop(self.child.take());
         drop(self.scope.take());
         self.effective_grants.released();
