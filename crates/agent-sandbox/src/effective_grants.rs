@@ -239,6 +239,14 @@ impl EffectiveOsGrants {
         self.facts.lock().unwrap_or_else(|e| e.into_inner()).ready = true;
     }
 
+    pub(crate) fn close_pins(&self) {
+        self.facts
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .access
+            .clear();
+    }
+
     pub(crate) fn released(&self) {
         self.quiescent.store(true, Ordering::Release);
     }
@@ -247,6 +255,70 @@ impl EffectiveOsGrants {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn closing_pins_allows_worker_cleanup_before_quiescence() {
+        let temp = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        let base = temp.path().canonicalize().unwrap();
+        #[cfg(windows)]
+        let base = temp.path().to_owned();
+        let storage = base.join("storage");
+        drop(
+            Dir::open(storage.parent().unwrap())
+                .unwrap()
+                .mkdir(Path::new("storage"))
+                .unwrap(),
+        );
+        let scope = crate::snapshot::WorkerScope::prepare(&storage).unwrap();
+        let directory = scope.directory().unwrap().to_owned();
+        let file = directory.join("runtime");
+        std::fs::write(&file, b"runtime").unwrap();
+        let grants = std::sync::Arc::new(EffectiveOsGrants::default());
+        let observer = std::sync::Arc::clone(&grants);
+        scope.register_owner(&grants);
+        grants.allow(&directory, None, "runtime directory").unwrap();
+        grants.allow(&file, None, "runtime file").unwrap();
+        assert_eq!(observer.facts.lock().unwrap().access.len(), 2);
+        assert!(!observer.is_quiescent());
+
+        grants.close_pins();
+        assert!(observer.facts.lock().unwrap().access.is_empty());
+        assert!(!observer.is_quiescent());
+        drop(scope);
+        assert!(!directory.exists());
+        assert_eq!(std::fs::read_dir(&storage).unwrap().count(), 0);
+        assert!(!observer.is_quiescent());
+        grants.released();
+        assert!(observer.is_quiescent());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn live_pins_prevent_worker_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("storage");
+        drop(
+            Dir::open(storage.parent().unwrap())
+                .unwrap()
+                .mkdir(Path::new("storage"))
+                .unwrap(),
+        );
+        let scope = crate::snapshot::WorkerScope::prepare(&storage).unwrap();
+        let directory = scope.directory().unwrap().to_owned();
+        let grants = EffectiveOsGrants::default();
+        grants.allow(&directory, None, "runtime directory").unwrap();
+
+        drop(scope);
+        assert!(directory.is_dir());
+        assert_eq!(std::fs::read_dir(&storage).unwrap().count(), 1);
+        assert!(!grants.is_quiescent());
+
+        grants.close_pins();
+        std::fs::remove_dir(&directory).unwrap();
+        assert_eq!(std::fs::read_dir(&storage).unwrap().count(), 0);
+        assert!(!grants.is_quiescent());
+    }
 
     #[test]
     fn local_runtime_grants_pin_files_directories_and_lineage() {
