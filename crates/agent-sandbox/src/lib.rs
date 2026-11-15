@@ -6,6 +6,7 @@
 
 pub mod audit;
 pub mod env_sanitize;
+pub mod exit_proof;
 mod group_kill;
 pub mod limits;
 #[cfg(target_os = "linux")]
