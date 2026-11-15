@@ -1437,6 +1437,13 @@ fn unique(prefix: &str) -> String {
     )
 }
 
+fn skipped_inventory_dir(name: &OsString) -> bool {
+    matches!(
+        name.as_os_str().to_str(),
+        Some("target" | "node_modules" | ".husk" | ".scratch")
+    )
+}
+
 fn inventory(root: &Dir, budget: SnapshotBudget) -> Result<BTreeMap<PathBuf, Entry>> {
     fn visit(
         dir: &Dir,
@@ -1450,6 +1457,9 @@ fn inventory(root: &Dir, budget: SnapshotBudget) -> Result<BTreeMap<PathBuf, Ent
                 Some(directory) => directory,
                 None => continue,
             };
+            if directory && skipped_inventory_dir(&name) {
+                continue;
+            }
             let path = prefix.join(&name);
             if path.components().count() > budget.max_depth
                 || map.len() as u64 >= budget.max_entries
@@ -1914,6 +1924,35 @@ mod ignore_config_tests {
             .source
             .is_dir(Path::new("link"))
             .is_err());
+    }
+
+    #[test]
+    fn inventory_skips_generated_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let source = base.join("source");
+        let storage = base.join("storage");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&storage).unwrap();
+        std::fs::set_permissions(&storage, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(source.join("keep.txt"), b"kept").unwrap();
+        let generated = source.join("target");
+        std::fs::create_dir(&generated).unwrap();
+        std::fs::write(generated.join("huge.bin"), vec![1; 64]).unwrap();
+        let snapshot = WorkspaceSnapshot::prepare(
+            &[source],
+            &storage,
+            SnapshotBudget {
+                max_bytes: 32,
+                max_entries: 32,
+                max_depth: 4,
+            },
+            SnapshotPreference::PrivateCopy,
+        )
+        .unwrap();
+        let working = &snapshot.private.roots.values[0].working.path;
+        assert_eq!(std::fs::read(working.join("keep.txt")).unwrap(), b"kept");
+        assert!(!working.join("target").exists());
     }
 }
 

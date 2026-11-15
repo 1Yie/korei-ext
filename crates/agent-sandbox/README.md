@@ -232,8 +232,9 @@ rejected at seal.
 
 The filesystem boundary uses handle-relative traversal, rejects links and
 special files, and preserves native path representations. Inventory skips
-symlinks, hard links and special files instead of failing preparation;
-opening or writing one still fails closed. Windows operations
+symlinks, hard links and special files instead of failing preparation, and it
+does not enter `target`, `node_modules`, `.husk` or `.scratch`. Opening or
+writing a link still fails closed. Windows operations
 use directory-rooted NT opens and reject reparse traversal; directory
 enumeration, rename, deletion and temporary ACL access use handles. Windows
 directory-flush durability remains unverified.

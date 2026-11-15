@@ -598,6 +598,13 @@ impl Dir {
         }
         Ok(directory)
     }
+    pub(crate) fn inventory_kind(&self, path: &Path) -> io::Result<Option<bool>> {
+        match self.is_dir(path) {
+            Ok(directory) => Ok(Some(directory)),
+            Err(error) if error.kind() == io::ErrorKind::InvalidInput => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
     pub fn unlink(&self, path: &Path, directory: bool) -> io::Result<()> {
         let (parent, name) = self.parent(path)?;
         let file = open_at(
