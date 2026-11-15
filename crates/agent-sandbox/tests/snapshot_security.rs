@@ -537,22 +537,36 @@ fn links_special_files_and_overlapping_roots_fail_closed() {
     let outside = storage.join("outside");
     fs::write(&outside, b"outside").unwrap();
     symlink(&outside, source.join("escape")).unwrap();
-    assert!(WorkspaceSnapshot::prepare(
+    let snapshot = WorkspaceSnapshot::prepare(
         &[source.clone()],
         &storage,
         budget(),
-        SnapshotPreference::PrivateCopy
+        SnapshotPreference::PrivateCopy,
     )
-    .is_err());
+    .unwrap();
+    let lease = snapshot.lease().unwrap();
+    let root = lease.roots().next().unwrap();
+    let working = lease.working_root(root).unwrap();
+    assert!(working.join("data").is_file());
+    assert!(!working.join("escape").exists());
+    assert!(lease.read_file(root, Path::new("escape")).is_err());
+    drop(lease);
+    drop(snapshot);
     fs::remove_file(source.join("escape")).unwrap();
     fs::hard_link(&outside, source.join("hardlink")).unwrap();
-    assert!(WorkspaceSnapshot::prepare(
+    let snapshot = WorkspaceSnapshot::prepare(
         &[source.clone()],
         &storage,
         budget(),
-        SnapshotPreference::PrivateCopy
+        SnapshotPreference::PrivateCopy,
     )
-    .is_err());
+    .unwrap();
+    let lease = snapshot.lease().unwrap();
+    let root = lease.roots().next().unwrap();
+    assert!(!lease.working_root(root).unwrap().join("hardlink").exists());
+    assert!(lease.read_file(root, Path::new("hardlink")).is_err());
+    drop(lease);
+    drop(snapshot);
     fs::remove_file(source.join("hardlink")).unwrap();
     assert!(WorkspaceSnapshot::prepare(
         &[source.clone()],

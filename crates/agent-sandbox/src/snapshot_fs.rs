@@ -336,6 +336,18 @@ mod platform {
             Ok(names)
         }
         pub fn is_dir(&self, path: &Path) -> io::Result<bool> {
+            self.inventory_kind(path)?.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "links and special files are forbidden",
+                )
+            })
+        }
+
+        /// `Some(true)` is a directory and `Some(false)` a single-link regular
+        /// file. `None` is a symlink, hard link, or special file. Inventory
+        /// skips those entries; opening one still fails closed.
+        pub(crate) fn inventory_kind(&self, path: &Path) -> io::Result<Option<bool>> {
             let (parent, name) = self.parent(path)?;
             let name = cstr(Path::new(&name))?;
             let mut st: libc::stat = unsafe { std::mem::zeroed() };
@@ -351,12 +363,9 @@ mod platform {
                 return Err(io::Error::last_os_error());
             }
             match st.st_mode & libc::S_IFMT {
-                libc::S_IFDIR => Ok(true),
-                libc::S_IFREG if st.st_nlink == 1 => Ok(false),
-                _ => Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "links and special files are forbidden",
-                )),
+                libc::S_IFDIR => Ok(Some(true)),
+                libc::S_IFREG if st.st_nlink == 1 => Ok(Some(false)),
+                _ => Ok(None),
             }
         }
         pub fn unlink(&self, name: &Path, directory: bool) -> io::Result<()> {

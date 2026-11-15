@@ -1446,13 +1446,16 @@ fn inventory(root: &Dir, budget: SnapshotBudget) -> Result<BTreeMap<PathBuf, Ent
         bytes: &mut u64,
     ) -> Result<()> {
         for name in dir.names()? {
+            let directory = match dir.inventory_kind(Path::new(&name))? {
+                Some(directory) => directory,
+                None => continue,
+            };
             let path = prefix.join(&name);
             if path.components().count() > budget.max_depth
                 || map.len() as u64 >= budget.max_entries
             {
                 bail!("snapshot entry/depth budget exceeded");
             }
-            let directory = dir.is_dir(Path::new(&name))?;
             let (identity, mode) = if directory {
                 let child = dir.child(Path::new(&name))?;
                 let identity = child.identity()?;
@@ -1873,6 +1876,44 @@ mod ignore_config_tests {
         std::fs::rename(base.join("child"), base.join("saved-child")).unwrap();
         symlink(&base, base.join("child")).unwrap();
         assert!(directory.child(Path::new("child")).is_err());
+    }
+
+    #[test]
+    fn inventory_skips_links_without_failing_preparation() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let source = base.join("source");
+        let storage = base.join("storage");
+        let outside = base.join("outside");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&storage).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::set_permissions(&storage, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(source.join("keep.txt"), b"kept").unwrap();
+        std::fs::write(outside.join("secret.txt"), b"secret").unwrap();
+        symlink(outside.join("secret.txt"), source.join("link")).unwrap();
+        std::fs::write(source.join("linked.txt"), b"hard").unwrap();
+        std::fs::hard_link(source.join("linked.txt"), source.join("hard")).unwrap();
+        let snapshot = WorkspaceSnapshot::prepare(
+            &[source],
+            &storage,
+            SnapshotBudget {
+                max_bytes: 4096,
+                max_entries: 32,
+                max_depth: 4,
+            },
+            SnapshotPreference::PrivateCopy,
+        )
+        .unwrap();
+        let working = &snapshot.private.roots.values[0].working.path;
+        assert_eq!(std::fs::read(working.join("keep.txt")).unwrap(), b"kept");
+        assert!(!working.join("link").exists());
+        assert!(!working.join("linked.txt").exists());
+        assert!(!working.join("hard").exists());
+        assert!(snapshot.private.roots.values[0]
+            .source
+            .is_dir(Path::new("link"))
+            .is_err());
     }
 }
 
