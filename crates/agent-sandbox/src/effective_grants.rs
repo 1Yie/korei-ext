@@ -22,12 +22,18 @@ struct PinnedPath {
 impl PinnedPath {
     fn open(path: &Path) -> Result<Self> {
         let canonical = path.canonicalize().context("resolve OS grant identity")?;
-        let (directory, file) = if canonical.is_dir() {
-            (Dir::open(&canonical)?, None)
+        // Windows canonical spelling is verbatim; only the original local path
+        // may enter the strict directory walk. Keep canonical for alias checks.
+        #[cfg(windows)]
+        let local = path;
+        #[cfg(not(windows))]
+        let local = canonical.as_path();
+        let (directory, file) = if local.is_dir() {
+            (Dir::open(local)?, None)
         } else {
-            let directory = Dir::open(canonical.parent().context("grant has no parent")?)?;
+            let directory = Dir::open(local.parent().context("grant has no parent")?)?;
             let file = directory.read(Path::new(
-                canonical.file_name().context("grant has no filename")?,
+                local.file_name().context("grant has no filename")?,
             ))?;
             crate::snapshot_fs::regular(&file)?;
             (directory, Some(file))
@@ -235,5 +241,80 @@ impl EffectiveOsGrants {
 
     pub(crate) fn released(&self) {
         self.quiescent.store(true, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_runtime_grants_pin_files_directories_and_lineage() {
+        let temp = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        let base = temp.path().canonicalize().unwrap();
+        #[cfg(windows)]
+        let base = temp.path().to_owned();
+        let runtime = base.join("runtime");
+        let source = base.join("source");
+        let working = base.join("working");
+        for path in [&runtime, &source, &working] {
+            std::fs::create_dir(path).unwrap();
+        }
+        let executable = runtime.join("tool.exe");
+        std::fs::write(&executable, b"runtime").unwrap();
+        #[cfg(windows)]
+        assert!(matches!(
+            runtime.canonicalize().unwrap().components().next(),
+            Some(std::path::Component::Prefix(prefix))
+                if matches!(prefix.kind(), std::path::Prefix::VerbatimDisk(_))
+        ));
+
+        let grants = EffectiveOsGrants::default();
+        grants.allow(&runtime, None, "runtime directory").unwrap();
+        grants.allow(&executable, None, "runtime file").unwrap();
+        grants.ready();
+        grants.check_root_addition(&source, &working).unwrap();
+        assert!(grants
+            .check_root_addition(&runtime, &working)
+            .unwrap_err()
+            .to_string()
+            .contains("conflicts with active runtime directory grant"));
+
+        let file_grants = EffectiveOsGrants::default();
+        file_grants
+            .allow(&executable, None, "runtime file")
+            .unwrap();
+        file_grants.ready();
+        file_grants.check_root_addition(&source, &working).unwrap();
+        assert!(file_grants
+            .check_root_addition(&runtime, &working)
+            .unwrap_err()
+            .to_string()
+            .contains("conflicts with active runtime file grant"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn local_grants_keep_nonlocal_and_verbatim_root_inputs_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let canonical = temp.path().canonicalize().unwrap();
+        assert!(PinnedPath::open(&canonical)
+            .unwrap_err()
+            .to_string()
+            .contains("UNC, device and relative roots are forbidden"));
+        for path in [
+            r"\\server\share\root",
+            r"\\.\C:\root",
+            r"C:relative",
+            r"\root-relative",
+            r"relative",
+        ] {
+            assert_eq!(
+                Dir::open(Path::new(path)).unwrap_err().kind(),
+                std::io::ErrorKind::InvalidInput,
+                "{path}"
+            );
+        }
     }
 }
