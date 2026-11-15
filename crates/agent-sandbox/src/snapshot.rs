@@ -5,7 +5,7 @@ use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use anyhow::{bail, Context, Result};
@@ -47,6 +47,28 @@ pub enum SnapshotState {
     Published,
     RecoveryRequired,
     RolledBack,
+}
+
+/// Identity of one retained private root. Paths are host-owned records.
+#[derive(Clone, Debug)]
+pub struct RetainedRoot {
+    pub source: PathBuf,
+    pub source_identity: (u64, u64),
+    pub baseline: PathBuf,
+    pub baseline_identity: (u64, u64),
+    pub working: PathBuf,
+    pub working_identity: (u64, u64),
+}
+
+/// A private snapshot directory that survives the in-memory owner.
+#[derive(Clone, Debug)]
+pub struct RetainedSnapshot {
+    pub container: PathBuf,
+    pub container_identity: (u64, u64),
+    pub budget: SnapshotBudget,
+    pub preference: SnapshotPreference,
+    pub stats: SnapshotStats,
+    pub roots: Vec<RetainedRoot>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,6 +178,7 @@ struct Private {
     roots: RootBatch,
     active: AtomicUsize,
     owners: Mutex<Vec<Weak<crate::EffectiveOsGrants>>>,
+    keep_container: AtomicBool,
 }
 
 impl Private {
@@ -180,8 +203,11 @@ impl Private {
 
 impl Drop for Private {
     fn drop(&mut self) {
-        // A displaced container is retained rather than following an attacker
-        // controlled path during cleanup.
+        // A retained container is reopened from its recorded identity. A
+        // displaced container is also kept rather than following a replaced path.
+        if self.keep_container.load(Ordering::Acquire) {
+            return;
+        }
         self.roots.clear();
         if let Some(container) = self.container.take() {
             if Dir::open(&container.path).and_then(|d| d.identity()).ok()
@@ -369,6 +395,7 @@ impl WorkerScope {
                 roots: RootBatch::default(),
                 active: AtomicUsize::new(0),
                 owners: Mutex::new(Vec::new()),
+                keep_container: AtomicBool::new(false),
             }),
             view: None,
         })
@@ -840,6 +867,7 @@ fn prepare_batch(
         roots: RootBatch::default(),
         active: AtomicUsize::new(0),
         owners: Mutex::new(Vec::new()),
+        keep_container: AtomicBool::new(false),
     };
     for (offset, source) in sources.into_iter().enumerate() {
         let index = first_index
@@ -1274,6 +1302,121 @@ impl WorkspaceSnapshot {
             bail!("cannot discard an active snapshot");
         }
         self.state = SnapshotState::RolledBack;
+        Ok(())
+    }
+
+    /// Keep the private directory after this snapshot is dropped.
+    ///
+    /// Active leases fail closed and the directory is still kept. A changed
+    /// identity is not retained and is not deleted.
+    pub fn retain_private(&self) -> Result<RetainedSnapshot> {
+        let container = self
+            .private
+            .container
+            .as_ref()
+            .context("missing snapshot container")?;
+        if Dir::open(&container.path)?.identity()? != container.identity()? {
+            bail!("snapshot container identity changed");
+        }
+        if self.private.active.load(Ordering::Acquire) != 0 {
+            self.private.keep_container.store(true, Ordering::Release);
+            bail!("cannot record a snapshot that still has active execution leases");
+        }
+        let mut roots = Vec::new();
+        for root in self.private.roots.iter() {
+            if Dir::open(&root.source.path)?.identity()? != root.identity
+                || Dir::open(&root.baseline.path)?.identity()? != root.baseline.identity()?
+                || Dir::open(&root.working.path)?.identity()? != root.working.identity()?
+            {
+                bail!("snapshot root identity changed before retain");
+            }
+            roots.push(RetainedRoot {
+                source: root.source.path.clone(),
+                source_identity: root.identity,
+                baseline: root.baseline.path.clone(),
+                baseline_identity: root.baseline.identity()?,
+                working: root.working.path.clone(),
+                working_identity: root.working.identity()?,
+            });
+        }
+        self.private.keep_container.store(true, Ordering::Release);
+        Ok(RetainedSnapshot {
+            container: container.path.clone(),
+            container_identity: container.identity()?,
+            budget: self.budget,
+            preference: self.preference,
+            stats: self.stats,
+            roots,
+        })
+    }
+
+    /// Reopen a retained private directory after its identity still matches.
+    pub fn reopen(record: &RetainedSnapshot) -> Result<Self> {
+        let container = Dir::open(&record.container).context("open retained snapshot")?;
+        if container.identity()? != record.container_identity {
+            bail!("retained snapshot identity changed");
+        }
+        let storage = Dir::open(
+            record
+                .container
+                .parent()
+                .context("retained snapshot has no storage parent")?,
+        )?;
+        check_private(&storage)?;
+        let mut private = Private {
+            container: Some(container),
+            roots: RootBatch::default(),
+            active: AtomicUsize::new(0),
+            owners: Mutex::new(Vec::new()),
+            keep_container: AtomicBool::new(true),
+        };
+        for (index, retained) in record.roots.iter().enumerate() {
+            let source = Dir::open(&retained.source).context("open retained source root")?;
+            let baseline = Dir::open(&retained.baseline).context("open retained baseline root")?;
+            let working = Dir::open(&retained.working).context("open retained working root")?;
+            if source.identity()? != retained.source_identity
+                || baseline.identity()? != retained.baseline_identity
+                || working.identity()? != retained.working_identity
+            {
+                bail!("retained root identity changed");
+            }
+            if index != private.roots.len() {
+                bail!("retained roots are not contiguous");
+            }
+            private.roots.values.push(Root {
+                identity: retained.source_identity,
+                root_mode: mode(&source.metadata()?),
+                original: inventory(&baseline, record.budget)?,
+                source,
+                baseline,
+                working,
+            });
+        }
+        Ok(Self {
+            private: Arc::new(private),
+            storage,
+            state: SnapshotState::Prepared,
+            stats: record.stats,
+            budget: record.budget,
+            preference: record.preference,
+            changes: Vec::new(),
+        })
+    }
+
+    /// Delete a retained directory only when its identity still matches.
+    pub fn discard_retained(record: &RetainedSnapshot) -> Result<()> {
+        let container = Dir::open(&record.container).context("open retained snapshot")?;
+        if container.identity()? != record.container_identity {
+            bail!("retained snapshot identity changed; refusing to delete it");
+        }
+        remove_contents(&container)?;
+        let path = container.path.clone();
+        drop(container);
+        let parent = Dir::open(path.parent().context("retained snapshot has no parent")?)?;
+        parent.unlink(
+            Path::new(path.file_name().context("retained snapshot has no name")?),
+            true,
+        )?;
         Ok(())
     }
 }

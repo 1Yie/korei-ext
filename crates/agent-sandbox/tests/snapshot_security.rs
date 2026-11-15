@@ -238,6 +238,47 @@ async fn worker_in_view_cannot_read_or_write_snapshot_files() {
     assert_eq!(fs::read(working.join("file")).unwrap(), b"source");
 }
 
+#[test]
+fn retained_snapshot_reopens_private_bytes_and_refuses_a_replaced_directory() {
+    let (_temp, source, storage) = setup();
+    fs::write(source.join("file"), b"source").unwrap();
+    let snapshot = prepare(&source, &storage, SnapshotPreference::PrivateCopy);
+    let lease = snapshot.lease().unwrap();
+    let root = lease.roots().next().unwrap();
+    lease
+        .write_file(root, Path::new("file"), b"private")
+        .unwrap();
+    drop(lease);
+    let retained = snapshot.retain_private().unwrap();
+    drop(snapshot);
+    assert_eq!(
+        fs::read(retained.roots[0].working.join("file")).unwrap(),
+        b"private"
+    );
+    let mut reopened = WorkspaceSnapshot::reopen(&retained).unwrap();
+    let lease = reopened.lease().unwrap();
+    let mut bytes = Vec::new();
+    lease
+        .read_file(lease.roots().next().unwrap(), Path::new("file"))
+        .unwrap()
+        .read_to_end(&mut bytes)
+        .unwrap();
+    assert_eq!(bytes, b"private");
+    drop(lease);
+    assert!(reopened
+        .seal()
+        .unwrap()
+        .iter()
+        .any(|change| change.path == Path::new("file")));
+    drop(reopened);
+    let mut forged = retained.clone();
+    forged.container_identity = (0, 1);
+    assert!(WorkspaceSnapshot::discard_retained(&forged).is_err());
+    assert!(retained.container.exists());
+    WorkspaceSnapshot::discard_retained(&retained).unwrap();
+    assert!(!retained.container.exists());
+}
+
 fn setup() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().canonicalize().unwrap();
